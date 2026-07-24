@@ -35,6 +35,15 @@ Conventions:
   units per major unit is given by `currency.decimal_places` (e.g. 2 for USD, 0 for JPY).
 - `budget.value_minor` and `recurring.value_minor` use the same signed convention as
   transactions (negative = expense/outflow, positive = income/inflow).
+- The application has a single **base currency** (`app_config.base_currency_id`), which
+  the user can change at any time. Budgets are always expressed in the base currency
+  (there is no per-budget currency).
+- `exchange_rate` records one row per currency per day: `rate` is the value of 1 unit of
+  `currency_id` expressed in `base_currency_id` on `rate_date`. `base_currency_id` is
+  stored on each row so changing the base currency never corrupts historical rates; the
+  base currency itself has an implicit rate of 1. Non-base transactions are converted to
+  base **at report time** using the rate on their `posted_date` — converted amounts are
+  not stored, so all reports reflect the current base currency.
 - Dates/times are stored in UTC as ISO-8601.
 - A transaction's `category_id` is nullable (NULL = uncategorized). When
   `transaction_split` rows exist, the parent's `category_id` is NULL and the splits'
@@ -55,12 +64,13 @@ Conventions:
   `rule.match_field` (`description`/`amount`/`account`), `rule.match_type`
   (`contains`/`equals`/`regex`), `category_source` (`manual`/`rule`/`unset`).
 - Lookup `value` columns are UNIQUE (`account_type`, `currency`, `tag`, marked `UK`);
-  `category` is unique on `(parent_id, value)`.
+  `category` is unique on `(parent_id, value)`. `exchange_rate` is unique on
+  `(currency_id, base_currency_id, rate_date)`.
 - Lookup tables (`account_type`, `currency`, `tag`) and pure join tables
   (`transaction_tag`) omit `created_at`/`updated_at`.
 
 ```mermaid
-%%{init: {'theme':'base', 'themeVariables':{'background':'#ffffff'}}}%%
+%%{init: {'theme':'base', 'themeVariables':{'background':'#ffffff','lineColor':'#ff5c5c'}}}%%
 erDiagram
     account ||--o{ transaction : has
     account_type ||--o{ account : classifies
@@ -74,7 +84,6 @@ erDiagram
     transaction ||--o{ transaction_split : "split into"
     category ||--o{ transaction_split : categorizes
     category ||--o{ budget : budgets
-    currency ||--o{ budget : denominates
     account ||--o{ recurring : schedules
     category |o--o{ recurring : classifies
     currency ||--o{ recurring : denominates
@@ -82,6 +91,9 @@ erDiagram
     import |o--o{ transaction : "imported in"
     rule |o--o{ transaction : categorized
     account ||--o{ balance_snapshot : "snapshot of"
+    currency ||--o| app_config : "base of"
+    currency ||--o{ exchange_rate : "priced"
+    currency ||--o{ exchange_rate : "quoted in"
 
     account_type {
         int id PK
@@ -155,7 +167,6 @@ erDiagram
     budget {
         int id PK
         int category_id FK
-        int currency_id FK
         int value_minor
         str period
         date start_date
@@ -189,6 +200,18 @@ erDiagram
         int account_id FK
         date snapshot_date
         int balance_minor
+    }
+    app_config {
+        int id PK
+        int base_currency_id FK
+        datetime updated_at
+    }
+    exchange_rate {
+        int id PK
+        int currency_id FK
+        int base_currency_id FK
+        date rate_date
+        decimal rate
     }
 ```
 
