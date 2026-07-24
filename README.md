@@ -4,6 +4,7 @@
   - [Overview](#overview)
   - [Technical details](#technical-details)
   - [Database schema](#database-schema)
+  - [Data protection / security](#data-protection--security)
 
 ## Overview
 
@@ -27,51 +28,104 @@ For now, we use a command-line interface for user interactions. In the future, w
 
 ## Database schema
 
-Conventions: money is stored as a single integer number of cents (`value_cents`,
-signed — negative = outflow) to avoid floating-point rounding; dates/times are stored
-in UTC as ISO-8601. A transaction's `category_id` is nullable (NULL = uncategorized).
+Conventions:
+
+- Money is stored as an integer count of the currency's minor unit (`value_minor`,
+  signed, negative = outflow) to avoid floating-point rounding. The number of minor
+  units per major unit is given by `currency.decimal_places` (e.g. 2 for USD, 0 for JPY).
+- `budget.value_minor` and `recurring.value_minor` use the same signed convention as
+  transactions (negative = expense/outflow, positive = income/inflow).
+- Dates/times are stored in UTC as ISO-8601.
+- A transaction's `category_id` is nullable (NULL = uncategorized). When
+  `transaction_split` rows exist, the parent's `category_id` is NULL and the splits'
+  `value_minor` sum to the parent's `value_minor`.
+- `import_id` is nullable — NULL means the transaction was entered manually or synced
+  from an API rather than imported from a file.
+- Transfers between your own accounts share a `transfer_group_id` so both legs can be
+  excluded from spending/income totals (avoids double-counting).
+- `raw_description` preserves the bank's original text; `description` may be
+  cleaned/normalized.
+- `category_source` records how the category was assigned (`manual` / `rule` / `unset`);
+  only `manual` labels are treated as ground truth when learning new rules.
+  `categorized_by_rule_id` records which rule fired (NULL if none).
+- Rules are applied in ascending `priority` order (most specific first) and skipped when
+  `is_enabled` is false.
+- Enum-like text columns use a fixed vocabulary, enforced with CHECK constraints:
+  `budget.period` & `recurring.cadence` (`weekly`/`monthly`/`quarterly`/`yearly`),
+  `rule.match_field` (`description`/`amount`/`account`), `rule.match_type`
+  (`contains`/`equals`/`regex`), `category_source` (`manual`/`rule`/`unset`).
+- Lookup `value` columns are UNIQUE (`account_type`, `currency`, `tag`, marked `UK`);
+  `category` is unique on `(parent_id, value)`.
+- Lookup tables (`account_type`, `currency`, `tag`) and pure join tables
+  (`transaction_tag`) omit `created_at`/`updated_at`.
 
 ```mermaid
 %%{init: {'theme':'base', 'themeVariables':{'background':'#ffffff'}}}%%
 erDiagram
     account ||--o{ transaction : has
     account_type ||--o{ account : classifies
+    currency ||--o{ account : denominates
     category |o--o{ transaction : classifies
     category |o--o{ category : "parent of"
     currency ||--o{ transaction : has
     category ||--o{ rule : "matched by"
     transaction ||--o{ transaction_tag : has
     tag ||--o{ transaction_tag : labels
+    transaction ||--o{ transaction_split : "split into"
+    category ||--o{ transaction_split : categorizes
+    category ||--o{ budget : budgets
+    currency ||--o{ budget : denominates
+    account ||--o{ recurring : schedules
+    category |o--o{ recurring : classifies
+    currency ||--o{ recurring : denominates
+    account ||--o{ import : "source of"
+    import |o--o{ transaction : "imported in"
+    rule |o--o{ transaction : categorized
+    account ||--o{ balance_snapshot : "snapshot of"
 
     account_type {
         int id PK
-        str value
+        str value UK
     }
     account {
         int id PK
         str name
         int account_type_id FK
-        int opening_balance_cents
+        int currency_id FK
+        int opening_balance_minor
         date opening_date
+        datetime created_at
+        datetime updated_at
     }
     transaction {
         int id PK
         int account_id FK
         int category_id FK
         int currency_id FK
+        int import_id FK
+        int categorized_by_rule_id FK
         date posted_date
         str description
-        int value_cents
+        str raw_description
+        int value_minor
+        int transfer_group_id
+        str category_source
         str import_hash UK
+        datetime created_at
+        datetime updated_at
     }
     currency {
         int id PK
-        str value
+        str value UK
+        str symbol
+        int decimal_places
     }
     category {
         int id PK
         int parent_id FK
         str value
+        datetime created_at
+        datetime updated_at
     }
     rule {
         int id PK
@@ -79,22 +133,65 @@ erDiagram
         str match_field
         str match_type
         str pattern
+        int priority
+        bool is_enabled
+        datetime created_at
+        datetime updated_at
     }
     tag {
         int id PK
-        str value
+        str value UK
     }
     transaction_tag {
+        int transaction_id PK, FK
+        int tag_id PK, FK
+    }
+    transaction_split {
+        int id PK
         int transaction_id FK
-        int tag_id FK
+        int category_id FK
+        int value_minor
     }
     budget {
         int id PK
         int category_id FK
-        int amount_cents
         int currency_id FK
+        int value_minor
         str period
         date start_date
         date end_date
+        datetime created_at
+        datetime updated_at
+    }
+    recurring {
+        int id PK
+        int account_id FK
+        int category_id FK
+        int currency_id FK
+        int value_minor
+        str description
+        str cadence
+        date next_date
+        date end_date
+        bool is_active
+        datetime created_at
+        datetime updated_at
+    }
+    import {
+        int id PK
+        int account_id FK
+        str source_file
+        int row_count
+        datetime imported_at
+    }
+    balance_snapshot {
+        int id PK
+        int account_id FK
+        date snapshot_date
+        int balance_minor
     }
 ```
+
+## Data protection / security
+
+All user data is stored in the `data/` directory, which is `.gitignored`. Within that directory, all user data is stored locally.
