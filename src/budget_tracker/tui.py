@@ -57,6 +57,7 @@ class BudgetApp(App):
     BINDINGS = [
         ("ctrl+r", "refresh", "Refresh"),
         ("ctrl+l", "clear_filters", "Clear filters"),
+        ("ctrl+n", "rename_vendor", "Rename vendor"),
         ("ctrl+c", "quit", "Quit"),
     ]
 
@@ -210,7 +211,8 @@ class BudgetApp(App):
                 "import [path] — import a CSV (or all in data/to_import)\n"
                 "rename <raw vendor> = <display name> — override / aggregate a vendor\n"
                 "all — clear filters   refresh — reload   quit — exit\n"
-                "Click an account/vendor/category to filter.",
+                "Click an account/vendor/category to filter.\n"
+                "ctrl+n — prefill rename for the selected vendor.",
                 title="Commands",
                 timeout=8,
             )
@@ -262,6 +264,42 @@ class BudgetApp(App):
         self.notify(f"{raw!r} → {display!r}")
 
     # --------------------------------------------------------------- actions
+    def _selected_vendor(self) -> Optional[queries.VendorRow]:
+        """The vendor ctrl+n targets: the active filter, else the highlighted row."""
+        if self.vendor_filter is not None:
+            kind, vendor_id = self.vendor_filter
+            for vendor in self._vendors:
+                if (vendor.kind, vendor.id) == (kind, vendor_id):
+                    return vendor
+            return None
+        # Index 0 is the "— All —" row, so the list is offset by one.
+        index = self.query_one("#vendors", ListView).index or 0
+        if not 1 <= index <= len(self._vendors):
+            return None
+        return self._vendors[index - 1]
+
+    def _prefill_command(self, text: str) -> None:
+        command = self.query_one("#command", Input)
+        command.value = text
+        command.cursor_position = len(text)
+        command.focus()
+
+    def action_rename_vendor(self) -> None:
+        vendor = self._selected_vendor()
+        if vendor is None:
+            self.notify("Select a vendor in the sidebar first.", severity="warning")
+            return
+        if vendor.kind != "raw":
+            # set_override() matches on the raw vendor string, which the sidebar no
+            # longer shows once a group exists, so we can only prefill the verb.
+            self.notify(
+                f"{vendor.name!r} is an override group — rename a raw vendor instead.",
+                severity="warning",
+            )
+            self._prefill_command("rename ")
+            return
+        self._prefill_command(f"rename {vendor.name} = ")
+
     def action_refresh(self) -> None:
         self.reload()
 

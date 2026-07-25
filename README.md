@@ -2,6 +2,14 @@
 
 - [Budget tracker](#budget-tracker)
   - [Overview](#overview)
+  - [How to run](#how-to-run)
+    - [Setup](#setup)
+    - [The interactive app](#the-interactive-app)
+    - [The command line](#the-command-line)
+    - [Renaming and grouping vendors](#renaming-and-grouping-vendors)
+    - [Importing data](#importing-data)
+    - [Where the data lives](#where-the-data-lives)
+    - [Running the tests](#running-the-tests)
   - [Technical details](#technical-details)
   - [Database schema](#database-schema)
   - [Data protection / security](#data-protection--security)
@@ -17,6 +25,120 @@ This is a project for tracking personal budgets. The planned features are the fo
 5. [Todo] Display details in a command-line interface.
 6. [Todo] Display details in a graphical interface if desired.
 7. [Todo] Connect to bank / credit card / broker APIs to read the user's current financial state.
+
+## How to run
+
+### Setup
+
+Requires Python 3.9 or newer. From the repository root:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+```
+
+This installs the dependencies (`SQLAlchemy`, `textual`) and puts a `budget` command on
+your path. The `[dev]` extra adds `pytest`; drop it if you do not intend to run the tests.
+
+### The interactive app
+
+Running `budget` with no arguments launches the full-screen TUI:
+
+```bash
+budget          # equivalent to: budget tui
+```
+
+The sidebar lists accounts, vendors, and categories — click any row to filter the
+transaction table, and the totals line updates to match. Type commands into the bar at
+the bottom:
+
+| Command | Effect |
+| --- | --- |
+| `import` | Import every CSV in `data/to_import/` |
+| `import <path>` | Import a single CSV |
+| `rename <raw vendor> = <display name>` | Give a vendor a readable name (see below) |
+| `all` | Clear all filters |
+| `refresh` | Reload from the database |
+| `help` | Show this list in-app |
+| `quit` | Exit |
+
+Keyboard shortcuts: `ctrl+n` prefills a `rename` command for the currently selected
+vendor, `ctrl+l` clears filters, `ctrl+r` refreshes, and `ctrl+c` quits.
+
+### The command line
+
+The same operations are available as subcommands, which is handy for scripting:
+
+```bash
+# Import a CSV. With no path, pick interactively from data/to_import/.
+budget import ~/Downloads/statement.csv
+budget import --currency EUR ~/Downloads/statement_eur.csv
+
+# List transactions, most recent first (default limit: 50).
+budget list
+budget list --account "Card 8207" --limit 100
+budget list --category Dining
+budget list --vendor Coffee          # accepts a raw name or an override name
+
+# Give a raw vendor string a readable display name.
+budget rename "COFFEE SHOP A" "Coffee"
+```
+
+`budget --help`, or `budget <subcommand> --help`, documents every flag.
+
+### Renaming and grouping vendors
+
+Imports record the bank's raw merchant string as the vendor. `rename` points that raw
+string at a readable name, and **reusing the same display name aggregates several raw
+vendors into one group**:
+
+```bash
+budget rename "COFFEE SHOP A" "Coffee"
+budget rename "COFFEE SHOP B" "Coffee"   # both now report under "Coffee"
+```
+
+Renames are stored separately from transactions and survive re-importing — the importer
+matches vendors on the raw string and never overwrites an existing display name. Note
+that the match is exact, so if your bank starts exporting a new variant of the string
+(`COFFEE SHOP A #4471`), that variant arrives as a separate, un-renamed vendor.
+
+### Importing data
+
+The importer currently reads Capital One-style CSV exports with these columns:
+
+```text
+Transaction Date, Posted Date, Card No., Description, Category, Debit, Credit
+```
+
+`Debit` is a charge (stored as a negative amount) and `Credit` is a payment or refund
+(positive). Files are read as UTF-8 or Windows-1252, so accented merchant names import
+cleanly. Re-importing the same file is safe: each row gets a content hash, and rows
+already present are reported as duplicates and skipped rather than doubled.
+
+Dropping statements into `data/to_import/` lets you import them without typing paths —
+`budget import` prompts you to choose one, and the TUI's `import` command takes them all
+at once.
+
+### Where the data lives
+
+The SQLite database is created on first run at `data/budget.db`, and the tables are
+created automatically — there is no migration step. Set the `BUDGET_DB` environment
+variable to point at a different file, which is useful for keeping a scratch database
+separate from your real one:
+
+```bash
+BUDGET_DB=/tmp/scratch.db budget import ~/Downloads/statement.csv
+```
+
+### Running the tests
+
+```bash
+pytest
+```
+
+The suite covers CSV importing, vendor overrides, and the TUI's rename shortcut. It
+builds a temporary database per test, so it never touches `data/budget.db`.
 
 ## Technical details
 
