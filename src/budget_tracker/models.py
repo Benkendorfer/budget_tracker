@@ -116,6 +116,33 @@ class VendorRule(Base):
     vendor_name: Mapped[VendorName] = relationship()
 
 
+class CsvFormat(Base):
+    """A bank's CSV layout, stored as data so no institution is named in the code.
+
+    List-valued columns (``signature``, ``date_formats``, ``dedup_columns``) hold JSON
+    arrays; :mod:`.formats` converts rows to and from the in-memory ``FormatSpec``.
+    """
+
+    __tablename__ = "csv_format"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String, unique=True)
+    signature: Mapped[str] = mapped_column(String)  # JSON array
+    posted_date_column: Mapped[str] = mapped_column(String)
+    description_column: Mapped[str] = mapped_column(String)
+    date_formats: Mapped[str] = mapped_column(String)  # JSON array
+    amount_style: Mapped[str] = mapped_column(String)
+    dedup_columns: Mapped[str] = mapped_column(String)  # JSON array
+    txn_date_column: Mapped[Optional[str]] = mapped_column(String, default=None)
+    category_column: Mapped[Optional[str]] = mapped_column(String, default=None)
+    debit_column: Mapped[Optional[str]] = mapped_column(String, default=None)
+    credit_column: Mapped[Optional[str]] = mapped_column(String, default=None)
+    amount_column: Mapped[Optional[str]] = mapped_column(String, default=None)
+    account_column: Mapped[Optional[str]] = mapped_column(String, default=None)
+    account_prefix: Mapped[str] = mapped_column(String, default="")
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
 class Import(Base):
     __tablename__ = "import"
 

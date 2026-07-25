@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 from typing import List, Optional
 
+from . import formats
 from .db import DEFAULT_DB_PATH, get_engine, get_sessionmaker, init_db
-from .importer import DEFAULT_CURRENCY_CODE, import_csv
+from .importer import DEFAULT_CURRENCY_CODE, import_csv, read_header_and_rows
 
 # cli.py -> budget_tracker -> src -> <repo root>
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -36,6 +38,15 @@ def _select_csv_interactively() -> Optional[Path]:
     return csv_files[index - 1]
 
 
+def _resolve_format(session, path: Path):
+    """Detect the file's format, falling back to interactive setup."""
+    fieldnames, rows = read_header_and_rows(path)
+    try:
+        return formats.detect(session, fieldnames)
+    except formats.UnknownFormat:
+        return _setup_format(session, path, fieldnames, rows)
+
+
 def _cmd_import(args: argparse.Namespace) -> int:
     if args.path:
         path = Path(args.path).expanduser()
@@ -50,8 +61,23 @@ def _cmd_import(args: argparse.Namespace) -> int:
     engine = get_engine()
     init_db(engine)
     session_factory = get_sessionmaker(engine)
-    with session_factory() as session:
-        result = import_csv(session, path, currency_code=args.currency)
+    try:
+        with session_factory() as session:
+            fmt = formats.get_format(session, args.format) if args.format else None
+            if fmt is None:
+                fmt = _resolve_format(session, path)
+                if fmt is None:
+                    return 1
+            result = import_csv(
+                session,
+                path,
+                currency_code=args.currency,
+                account_name=args.account,
+                fmt=fmt,
+            )
+    except (formats.AccountRequired, formats.UnknownFormat) as error:
+        print(error)
+        return 1
 
     print(
         f"Imported '{result.source_file}': {result.inserted} added, "
@@ -176,6 +202,139 @@ def _cmd_rule(args: argparse.Namespace) -> int:
         return 0
 
 
+def _ask(question: formats.Question) -> str:
+    """Put one unresolved mapping question to the user."""
+    print()
+    print(f"  {question.prompt}")
+    if question.choices:
+        for index, choice in enumerate(question.choices, start=1):
+            print(f"    [{index}] {choice}")
+    suffix = f" [{question.default}]" if question.default else ""
+    answer = input(f"  Answer{suffix}: ").strip()
+    if not answer and question.default:
+        return question.default
+    if question.choices and answer.isdigit():
+        index = int(answer)
+        if 1 <= index <= len(question.choices):
+            return question.choices[index - 1]
+    return answer
+
+
+def _setup_format(session, path: Path, fieldnames, rows) -> Optional[object]:
+    """Walk the user through defining a format for an unrecognised CSV."""
+    print(f"'{path.name}' does not match any format you have defined yet.")
+    default_name = re.sub(r"[^a-z0-9]+", "_", path.stem.lower()).strip("_") or "format"
+    name = input(f"Name for this layout [{default_name}]: ").strip() or default_name
+
+    inference = formats.infer(name, fieldnames, rows)
+    resolved = {k: v for k, v in inference.values.items() if v}
+    print("\nWorked out from the header:")
+    for field in (
+        "posted_date_column",
+        "txn_date_column",
+        "description_column",
+        "category_column",
+        "account_column",
+        "amount_column",
+        "debit_column",
+        "credit_column",
+        "date_formats",
+    ):
+        if resolved.get(field):
+            print(f"  {field:<20} {resolved[field]}")
+    if not resolved.get("account_column"):
+        print("  (no account column — imports of this layout will need --account)")
+
+    # Answering one question can expose another — naming the date column is what makes
+    # the date format checkable — so keep asking until nothing is left.
+    values = inference.values
+    questions = inference.questions
+    for _ in range(4):
+        if not questions:
+            break
+        answers = {q.field: _ask(q) for q in questions}
+        values = formats.apply_answers(values, answers, fieldnames, rows)
+        questions = formats.remaining_questions(values, rows, fieldnames)
+    else:
+        print("\nStill missing: " + ", ".join(q.field for q in questions))
+        return None
+
+    # The column gives an identifier like "8207"; only you know it should read
+    # "Card 8207". Getting this wrong would create a second account for the same card.
+    account_column = values.get("account_column")
+    if account_column:
+        sample = next(
+            ((row.get(account_column) or "").strip() for row in rows if row.get(account_column)),
+            "1234",
+        )
+        print()
+        print(f"  Accounts will be named after {account_column!r}, e.g. {sample!r}.")
+        prefix = input("  Prefix for those names, if any [none]: ").strip()
+        if prefix:
+            values["account_prefix"] = prefix + " " if not prefix.endswith(" ") else prefix
+            print(f"  Accounts will be named e.g. {values['account_prefix']}{sample}")
+
+    try:
+        spec = formats.spec_from_values(values)
+    except formats.InvalidFormat as error:
+        print(f"\nCould not build a usable format: {error}")
+        return None
+    formats.save_format(session, spec)
+    session.commit()
+    print(f"\nSaved layout {spec.name!r}. Future imports of this shape are automatic.")
+    return spec
+
+
+def _cmd_format(args: argparse.Namespace) -> int:
+    import json
+
+    engine = get_engine()
+    init_db(engine)
+    session_factory = get_sessionmaker(engine)
+
+    with session_factory() as session:
+        try:
+            if args.format_command == "remove":
+                if not formats.remove_format(session, args.name):
+                    print(f"No format named {args.name!r}.")
+                    return 1
+                session.commit()
+                print(f"Removed format {args.name!r}.")
+                return 0
+
+            if args.format_command == "export":
+                specs = (
+                    [formats.get_format(session, args.name)]
+                    if args.name
+                    else formats.list_formats(session)
+                )
+                payload = [formats.to_dict(s) for s in specs]
+                text = json.dumps(payload[0] if args.name else payload, indent=2)
+                if args.output:
+                    Path(args.output).expanduser().write_text(text, encoding="utf-8")
+                    print(f"Wrote {len(specs)} format(s) to {args.output}.")
+                else:
+                    print(text)
+                return 0
+
+            specs = formats.list_formats(session)  # "list"
+        except (formats.InvalidFormat, formats.UnknownFormat) as error:
+            print(error)
+            return 1
+
+    if not specs:
+        print(
+            "No CSV layouts learned yet. Run 'budget import <file>' and you will be "
+            "walked through the first one."
+        )
+        return 0
+    width = max(len(s.name) for s in specs)
+    for spec in specs:
+        account = spec.account_column or "requires --account"
+        print(f"  {spec.name:<{width}}  {spec.amount_style:<13}  account: {account}")
+    return 0
+
+
 def _cmd_tui(args: argparse.Namespace) -> int:
     # Imported lazily so plain `import` runs without pulling in Textual.
     from .tui import run
@@ -208,6 +367,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--currency",
         default=DEFAULT_CURRENCY_CODE,
         help="ISO currency code for the transactions (default: %(default)s).",
+    )
+    import_parser.add_argument(
+        "--account",
+        help=(
+            "Account these transactions belong to. Required for exports that carry no "
+            "account column; overrides the derived name otherwise."
+        ),
+    )
+    import_parser.add_argument(
+        "--format",
+        help=(
+            "Force a defined CSV format instead of detecting it from the header "
+            "(see 'budget format list')."
+        ),
     )
     import_parser.set_defaults(func=_cmd_import)
 
@@ -250,6 +423,27 @@ def build_parser() -> argparse.ArgumentParser:
         "remove", help="Delete a rule and revert the vendors it named."
     )
     rule_remove.add_argument("pattern", help="The exact pattern to remove.")
+
+    format_parser = subparsers.add_parser(
+        "format",
+        help=(
+            "Inspect CSV layouts learned during import (stored in the database, not "
+            "in the source tree)."
+        ),
+    )
+    format_parser.set_defaults(func=_cmd_format, format_command="list", name=None)
+    format_subparsers = format_parser.add_subparsers(dest="format_command")
+
+    format_remove = format_subparsers.add_parser("remove", help="Delete a format.")
+    format_remove.add_argument("name", help="The format name to remove.")
+
+    format_subparsers.add_parser("list", help="Show defined formats (default).")
+
+    format_export = format_subparsers.add_parser(
+        "export", help="Print or write format definitions as JSON."
+    )
+    format_export.add_argument("name", nargs="?", help="Export just this format.")
+    format_export.add_argument("--output", help="Write to this file instead of stdout.")
 
     rule_subparsers.add_parser("list", help="Show every rule (default).")
     rule_subparsers.add_parser(

@@ -5,6 +5,7 @@ import sqlalchemy
 from budget_tracker import queries, vendors
 from budget_tracker.db import get_engine, get_sessionmaker, init_db
 from budget_tracker.importer import import_csv
+from helpers import learn_format
 
 # The literal "*" in "Kindle Svcs*<ref>" is what the bank emits, not a wildcard.
 CSV = """Transaction Date,Posted Date,Card No.,Description,Category,Debit,Credit
@@ -25,6 +26,7 @@ def _setup(tmp_path):
     csv_path = tmp_path / "in.csv"
     csv_path.write_text(CSV, encoding="utf-8")
     with session_factory() as session:
+        learn_format(session, csv_path)
         import_csv(session, csv_path)
     return session_factory
 

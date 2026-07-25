@@ -6,6 +6,8 @@ transactions table, a totals line, and a command bar at the bottom.
 
 from __future__ import annotations
 
+import re
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
@@ -23,12 +25,35 @@ from textual.widgets import (
     Static,
 )
 
-from . import queries, vendors
+from . import formats, queries, vendors
 from .db import get_engine, get_sessionmaker, init_db
-from .importer import import_csv
+from .importer import (
+    ImportCandidate,
+    import_csv,
+    inspect_csv,
+    read_header_and_rows,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 TO_IMPORT_DIR = _REPO_ROOT / "data" / "to_import"
+
+
+@dataclass
+class _Setup:
+    """State for the in-app walkthrough that teaches the app a new CSV layout.
+
+    Questions come from :mod:`.formats`, the same source the CLI uses, so both routes
+    ask exactly the same things in the same order.
+    """
+
+    path: Path
+    fieldnames: List[str] = field(default_factory=list)
+    rows: List[dict] = field(default_factory=list)
+    values: dict = field(default_factory=dict)
+    asked: set = field(default_factory=set)
+    spec: Optional[formats.FormatSpec] = None
+    account_name: Optional[str] = None
+    question: Optional[formats.Question] = None
 
 
 def _fmt_amount(minor: int, decimal_places: int = 2) -> str:
@@ -48,11 +73,14 @@ class BudgetApp(App):
     CSS = """
     #sidebar { width: 36; }
     #accounts, #categories { border: round $accent; height: 1fr; }
-    #txns, #rules { border: round $accent; height: 1fr; }
+    #txns, #rules, #imports, #setup { border: round $accent; height: 1fr; }
+    #prompt { height: auto; padding: 1 1 0 1; color: $accent; }
     #status { height: 1; padding: 0 1; color: $text-muted; background: $panel; }
     #command { border: tall $accent; }
     .heading { padding: 0 1; text-style: bold; color: $accent; }
     """
+
+    PANELS = ("txns", "rules", "imports", "setup")
 
     BINDINGS = [
         ("ctrl+r", "refresh", "Refresh"),
@@ -76,7 +104,9 @@ class BudgetApp(App):
         # Parallel to the rows in #txns, so a cursor index maps back to a transaction.
         self._txns: List[queries.TxnRow] = []
         self._rules: List[queries.RuleRow] = []
-        self._rules_visible = False
+        self._candidates: List[ImportCandidate] = []
+        self._panel = "txns"
+        self._setup: Optional[_Setup] = None
         self._totals = queries.Totals(count=0, net_minor=0, outflow_minor=0, inflow_minor=0)
 
     def compose(self) -> ComposeResult:
@@ -92,9 +122,12 @@ class BudgetApp(App):
             with Vertical(id="main"):
                 yield DataTable(id="txns")
                 yield DataTable(id="rules")
+                yield DataTable(id="imports")
+                yield Static("", id="prompt")
+                yield DataTable(id="setup")
                 yield Static("", id="status")
         yield Input(
-            placeholder="command: import [path] | all | refresh | help | quit",
+            placeholder="command: import | rules | all | refresh | help | quit",
             id="command",
         )
         yield Footer()
@@ -119,6 +152,22 @@ class BudgetApp(App):
         rules.add_column("Display name", width=18)
         rules.add_column("Vendors", width=7)
         rules.display = False  # the transactions table owns the panel by default
+
+        imports = self.query_one("#imports", DataTable)
+        imports.cursor_type = "row"
+        imports.zebra_stripes = True
+        imports.add_column("File", width=34)
+        imports.add_column("Rows", width=5)
+        imports.add_column("Status", width=15)
+        imports.display = False
+
+        setup = self.query_one("#setup", DataTable)
+        setup.cursor_type = "row"
+        setup.zebra_stripes = True
+        setup.add_column("#", width=4)
+        setup.add_column("Choice", width=44)
+        setup.display = False
+        self.query_one("#prompt", Static).display = False
 
         self.reload()
         self.query_one("#command", Input).focus()
@@ -183,14 +232,41 @@ class BudgetApp(App):
                 Text(str(rule.vendor_count), justify="right"),
             )
 
+    def _fill_imports(self) -> None:
+        table = self.query_one("#imports", DataTable)
+        table.clear()
+        for candidate in self._candidates:
+            status = Text(
+                _truncate(candidate.status, 15),
+                style="" if candidate.ready else "yellow",
+            )
+            table.add_row(
+                _truncate(candidate.path.name, 34),
+                Text(str(candidate.row_count), justify="right"),
+                status,
+            )
+
     def _refresh_status(self) -> None:
-        if self._rules_visible:
+        status = self.query_one("#status", Static)
+        if self._panel == "rules":
             count = len(self._rules)
             named = sum(rule.vendor_count for rule in self._rules)
-            self.query_one("#status", Static).update(
+            status.update(
                 f"{count} rule{'s' if count != 1 else ''}   "
                 f"naming {named} vendors   "
                 "escape to return to transactions"
+            )
+            return
+        if self._panel == "setup" and self._setup is not None:
+            status.update(
+                f"setting up {self._setup.path.name}   escape cancels"
+            )
+            return
+        if self._panel == "imports":
+            ready = sum(1 for c in self._candidates if c.ready)
+            status.update(
+                f"{len(self._candidates)} file(s), {ready} ready   "
+                "enter to import   escape to return to transactions"
             )
             return
         self._set_status(self._totals)
@@ -227,10 +303,183 @@ class BudgetApp(App):
             self.category_filter = None if index == 0 else self._categories[index - 1].id
         self.reload()
 
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        """Enter on a row in the imports panel imports that file."""
+        if event.data_table.id == "setup":
+            if self._setup is not None and self._setup.question is not None:
+                choices = self._setup.question.choices
+                if 0 <= event.cursor_row < len(choices):
+                    self._answer_setup(str(choices[event.cursor_row]))
+            return
+        if event.data_table.id != "imports":
+            return
+        row = event.cursor_row
+        if not 0 <= row < len(self._candidates):
+            return
+        self._import_candidate(self._candidates[row])
+
+    def _import_candidate(self, candidate: ImportCandidate) -> None:
+        """Import the file, first walking through whatever it still needs."""
+        setup = _Setup(path=candidate.path)
+        if candidate.format_name is None:
+            # An unseen layout: infer what we can, then ask about the rest.
+            fieldnames, rows = read_header_and_rows(candidate.path)
+            setup.fieldnames, setup.rows = fieldnames, rows
+            default = re.sub(r"[^a-z0-9]+", "_", candidate.path.stem.lower()).strip("_")
+            setup.values = formats.infer(default or "layout", fieldnames, rows).values
+        else:
+            with self.session_factory() as session:
+                setup.spec = formats.get_format(session, candidate.format_name)
+        self._setup = setup
+        self._advance_setup()
+
+    def _next_setup_question(self, setup: _Setup) -> Optional[formats.Question]:
+        """The next thing we need from the user, or None when ready to import."""
+        if setup.spec is None:
+            if "name" not in setup.asked:
+                return formats.Question(
+                    field="name",
+                    prompt="Name for this layout",
+                    default=setup.values.get("name"),
+                )
+            pending = formats.remaining_questions(
+                setup.values, setup.rows, setup.fieldnames
+            )
+            if pending:
+                return pending[0]
+            if setup.values.get("account_column") and "account_prefix" not in setup.asked:
+                column = setup.values["account_column"]
+                sample = next(
+                    ((r.get(column) or "").strip() for r in setup.rows if r.get(column)),
+                    "1234",
+                )
+                return formats.Question(
+                    field="account_prefix",
+                    prompt=(
+                        f"Accounts are named after {column!r}, e.g. {sample!r}. "
+                        "Prefix for those names? (blank for none)"
+                    ),
+                    allow_empty=True,
+                )
+            return None
+        if setup.spec.needs_account and setup.account_name is None:
+            return formats.Question(
+                field="__account",
+                prompt=(
+                    f"{setup.path.name} does not say which account it is. "
+                    "Name the account"
+                ),
+            )
+        return None
+
+    def _advance_setup(self) -> None:
+        """Ask the next question, or finish: save the layout and import."""
+        setup = self._setup
+        if setup is None:
+            return
+
+        question = self._next_setup_question(setup)
+        if question is None and setup.spec is None:
+            try:
+                spec = formats.spec_from_values(setup.values)
+            except formats.InvalidFormat as error:
+                self.notify(str(error), severity="error", markup=False)
+                self._cancel_setup()
+                return
+            with self.session_factory() as session:
+                formats.save_format(session, spec)
+                session.commit()
+            setup.spec = spec
+            self.notify(f"Learned layout {spec.name!r}.")
+            question = self._next_setup_question(setup)
+
+        if question is not None:
+            setup.question = question
+            self._show_setup_question()
+            return
+
+        self._finish_setup()
+
+    def _finish_setup(self) -> None:
+        setup = self._setup
+        self._setup = None
+        with self.session_factory() as session:
+            result = import_csv(session, setup.path, account_name=setup.account_name)
+        self.reload()
+        self._show_imports()
+        self.notify(
+            f"{setup.path.name}: {result.inserted} added, "
+            f"{result.skipped_duplicates} skipped."
+        )
+
+    def _cancel_setup(self) -> None:
+        self._setup = None
+        self._show_imports()
+
+    def _show_setup_question(self) -> None:
+        table = self.query_one("#setup", DataTable)
+        table.clear()
+        question = self._setup.question
+        for index, choice in enumerate(question.choices, start=1):
+            table.add_row(Text(str(index), justify="right"), _truncate(str(choice), 44))
+        self._set_panel("setup")
+
+        hint = (
+            "Enter on a row, or type the number below."
+            if question.choices
+            else "Type your answer in the command bar below."
+        )
+        if question.default:
+            hint += f"  Blank accepts {question.default!r}."
+        elif question.allow_empty:
+            hint += "  Blank is allowed."
+        # Text(), not markup: prompts quote column names that may contain brackets.
+        self.query_one("#prompt", Static).update(
+            Text.assemble((question.prompt + "\n", "bold"), (hint, "dim"))
+        )
+        # An empty choices table is just noise, so only show it when there is a list.
+        table.display = bool(question.choices)
+        if not question.choices:
+            self.query_one("#command", Input).focus()
+
+    def _answer_setup(self, text: str) -> None:
+        """Apply one answer, then move on to whatever is next."""
+        setup = self._setup
+        question = setup.question
+        answer = text.strip()
+        if not answer and question.default:
+            answer = question.default
+        if question.choices and answer.isdigit():
+            index = int(answer)
+            if 1 <= index <= len(question.choices):
+                answer = str(question.choices[index - 1])
+        if not answer and not question.allow_empty:
+            self.notify("An answer is needed; escape cancels.", severity="warning")
+            return
+
+        setup.asked.add(question.field)
+        if question.field == "name":
+            setup.values["name"] = answer
+        elif question.field == "account_prefix":
+            setup.values["account_prefix"] = (
+                answer if not answer or answer.endswith(" ") else answer + " "
+            )
+        elif question.field == "__account":
+            setup.account_name = answer
+        else:
+            setup.values = formats.apply_answers(
+                setup.values, {question.field: answer}, setup.fieldnames, setup.rows
+            )
+        setup.question = None
+        self._advance_setup()
+
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        command = event.value.strip()
+        text = event.value
         event.input.value = ""
-        self._run_command(command)
+        if self._setup is not None and self._setup.question is not None:
+            self._answer_setup(text)
+            return
+        self._run_command(text.strip())
 
     def _run_command(self, command: str) -> None:
         if not command:
@@ -256,7 +505,8 @@ class BudgetApp(App):
             self._show_rules()
         elif name == "help":
             self.notify(
-                "import [path] — import a CSV (or all in data/to_import)\n"
+                "import — browse data/to_import; enter imports the selected file\n"
+                "import all | import <path> — import without browsing\n"
                 "rename <raw vendor> = <display name> — override / aggregate a vendor\n"
                 "rule <pattern> = <display name> — rename every matching vendor,\n"
                 "  now and on future imports (e.g. rule Kindle Svcs* = Kindle)\n"
@@ -272,28 +522,49 @@ class BudgetApp(App):
             self.notify(f"Unknown command: {name}", severity="warning")
 
     def _do_import(self, arg: str) -> None:
-        if arg:
+        if not arg:
+            # Bare "import" browses the inbox; enter on a row imports that file.
+            self._show_imports()
+            return
+        if arg == "all":
+            paths = sorted(TO_IMPORT_DIR.glob("*.csv"))
+            if not paths:
+                self.notify(f"No CSVs in {TO_IMPORT_DIR}", severity="warning")
+                return
+        else:
             path = Path(arg).expanduser()
             if not path.is_file():
                 self.notify(f"File not found: {path}", severity="error")
                 return
             paths = [path]
-        else:
-            paths = sorted(TO_IMPORT_DIR.glob("*.csv"))
-            if not paths:
-                self.notify(f"No CSVs in {TO_IMPORT_DIR}", severity="warning")
-                return
 
         added = skipped = 0
+        imported = 0
+        problems: List[str] = []
         with self.session_factory() as session:
             for path in paths:
-                result = import_csv(session, path)
+                try:
+                    result = import_csv(session, path)
+                except (formats.AccountRequired, formats.UnknownFormat) as error:
+                    problems.append(f"{path.name}: {error}")
+                    continue
+                imported += 1
                 added += result.inserted
                 skipped += result.skipped_duplicates
         self.reload()
         self.notify(
-            f"Imported {len(paths)} file(s): {added} added, {skipped} skipped."
+            f"Imported {imported} file(s): {added} added, {skipped} skipped."
         )
+        if problems:
+            # An unknown layout needs the interactive setup, and an account-less file
+            # needs --account; neither is something the app can decide for you.
+            self.notify(
+                "\n".join(problems) + "\n\nRun 'budget import <file>' to sort these out.",
+                title=f"{len(problems)} file(s) not imported",
+                severity="warning",
+                timeout=12,
+                markup=False,
+            )
 
     def _do_rename(self, arg: str) -> None:
         if "=" not in arg:
@@ -315,24 +586,35 @@ class BudgetApp(App):
         self.reload()
         self.notify(f"{raw!r} → {display!r}")
 
-    def _set_rules_visible(self, visible: bool) -> None:
-        """Swap the main panel between the transactions table and the rules table."""
-        self._rules_visible = visible
-        self.query_one("#txns", DataTable).display = not visible
-        self.query_one("#rules", DataTable).display = visible
-        if visible:
-            self.query_one("#rules", DataTable).focus()
-        else:
+    def _set_panel(self, panel: str) -> None:
+        """Show one of the main-view panels; escape always returns to transactions."""
+        self._panel = panel
+        for name in self.PANELS:
+            self.query_one(f"#{name}", DataTable).display = name == panel
+        self.query_one("#prompt", Static).display = panel == "setup"
+        if panel == "txns":
             self.query_one("#command", Input).focus()
+        else:
+            self.query_one(f"#{panel}", DataTable).focus()
         self._refresh_status()
 
     def _show_rules(self) -> None:
         self.reload()
-        self._set_rules_visible(True)
+        self._set_panel("rules")
         if not self._rules:
             self.notify(
                 "No vendor rules yet. Add one with:  rule <pattern> = <display name>"
             )
+
+    def _show_imports(self) -> None:
+        """List the files in the inbox, with whatever blocks each one."""
+        paths = sorted(TO_IMPORT_DIR.glob("*.csv"))
+        with self.session_factory() as session:
+            self._candidates = [inspect_csv(session, path) for path in paths]
+        self._fill_imports()
+        self._set_panel("imports")
+        if not self._candidates:
+            self.notify(f"No CSVs in {TO_IMPORT_DIR}", severity="warning")
 
     def _do_rule(self, arg: str) -> None:
         if not arg:
@@ -414,8 +696,12 @@ class BudgetApp(App):
         self._prefill_command(f"rename {vendor.name} = ")
 
     def action_show_transactions(self) -> None:
-        if self._rules_visible:
-            self._set_rules_visible(False)
+        if self._setup is not None:
+            self.notify(f"Setup for {self._setup.path.name} cancelled.")
+            self._cancel_setup()
+            return
+        if self._panel != "txns":
+            self._set_panel("txns")
 
     def action_refresh(self) -> None:
         self.reload()

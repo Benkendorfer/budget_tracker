@@ -58,7 +58,8 @@ the bottom:
 
 | Command | Effect |
 | --- | --- |
-| `import` | Import every CSV in `data/to_import/` |
+| `import` | Browse `data/to_import/`; `enter` imports the highlighted file |
+| `import all` | Import every CSV in `data/to_import/` without browsing |
 | `import <path>` | Import a single CSV |
 | `rename <raw vendor> = <display name>` | Give one vendor a readable name (see below) |
 | `rule <pattern> = <display name>` | Rename every matching vendor, now and in future imports |
@@ -85,6 +86,8 @@ The same operations are available as subcommands, which is handy for scripting:
 # Import a CSV. With no path, pick interactively from data/to_import/.
 budget import ~/Downloads/statement.csv
 budget import --currency EUR ~/Downloads/statement_eur.csv
+# Exports that do not name their account (see "Importing data") need --account.
+budget import --account "Checking" ~/Downloads/checking.csv
 
 # List transactions, most recent first (default limit: 50).
 budget list
@@ -167,20 +170,83 @@ and `raw_description` always preserves the bank's original text.
 
 ### Importing data
 
-The importer currently reads Capital One-style CSV exports with these columns:
+Every bank lays its CSV out differently, so the first time you import an unfamiliar
+layout the importer works out the mapping from the header and a sample of rows, then
+asks about anything it could not settle. This works the same way from either interface.
+
+**In the app**, `import` lists the files in `data/to_import/` with what stands in the way
+of each one:
 
 ```text
-Transaction Date, Posted Date, Card No., Description, Category, Debit, Credit
+ File                                Rows  Status
+ statement-june.csv                   516  cards
+ new-bank-export.csv                  387  needs setup
+
+ 2 file(s), 1 ready   enter to import   escape to return to transactions
 ```
 
-`Debit` is a charge (stored as a negative amount) and `Credit` is a payment or refund
-(positive). Files are read as UTF-8 or Windows-1252, so accented merchant names import
-cleanly. Re-importing the same file is safe: each row gets a content hash, and rows
-already present are reported as duplicates and skipped rather than doubled.
+Press `enter` on a file. A ready one imports straight away; one needing setup starts the
+walkthrough, which asks one question at a time — pick a column by pressing `enter` on it,
+or type your answer in the command bar. `escape` cancels without saving anything. Once
+the layout is learned the import continues by itself, and that file type never asks
+again.
+
+**From the command line** the same walkthrough runs as prompts:
+
+```text
+$ budget import ~/Downloads/statement.csv
+'statement.csv' does not match any format you have defined yet.
+Name for this layout [statement]: current
+
+Worked out from the header:
+  posted_date_column   Posting Date
+  description_column   Description
+  amount_column        Amount
+  date_formats         ['%m/%d/%Y']
+  (no account column — imports of this layout will need --account)
+
+Saved layout 'current'. Future imports of this shape are automatic.
+```
+
+Layouts are saved in the database, **not in the source tree**, so the repository never
+records which institutions you bank with. `budget format list` shows what has been
+learned, `budget format export` prints the definitions as JSON, and
+`budget format remove <name>` forgets one.
+
+What it works out for itself: which columns hold the dates, description, category, and
+account; whether the amount is one signed column or a `Debit`/`Credit` pair; the date
+format, tried against real values from the file; and which columns identify a row for
+deduplication (a unique id column if there is one, otherwise the mapped fields).
+
+What it asks about, rather than guess:
+
+- A column it cannot place — it lists the header and you pick by number.
+- **Ambiguous dates.** If every sampled day is 12 or lower, `01/02/2026` could be
+  January 2nd or February 1st, and guessing would silently mis-date transactions.
+- **An account-name prefix.** A card column gives `8207`; only you know it should read
+  `Card 8207`. Getting this wrong would create a second account for the same card.
+
+A `Debit` is a charge (stored negative) and a `Credit` is a payment or refund (positive);
+a signed amount column already uses that convention. Files are read as UTF-8 or
+Windows-1252, so accented merchant names import cleanly. Re-importing is safe: each row
+gets a stable hash and rows already present are skipped rather than doubled.
+
+Some exports do not identify their account — a checking file and a savings file from the
+same institution can be identical apart from their rows. Those layouts require
+`--account`, and nothing is guessed:
+
+```bash
+budget import --account "Checking" ~/Downloads/checking.csv
+budget import --account "Savings"  ~/Downloads/savings.csv
+```
+
+Passing `--account` for a layout that *does* carry an account column overrides the
+derived name. `--format` forces a known layout if detection ever picks wrong.
 
 Dropping statements into `data/to_import/` lets you import them without typing paths —
-`budget import` prompts you to choose one, and the TUI's `import` command takes them all
-at once.
+`budget import` prompts you to choose one, and the app's `import` command browses them.
+`import all` in the app imports every recognised file in one go and reports the ones that
+need setup rather than stopping.
 
 ### Where the data lives
 
