@@ -62,13 +62,14 @@ the bottom:
 | `import <path>` | Import a single CSV |
 | `rename <raw vendor> = <display name>` | Give one vendor a readable name (see below) |
 | `rule <pattern> = <display name>` | Rename every matching vendor, now and in future imports |
-| `rules` | List the rules you have defined (`rule` on its own does the same) |
+| `rules` | Open the rules panel (`rule` on its own does the same); `escape` returns |
 | `all` | Clear all filters |
 | `refresh` | Reload from the database |
 | `help` | Show this list in-app |
 | `quit` | Exit |
 
-Keyboard shortcuts: `ctrl+l` clears filters, `ctrl+r` refreshes, and `ctrl+c` quits.
+Keyboard shortcuts: `ctrl+l` clears filters, `ctrl+r` refreshes, `escape` returns to the
+transactions from the rules panel, and `ctrl+c` quits.
 
 `ctrl+n` prefills a `rename` command for whichever vendor you are pointing at. With the
 transaction table focused, that is the vendor of the transaction under the cursor —
@@ -127,10 +128,22 @@ budget rule remove "AMAZON*"               # reverts the vendors it had named
 budget rule apply                          # re-run every rule
 ```
 
-In the app, the equivalent command is `rule Kindle Svcs* = Kindle`, and `rules` (or a
-bare `rule`) lists what you have defined. The listing shows the first 12 rules and then
-points at `budget rule list` for the rest, since a notification is a poor place for a
-long list. Removing a rule is CLI-only for now.
+In the app, the equivalent command is `rule Kindle Svcs* = Kindle`. Typing `rules` (or a
+bare `rule`) replaces the transaction table with a rules panel listing every pattern,
+the name it maps to, and how many raw vendors it currently covers — which is the quickest
+way to see whether a pattern is doing anything:
+
+```text
+ Pattern                       Display name        Vendors
+ Kindle Svcs*                  Kindle                    5
+ AMAZON*                       Amazon                   12
+ *CAVA*                        CAVA                      3
+
+ 3 rules   naming 20 vendors   escape to return to transactions
+```
+
+Press `escape` to go back to the transactions. Adding a rule while the panel is open
+updates it in place. Removing a rule is CLI-only for now.
 
 Patterns are shell-style globs (`*` and `?`) matched case-insensitively against the raw
 vendor name. Note that `*` is a wildcard in the pattern even though banks often emit it

@@ -48,7 +48,7 @@ class BudgetApp(App):
     CSS = """
     #sidebar { width: 36; }
     #accounts, #categories { border: round $accent; height: 1fr; }
-    #txns { border: round $accent; height: 1fr; }
+    #txns, #rules { border: round $accent; height: 1fr; }
     #status { height: 1; padding: 0 1; color: $text-muted; background: $panel; }
     #command { border: tall $accent; }
     .heading { padding: 0 1; text-style: bold; color: $accent; }
@@ -58,6 +58,7 @@ class BudgetApp(App):
         ("ctrl+r", "refresh", "Refresh"),
         ("ctrl+l", "clear_filters", "Clear filters"),
         ("ctrl+n", "rename_vendor", "Rename vendor"),
+        ("escape", "show_transactions", "Back to transactions"),
         ("ctrl+c", "quit", "Quit"),
     ]
 
@@ -74,6 +75,9 @@ class BudgetApp(App):
         self._categories: List[queries.CategoryRow] = []
         # Parallel to the rows in #txns, so a cursor index maps back to a transaction.
         self._txns: List[queries.TxnRow] = []
+        self._rules: List[queries.RuleRow] = []
+        self._rules_visible = False
+        self._totals = queries.Totals(count=0, net_minor=0, outflow_minor=0, inflow_minor=0)
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -87,6 +91,7 @@ class BudgetApp(App):
                 yield ListView(id="categories")
             with Vertical(id="main"):
                 yield DataTable(id="txns")
+                yield DataTable(id="rules")
                 yield Static("", id="status")
         yield Input(
             placeholder="command: import [path] | all | refresh | help | quit",
@@ -104,6 +109,17 @@ class BudgetApp(App):
         table.add_column("Vendor", width=20)
         table.add_column("Category", width=14)
         table.add_column("Amount", width=12)
+
+        rules = self.query_one("#rules", DataTable)
+        rules.cursor_type = "row"
+        rules.zebra_stripes = True
+        # Widths are chosen so all three columns fit beside the 36-wide sidebar without
+        # the count — the point of the panel — scrolling off the right edge.
+        rules.add_column("Pattern", width=28)
+        rules.add_column("Display name", width=18)
+        rules.add_column("Vendors", width=7)
+        rules.display = False  # the transactions table owns the panel by default
+
         self.reload()
         self.query_one("#command", Input).focus()
 
@@ -113,6 +129,7 @@ class BudgetApp(App):
             self._accounts = queries.get_accounts(session)
             self._vendors = queries.get_vendors(session)
             self._categories = queries.get_categories(session)
+            self._rules = queries.get_rules(session)
             txns = queries.get_transactions(
                 session,
                 self.account_filter,
@@ -132,7 +149,9 @@ class BudgetApp(App):
             [f"{c.name} ({c.count})  {_fmt_amount(c.total_minor)}" for c in self._categories],
         )
         self._fill_txns(txns)
-        self._set_status(totals)
+        self._fill_rules()
+        self._totals = totals
+        self._refresh_status()
 
     def _fill_list(self, selector: str, labels: List[str]) -> None:
         list_view = self.query_one(selector, ListView)
@@ -153,6 +172,28 @@ class BudgetApp(App):
                 _truncate(txn.category, 14),
                 _amount_cell(txn.amount_minor),
             )
+
+    def _fill_rules(self) -> None:
+        table = self.query_one("#rules", DataTable)
+        table.clear()
+        for rule in self._rules:
+            table.add_row(
+                _truncate(rule.pattern, 28),
+                _truncate(rule.name, 18),
+                Text(str(rule.vendor_count), justify="right"),
+            )
+
+    def _refresh_status(self) -> None:
+        if self._rules_visible:
+            count = len(self._rules)
+            named = sum(rule.vendor_count for rule in self._rules)
+            self.query_one("#status", Static).update(
+                f"{count} rule{'s' if count != 1 else ''}   "
+                f"naming {named} vendors   "
+                "escape to return to transactions"
+            )
+            return
+        self._set_status(self._totals)
 
     def _set_status(self, totals: queries.Totals) -> None:
         scope = []
@@ -219,7 +260,7 @@ class BudgetApp(App):
                 "rename <raw vendor> = <display name> — override / aggregate a vendor\n"
                 "rule <pattern> = <display name> — rename every matching vendor,\n"
                 "  now and on future imports (e.g. rule Kindle Svcs* = Kindle)\n"
-                "rules — list the rules you have defined\n"
+                "rules — list the rules you have defined (escape returns)\n"
                 "all — clear filters   refresh — reload   quit — exit\n"
                 "Click an account/vendor/category to filter.\n"
                 "ctrl+n — prefill rename for the selected transaction's vendor,\n"
@@ -274,30 +315,24 @@ class BudgetApp(App):
         self.reload()
         self.notify(f"{raw!r} → {display!r}")
 
-    # Beyond this many, a notification is the wrong surface; point at the CLI instead.
-    RULES_SHOWN = 12
+    def _set_rules_visible(self, visible: bool) -> None:
+        """Swap the main panel between the transactions table and the rules table."""
+        self._rules_visible = visible
+        self.query_one("#txns", DataTable).display = not visible
+        self.query_one("#rules", DataTable).display = visible
+        if visible:
+            self.query_one("#rules", DataTable).focus()
+        else:
+            self.query_one("#command", Input).focus()
+        self._refresh_status()
 
     def _show_rules(self) -> None:
-        with self.session_factory() as session:
-            rules = [(r.pattern, r.vendor_name.value) for r in vendors.list_rules(session)]
-        if not rules:
+        self.reload()
+        self._set_rules_visible(True)
+        if not self._rules:
             self.notify(
-                "No vendor rules yet. Add one with:  rule <pattern> = <display name>",
-                title="Vendor rules",
-                timeout=8,
+                "No vendor rules yet. Add one with:  rule <pattern> = <display name>"
             )
-            return
-        shown = rules[: self.RULES_SHOWN]
-        width = max(len(pattern) for pattern, _ in shown)
-        lines = [f"{pattern:<{width}}  ->  {name}" for pattern, name in shown]
-        if len(rules) > len(shown):
-            lines.append(f"... and {len(rules) - len(shown)} more (budget rule list)")
-        self.notify(
-            "\n".join(lines),
-            title=f"{len(rules)} vendor rule{'s' if len(rules) != 1 else ''}",
-            timeout=10,
-            markup=False,  # patterns are user text and may contain "[" or "*"
-        )
 
     def _do_rule(self, arg: str) -> None:
         if not arg:
@@ -377,6 +412,10 @@ class BudgetApp(App):
             self._prefill_command("rename ")
             return
         self._prefill_command(f"rename {vendor.name} = ")
+
+    def action_show_transactions(self) -> None:
+        if self._rules_visible:
+            self._set_rules_visible(False)
 
     def action_refresh(self) -> None:
         self.reload()

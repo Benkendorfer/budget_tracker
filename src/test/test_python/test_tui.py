@@ -6,7 +6,7 @@ suite does not need pytest-asyncio.
 
 import asyncio
 
-from textual.widgets import DataTable, Input, ListView
+from textual.widgets import DataTable, Input, ListView, Static
 
 from budget_tracker import vendors
 from budget_tracker.db import get_engine, get_sessionmaker, init_db
@@ -140,41 +140,82 @@ def test_sidebar_still_used_when_table_not_focused(tmp_path, monkeypatch):
     assert asyncio.run(run()) == "rename COFFEE SHOP B = "
 
 
-def _notifications(app):
-    return [(n.title, n.message) for n in app._notifications]
+def _panel_state(app):
+    """(transactions visible, rules visible, status line)."""
+    return (
+        app.query_one("#txns", DataTable).display,
+        app.query_one("#rules", DataTable).display,
+        str(app.query_one("#status", Static).content),
+    )
 
 
-def test_rules_command_lists_rules(tmp_path, monkeypatch):
+def test_rules_command_opens_the_main_panel(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
 
     async def run():
         app = BudgetApp()
         async with app.run_test() as pilot:
-            app._run_command("rules")  # nothing defined yet
-            await pilot.pause()
-            empty = _notifications(app)[-1]
+            before = _panel_state(app)
 
             app._run_command("rule COFFEE* = Coffee")
             app._run_command("rule *GROCER* = Groceries")
             await pilot.pause()
             app._run_command("rules")
             await pilot.pause()
-            listed = _notifications(app)[-1]
-            return empty, listed
 
-    empty, listed = asyncio.run(run())
-    assert empty[0] == "Vendor rules"
-    assert "No vendor rules yet" in empty[1]
+            table = app.query_one("#rules", DataTable)
+            rows = [
+                [str(c) for c in table.get_row_at(i)] for i in range(table.row_count)
+            ]
+            return before, _panel_state(app), rows, app.focused.id
 
-    assert listed[0] == "2 vendor rules"
-    # Patterns are padded to a common width and paired with their display name.
-    assert listed[1].splitlines() == [
-        "COFFEE*   ->  Coffee",
-        "*GROCER*  ->  Groceries",
-    ]
+    before, after, rows, focused = asyncio.run(run())
+    assert before == (True, False, before[2])  # transactions own the panel on mount
+    assert after[0] is False and after[1] is True
+    # COFFEE* names both coffee vendors; *GROCER* matches nothing in this data.
+    assert rows == [["COFFEE*", "Coffee", "2"], ["*GROCER*", "Groceries", "0"]]
+    assert "2 rules" in after[2] and "escape to return" in after[2]
+    assert focused == "rules"
 
 
-def test_bare_rule_command_also_lists(tmp_path, monkeypatch):
+def test_escape_returns_to_transactions(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._run_command("rule COFFEE* = Coffee")
+            await pilot.pause()
+            app._run_command("rules")
+            await pilot.pause()
+            opened = _panel_state(app)
+
+            await pilot.press("escape")
+            await pilot.pause()
+            return opened, _panel_state(app), app.focused.id
+
+    opened, closed, focused = asyncio.run(run())
+    assert opened[1] is True
+    assert closed[0] is True and closed[1] is False
+    assert "txns" in closed[2]  # the totals line is back
+    assert focused == "command"
+
+
+def test_escape_is_a_noop_in_transaction_view(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            await pilot.press("escape")
+            await pilot.pause()
+            return _panel_state(app)
+
+    visible_txns, visible_rules, _ = asyncio.run(run())
+    assert visible_txns is True and visible_rules is False
+
+
+def test_bare_rule_command_also_opens_the_panel(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
 
     async def run():
@@ -184,31 +225,47 @@ def test_bare_rule_command_also_lists(tmp_path, monkeypatch):
             await pilot.pause()
             app._run_command("rule")
             await pilot.pause()
-            return _notifications(app)[-1]
+            return _panel_state(app), app.query_one("#rules", DataTable).row_count
 
-    title, message = asyncio.run(run())
-    assert title == "1 vendor rule"  # singular
-    assert message == "COFFEE*  ->  Coffee"
+    state, row_count = asyncio.run(run())
+    assert state[1] is True
+    assert row_count == 1
+    assert "1 rule " in state[2]  # singular
 
 
-def test_rules_listing_is_capped(tmp_path, monkeypatch):
+def test_rules_panel_with_no_rules_is_empty_and_notifies(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
 
     async def run():
         app = BudgetApp()
         async with app.run_test() as pilot:
-            for i in range(app.RULES_SHOWN + 3):
-                app._run_command(f"rule PATTERN{i:02d}* = Name{i:02d}")
-            await pilot.pause()
             app._run_command("rules")
             await pilot.pause()
-            return _notifications(app)[-1]
+            messages = [n.message for n in app._notifications]
+            return _panel_state(app), app.query_one("#rules", DataTable).row_count, messages
 
-    title, message = asyncio.run(run())
-    lines = message.splitlines()
-    assert title == "15 vendor rules"
-    assert len(lines) == 13  # 12 rules + the overflow hint
-    assert lines[-1] == "... and 3 more (budget rule list)"
+    state, row_count, messages = asyncio.run(run())
+    assert state[1] is True  # the panel still opens, just empty
+    assert row_count == 0
+    assert any("No vendor rules yet" in m for m in messages)
+
+
+def test_new_rule_appears_in_an_open_panel(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._run_command("rules")
+            await pilot.pause()
+            app._run_command("rule COFFEE* = Coffee")
+            await pilot.pause()
+            table = app.query_one("#rules", DataTable)
+            return _panel_state(app), table.row_count
+
+    state, row_count = asyncio.run(run())
+    assert state[1] is True  # still on the rules panel
+    assert row_count == 1  # and it picked up the rule that was just added
 
 
 def test_shortcut_with_no_vendor_selected_does_nothing(tmp_path, monkeypatch):

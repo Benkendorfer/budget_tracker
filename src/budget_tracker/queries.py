@@ -16,7 +16,15 @@ from typing import List, Optional, Tuple
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from .models import Account, Category, Currency, Transaction, Vendor, VendorName
+from .models import (
+    Account,
+    Category,
+    Currency,
+    Transaction,
+    Vendor,
+    VendorName,
+    VendorRule,
+)
 
 VendorFilter = Tuple[str, int]
 
@@ -55,6 +63,14 @@ class TxnRow:
     category: str
     amount_minor: int
     currency: str
+
+
+@dataclass
+class RuleRow:
+    id: int
+    pattern: str
+    name: str
+    vendor_count: int  # raw vendors this rule currently names
 
 
 @dataclass
@@ -120,6 +136,32 @@ def get_categories(session: Session) -> List[CategoryRow]:
     ).all()
     return [
         CategoryRow(id=r[0], name=r[1], count=r[2], total_minor=r[3]) for r in rows
+    ]
+
+
+def get_rules(session: Session) -> List[RuleRow]:
+    """Vendor rules with the number of raw vendors each one currently names.
+
+    Attribution mirrors :func:`vendors.apply_rules` — first match in ``id`` order wins —
+    so two rules pointing at the same display name are still counted separately.
+    """
+    from .vendors import RULE, matches  # local import keeps the dependency one-way
+
+    rules = list(session.scalars(select(VendorRule).order_by(VendorRule.id)))
+    counts = {rule.id: 0 for rule in rules}
+    owned = session.scalars(select(Vendor).where(Vendor.vendor_name_source == RULE))
+    for vendor in owned:
+        match = next((r for r in rules if matches(r.pattern, vendor.name)), None)
+        if match is not None:
+            counts[match.id] += 1
+    return [
+        RuleRow(
+            id=rule.id,
+            pattern=rule.pattern,
+            name=rule.vendor_name.value,
+            vendor_count=counts[rule.id],
+        )
+        for rule in rules
     ]
 
 
