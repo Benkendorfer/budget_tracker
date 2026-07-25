@@ -6,7 +6,7 @@ suite does not need pytest-asyncio.
 
 import asyncio
 
-from textual.widgets import Input, ListView
+from textual.widgets import DataTable, Input, ListView
 
 from budget_tracker import vendors
 from budget_tracker.db import get_engine, get_sessionmaker, init_db
@@ -79,6 +79,136 @@ def test_shortcut_on_override_group_prefills_verb_only(tmp_path, monkeypatch):
             return app.query_one("#command", Input).value
 
     assert asyncio.run(run()) == "rename "
+
+
+def test_shortcut_uses_focused_transactions_cursor(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            table = app.query_one("#txns", DataTable)
+            table.focus()
+            # Transactions sort newest first, so row 0 is the 2025-07-03 COFFEE SHOP A.
+            table.move_cursor(row=0)
+            await pilot.press("ctrl+n")
+            first = app.query_one("#command", Input).value
+
+            table.focus()
+            table.move_cursor(row=1)  # 2025-07-01 COFFEE SHOP B
+            await pilot.press("ctrl+n")
+            second = app.query_one("#command", Input).value
+            return first, second
+
+    assert asyncio.run(run()) == (
+        "rename COFFEE SHOP A = ",
+        "rename COFFEE SHOP B = ",
+    )
+
+
+def test_transaction_shortcut_uses_raw_name_not_display_name(tmp_path, monkeypatch):
+    """A grouped vendor is still renameable from the table, which knows the raw string."""
+    session_factory = _setup(tmp_path, monkeypatch)
+    with session_factory() as session:
+        vendors.set_override(session, "COFFEE SHOP A", "Coffee")
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            table = app.query_one("#txns", DataTable)
+            row = next(i for i, t in enumerate(app._txns) if t.vendor == "Coffee")
+            table.focus()
+            table.move_cursor(row=row)
+            await pilot.press("ctrl+n")
+            return app.query_one("#command", Input).value
+
+    # The sidebar would only know "Coffee", which set_override cannot match.
+    assert asyncio.run(run()) == "rename COFFEE SHOP A = "
+
+
+def test_sidebar_still_used_when_table_not_focused(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            # The command bar holds focus on mount; the table cursor must not win.
+            app.query_one("#vendors", ListView).index = 2  # COFFEE SHOP B
+            await pilot.press("ctrl+n")
+            return app.query_one("#command", Input).value
+
+    assert asyncio.run(run()) == "rename COFFEE SHOP B = "
+
+
+def _notifications(app):
+    return [(n.title, n.message) for n in app._notifications]
+
+
+def test_rules_command_lists_rules(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._run_command("rules")  # nothing defined yet
+            await pilot.pause()
+            empty = _notifications(app)[-1]
+
+            app._run_command("rule COFFEE* = Coffee")
+            app._run_command("rule *GROCER* = Groceries")
+            await pilot.pause()
+            app._run_command("rules")
+            await pilot.pause()
+            listed = _notifications(app)[-1]
+            return empty, listed
+
+    empty, listed = asyncio.run(run())
+    assert empty[0] == "Vendor rules"
+    assert "No vendor rules yet" in empty[1]
+
+    assert listed[0] == "2 vendor rules"
+    # Patterns are padded to a common width and paired with their display name.
+    assert listed[1].splitlines() == [
+        "COFFEE*   ->  Coffee",
+        "*GROCER*  ->  Groceries",
+    ]
+
+
+def test_bare_rule_command_also_lists(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._run_command("rule COFFEE* = Coffee")
+            await pilot.pause()
+            app._run_command("rule")
+            await pilot.pause()
+            return _notifications(app)[-1]
+
+    title, message = asyncio.run(run())
+    assert title == "1 vendor rule"  # singular
+    assert message == "COFFEE*  ->  Coffee"
+
+
+def test_rules_listing_is_capped(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            for i in range(app.RULES_SHOWN + 3):
+                app._run_command(f"rule PATTERN{i:02d}* = Name{i:02d}")
+            await pilot.pause()
+            app._run_command("rules")
+            await pilot.pause()
+            return _notifications(app)[-1]
+
+    title, message = asyncio.run(run())
+    lines = message.splitlines()
+    assert title == "15 vendor rules"
+    assert len(lines) == 13  # 12 rules + the overflow hint
+    assert lines[-1] == "... and 3 more (budget rule list)"
 
 
 def test_shortcut_with_no_vendor_selected_does_nothing(tmp_path, monkeypatch):

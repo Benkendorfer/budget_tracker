@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -42,8 +42,32 @@ def get_engine(db_path: Optional[Path] = None) -> Engine:
     return create_engine(f"sqlite:///{path}", future=True)
 
 
+# Columns added to existing tables after the first release. ``create_all`` only creates
+# missing *tables*, so these are applied by hand; SQLite ADD COLUMN is cheap and safe.
+_ADDED_COLUMNS = {
+    "vendor": {"vendor_name_source": "VARCHAR"},
+}
+
+
+def _add_missing_columns(engine: Engine) -> None:
+    """Idempotently add known-new columns to tables that predate them."""
+    inspector = inspect(engine)
+    existing_tables = set(inspector.get_table_names())
+    with engine.begin() as connection:
+        for table, columns in _ADDED_COLUMNS.items():
+            if table not in existing_tables:
+                continue  # create_all() just made it, already correct
+            present = {c["name"] for c in inspector.get_columns(table)}
+            for column, sql_type in columns.items():
+                if column not in present:
+                    connection.execute(
+                        text(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
+                    )
+
+
 def init_db(engine: Engine) -> None:
-    """Create any missing tables."""
+    """Create any missing tables, then patch in any columns added since."""
+    _add_missing_columns(engine)
     Base.metadata.create_all(engine)
 
 

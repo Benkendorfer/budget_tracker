@@ -76,6 +76,10 @@ class Vendor(Base):
     ``vendor_name_id`` is NULL by default (no override), in which case ``name`` is the
     display name. Point it at a :class:`VendorName` to rename and/or aggregate several
     raw vendors under one readable name.
+
+    ``vendor_name_source`` records who set the override (``manual`` / ``rule``, NULL when
+    there is none), following the same convention as ``transaction.category_source``.
+    Rules only ever touch rows they own, so a manual rename is never clobbered.
     """
 
     __tablename__ = "vendor"
@@ -85,12 +89,31 @@ class Vendor(Base):
     vendor_name_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("vendor_name.id"), default=None
     )
+    vendor_name_source: Mapped[Optional[str]] = mapped_column(String, default=None)
 
     vendor_name: Mapped[Optional[VendorName]] = relationship()
 
     @property
     def display_name(self) -> str:
         return self.vendor_name.value if self.vendor_name else self.name
+
+
+class VendorRule(Base):
+    """A glob pattern that maps matching raw vendor strings to a :class:`VendorName`.
+
+    ``pattern`` is matched case-insensitively against ``vendor.name`` with shell-style
+    globbing (``*`` and ``?``), so ``Kindle Svcs*`` catches every ``Kindle Svcs*<ref>``
+    the bank emits. Rules are evaluated in ``id`` order and the first match wins.
+    """
+
+    __tablename__ = "vendor_rule"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    pattern: Mapped[str] = mapped_column(String, unique=True)
+    vendor_name_id: Mapped[int] = mapped_column(ForeignKey("vendor_name.id"))
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+    vendor_name: Mapped[VendorName] = relationship()
 
 
 class Import(Base):

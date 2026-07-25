@@ -72,6 +72,8 @@ class BudgetApp(App):
         self._accounts: List[queries.AccountRow] = []
         self._vendors: List[queries.VendorRow] = []
         self._categories: List[queries.CategoryRow] = []
+        # Parallel to the rows in #txns, so a cursor index maps back to a transaction.
+        self._txns: List[queries.TxnRow] = []
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -142,6 +144,7 @@ class BudgetApp(App):
     def _fill_txns(self, txns: List[queries.TxnRow]) -> None:
         table = self.query_one("#txns", DataTable)
         table.clear()
+        self._txns = txns
         for txn in txns:
             table.add_row(
                 txn.posted_date,
@@ -206,13 +209,21 @@ class BudgetApp(App):
             self._do_import(arg)
         elif name == "rename":
             self._do_rename(arg)
+        elif name == "rule":
+            self._do_rule(arg)
+        elif name == "rules":
+            self._show_rules()
         elif name == "help":
             self.notify(
                 "import [path] — import a CSV (or all in data/to_import)\n"
                 "rename <raw vendor> = <display name> — override / aggregate a vendor\n"
+                "rule <pattern> = <display name> — rename every matching vendor,\n"
+                "  now and on future imports (e.g. rule Kindle Svcs* = Kindle)\n"
+                "rules — list the rules you have defined\n"
                 "all — clear filters   refresh — reload   quit — exit\n"
                 "Click an account/vendor/category to filter.\n"
-                "ctrl+n — prefill rename for the selected vendor.",
+                "ctrl+n — prefill rename for the selected transaction's vendor,\n"
+                "  or for the selected vendor in the sidebar.",
                 title="Commands",
                 timeout=8,
             )
@@ -263,6 +274,53 @@ class BudgetApp(App):
         self.reload()
         self.notify(f"{raw!r} → {display!r}")
 
+    # Beyond this many, a notification is the wrong surface; point at the CLI instead.
+    RULES_SHOWN = 12
+
+    def _show_rules(self) -> None:
+        with self.session_factory() as session:
+            rules = [(r.pattern, r.vendor_name.value) for r in vendors.list_rules(session)]
+        if not rules:
+            self.notify(
+                "No vendor rules yet. Add one with:  rule <pattern> = <display name>",
+                title="Vendor rules",
+                timeout=8,
+            )
+            return
+        shown = rules[: self.RULES_SHOWN]
+        width = max(len(pattern) for pattern, _ in shown)
+        lines = [f"{pattern:<{width}}  ->  {name}" for pattern, name in shown]
+        if len(rules) > len(shown):
+            lines.append(f"... and {len(rules) - len(shown)} more (budget rule list)")
+        self.notify(
+            "\n".join(lines),
+            title=f"{len(rules)} vendor rule{'s' if len(rules) != 1 else ''}",
+            timeout=10,
+            markup=False,  # patterns are user text and may contain "[" or "*"
+        )
+
+    def _do_rule(self, arg: str) -> None:
+        if not arg:
+            self._show_rules()
+            return
+        if "=" not in arg:
+            self.notify(
+                "Usage: rule <pattern> = <display name>", severity="warning"
+            )
+            return
+        pattern, display = (part.strip() for part in arg.split("=", 1))
+        if not pattern or not display:
+            self.notify(
+                "Usage: rule <pattern> = <display name>", severity="warning"
+            )
+            return
+        with self.session_factory() as session:
+            vendors.add_rule(session, pattern, display)
+            changed = vendors.apply_rules(session)
+            session.commit()
+        self.reload()
+        self.notify(f"{pattern!r} → {display!r} ({changed} vendors updated)")
+
     # --------------------------------------------------------------- actions
     def _selected_vendor(self) -> Optional[queries.VendorRow]:
         """The vendor ctrl+n targets: the active filter, else the highlighted row."""
@@ -284,7 +342,27 @@ class BudgetApp(App):
         command.cursor_position = len(text)
         command.focus()
 
+    def _cursor_txn(self) -> Optional[queries.TxnRow]:
+        """The transaction under the table cursor, when the table has focus."""
+        table = self.query_one("#txns", DataTable)
+        if self.focused is not table:
+            return None
+        row = table.cursor_row
+        if not 0 <= row < len(self._txns):
+            return None
+        return self._txns[row]
+
     def action_rename_vendor(self) -> None:
+        # In the transaction table, target the selected transaction's vendor. Rows carry
+        # the raw merchant string, so this works even for already-grouped vendors.
+        txn = self._cursor_txn()
+        if txn is not None:
+            if not txn.vendor_raw:
+                self.notify("That transaction has no vendor.", severity="warning")
+                return
+            self._prefill_command(f"rename {txn.vendor_raw} = ")
+            return
+
         vendor = self._selected_vendor()
         if vendor is None:
             self.notify("Select a vendor in the sidebar first.", severity="warning")

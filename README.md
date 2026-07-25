@@ -9,6 +9,7 @@
     - [The interactive app](#the-interactive-app)
     - [The command line](#the-command-line)
     - [Renaming and grouping vendors](#renaming-and-grouping-vendors)
+    - [Vendor rename rules](#vendor-rename-rules)
     - [Importing data](#importing-data)
     - [Where the data lives](#where-the-data-lives)
     - [Running the tests](#running-the-tests)
@@ -59,14 +60,21 @@ the bottom:
 | --- | --- |
 | `import` | Import every CSV in `data/to_import/` |
 | `import <path>` | Import a single CSV |
-| `rename <raw vendor> = <display name>` | Give a vendor a readable name (see below) |
+| `rename <raw vendor> = <display name>` | Give one vendor a readable name (see below) |
+| `rule <pattern> = <display name>` | Rename every matching vendor, now and in future imports |
+| `rules` | List the rules you have defined (`rule` on its own does the same) |
 | `all` | Clear all filters |
 | `refresh` | Reload from the database |
 | `help` | Show this list in-app |
 | `quit` | Exit |
 
-Keyboard shortcuts: `ctrl+n` prefills a `rename` command for the currently selected
-vendor, `ctrl+l` clears filters, `ctrl+r` refreshes, and `ctrl+c` quits.
+Keyboard shortcuts: `ctrl+l` clears filters, `ctrl+r` refreshes, and `ctrl+c` quits.
+
+`ctrl+n` prefills a `rename` command for whichever vendor you are pointing at. With the
+transaction table focused, that is the vendor of the transaction under the cursor —
+which works even for vendors you have already grouped, because each row remembers the
+raw merchant string. Otherwise it falls back to the vendor sidebar: the active vendor
+filter if there is one, else the highlighted row.
 
 ### The command line
 
@@ -103,7 +111,46 @@ budget rename "COFFEE SHOP B" "Coffee"   # both now report under "Coffee"
 Renames are stored separately from transactions and survive re-importing — the importer
 matches vendors on the raw string and never overwrites an existing display name. Note
 that the match is exact, so if your bank starts exporting a new variant of the string
-(`COFFEE SHOP A #4471`), that variant arrives as a separate, un-renamed vendor.
+(`COFFEE SHOP A #4471`), that variant arrives as a separate, un-renamed vendor. Use a
+rule instead when you expect variants.
+
+### Vendor rename rules
+
+Sometimes, one merchant arrives as many raw vendors, like `Kindle Svcs*BY3UO9RV2`, `Kindle Svcs*BS4XF2Z70`, and so
+on. A rule renames all of them at once, including any that show up in later imports:
+
+```bash
+budget rule add "Kindle Svcs*" "Kindle"    # 5 vendors updated
+budget rule add "AMAZON*" "Amazon"         # catches AMAZON MKTPL*, Amazon.com*, ...
+budget rule list
+budget rule remove "AMAZON*"               # reverts the vendors it had named
+budget rule apply                          # re-run every rule
+```
+
+In the app, the equivalent command is `rule Kindle Svcs* = Kindle`, and `rules` (or a
+bare `rule`) lists what you have defined. The listing shows the first 12 rules and then
+points at `budget rule list` for the rest, since a notification is a poor place for a
+long list. Removing a rule is CLI-only for now.
+
+Patterns are shell-style globs (`*` and `?`) matched case-insensitively against the raw
+vendor name. Note that `*` is a wildcard in the pattern even though banks often emit it
+literally — which is precisely why `Kindle Svcs*` is the natural pattern for
+`Kindle Svcs*BY3UO9RV2`. A pattern with no wildcard matches exactly, so use `*CAVA*` to
+match anywhere in the string. When several rules match, the oldest one wins.
+
+Rules and manual renames coexist predictably, because each vendor records which set its
+name:
+
+- **A manual `rename` always wins.** Rules skip vendors you have renamed by hand, so
+  applying a broad rule can never undo a deliberate choice.
+- **Rules own the vendors they name.** Re-pointing a rule to a different name updates
+  them, and removing a rule reverts them to their raw names.
+- **Imports apply rules automatically**, so new merchant variants are folded in without
+  a manual step. `budget rule apply` is only needed if the database is changed outside
+  the app.
+
+Rules are stored, not baked in: they are re-evaluated rather than rewriting transactions,
+and `raw_description` always preserves the bank's original text.
 
 ### Importing data
 

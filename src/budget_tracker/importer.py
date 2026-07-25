@@ -217,6 +217,12 @@ def import_csv(
     if len(account_ids) == 1:
         import_record.account_id = next(iter(account_ids))
 
+    # Name any newly-seen vendors that an existing rule covers. Imported here to keep
+    # the module-level dependency one-way (vendors -> models only).
+    from .vendors import apply_rules
+
+    apply_rules(session)
+
     session.commit()
     return ImportResult(
         source_file=path.name,

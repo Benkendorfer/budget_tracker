@@ -50,7 +50,8 @@ class TxnRow:
     id: int
     posted_date: str
     description: str
-    vendor: str
+    vendor: str  # effective (display) name — the override if there is one
+    vendor_raw: str  # the raw merchant string, which overrides are keyed on
     category: str
     amount_minor: int
     currency: str
@@ -165,6 +166,7 @@ def get_transactions(
                 posted_date=txn.posted_date.isoformat(),
                 description=txn.description,
                 vendor=txn.vendor.display_name if txn.vendor else "",
+                vendor_raw=txn.vendor.name if txn.vendor else "",
                 category=txn.category.value if txn.category else "",
                 amount_minor=txn.value_minor,
                 currency=txn.currency.value,

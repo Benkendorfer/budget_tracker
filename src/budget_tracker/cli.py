@@ -136,6 +136,46 @@ def _cmd_rename(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_rule(args: argparse.Namespace) -> int:
+    from . import vendors
+
+    engine = get_engine()
+    init_db(engine)
+    session_factory = get_sessionmaker(engine)
+
+    with session_factory() as session:
+        if args.rule_command == "list":
+            rules = vendors.list_rules(session)
+            if not rules:
+                print("No vendor rules defined.")
+                return 0
+            width = max(len(r.pattern) for r in rules)
+            for rule in rules:
+                print(f"  {rule.pattern:<{width}}  ->  {rule.vendor_name.value}")
+            return 0
+
+        if args.rule_command == "add":
+            vendors.add_rule(session, args.pattern, args.display)
+            changed = vendors.apply_rules(session)
+            session.commit()
+            print(f"Rule {args.pattern!r} -> {args.display!r}; {changed} vendors updated.")
+            return 0
+
+        if args.rule_command == "remove":
+            if not vendors.remove_rule(session, args.pattern):
+                print(f"No rule with pattern {args.pattern!r}.")
+                return 1
+            changed = vendors.apply_rules(session)
+            session.commit()
+            print(f"Removed {args.pattern!r}; {changed} vendors updated.")
+            return 0
+
+        changed = vendors.apply_rules(session)  # "apply"
+        session.commit()
+        print(f"Applied {len(vendors.list_rules(session))} rules; {changed} vendors updated.")
+        return 0
+
+
 def _cmd_tui(args: argparse.Namespace) -> int:
     # Imported lazily so plain `import` runs without pulling in Textual.
     from .tui import run
@@ -191,6 +231,30 @@ def build_parser() -> argparse.ArgumentParser:
     rename_parser.add_argument("raw", help="The raw vendor name as seen in imports.")
     rename_parser.add_argument("display", help="The readable display name.")
     rename_parser.set_defaults(func=_cmd_rename)
+
+    rule_parser = subparsers.add_parser(
+        "rule", help="Manage pattern-based vendor rename rules."
+    )
+    rule_parser.set_defaults(func=_cmd_rule, rule_command="list")
+    rule_subparsers = rule_parser.add_subparsers(dest="rule_command")
+
+    rule_add = rule_subparsers.add_parser(
+        "add", help="Add or re-target a rule, then apply it."
+    )
+    rule_add.add_argument(
+        "pattern", help="Glob matched against raw vendor names, e.g. 'Kindle Svcs*'."
+    )
+    rule_add.add_argument("display", help="The readable display name.")
+
+    rule_remove = rule_subparsers.add_parser(
+        "remove", help="Delete a rule and revert the vendors it named."
+    )
+    rule_remove.add_argument("pattern", help="The exact pattern to remove.")
+
+    rule_subparsers.add_parser("list", help="Show every rule (default).")
+    rule_subparsers.add_parser(
+        "apply", help="Re-run all rules, e.g. after importing outside the app."
+    )
 
     return parser
 
