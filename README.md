@@ -1,5 +1,7 @@
 # Budget tracker
 
+[![tests](https://github.com/Benkendorfer/budget_tracker/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/Benkendorfer/budget_tracker/actions/workflows/tests.yml?query=branch%3Amain)
+
 - [Budget tracker](#budget-tracker)
   - [Overview](#overview)
   - [How to run](#how-to-run)
