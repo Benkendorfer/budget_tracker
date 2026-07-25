@@ -61,6 +61,38 @@ class Category(Base):
     )
 
 
+class VendorName(Base):
+    """Canonical / readable vendor names that overrides point to."""
+
+    __tablename__ = "vendor_name"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    value: Mapped[str] = mapped_column(String, unique=True)
+
+
+class Vendor(Base):
+    """A raw merchant string seen in imports.
+
+    ``vendor_name_id`` is NULL by default (no override), in which case ``name`` is the
+    display name. Point it at a :class:`VendorName` to rename and/or aggregate several
+    raw vendors under one readable name.
+    """
+
+    __tablename__ = "vendor"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String, unique=True)
+    vendor_name_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("vendor_name.id"), default=None
+    )
+
+    vendor_name: Mapped[Optional[VendorName]] = relationship()
+
+    @property
+    def display_name(self) -> str:
+        return self.vendor_name.value if self.vendor_name else self.name
+
+
 class Import(Base):
     __tablename__ = "import"
 
@@ -86,6 +118,9 @@ class Transaction(Base):
     import_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("import.id"), default=None
     )
+    vendor_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("vendor.id"), default=None
+    )
     posted_date: Mapped[date] = mapped_column()
     description: Mapped[str] = mapped_column(String)
     raw_description: Mapped[str] = mapped_column(String)
@@ -97,3 +132,4 @@ class Transaction(Base):
     account: Mapped[Account] = relationship()
     category: Mapped[Optional[Category]] = relationship()
     currency: Mapped[Currency] = relationship()
+    vendor: Mapped[Optional[Vendor]] = relationship()

@@ -62,6 +62,80 @@ def _cmd_import(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_list(args: argparse.Namespace) -> int:
+    from rich.console import Console
+    from rich.table import Table
+
+    from . import queries
+
+    engine = get_engine()
+    init_db(engine)
+    session_factory = get_sessionmaker(engine)
+    with session_factory() as session:
+        account_id = None
+        if args.account:
+            account_id = queries.resolve_account(session, args.account)
+            if account_id is None:
+                print(f"No account named {args.account!r}.")
+                return 1
+        category_id = None
+        if args.category:
+            category_id = queries.resolve_category(session, args.category)
+            if category_id is None:
+                print(f"No category named {args.category!r}.")
+                return 1
+        vendor_filter = None
+        if args.vendor:
+            vendor_filter = queries.resolve_vendor_filter(session, args.vendor)
+            if vendor_filter is None:
+                print(f"No vendor named {args.vendor!r}.")
+                return 1
+        txns = queries.get_transactions(
+            session, account_id, category_id, vendor_filter, limit=args.limit
+        )
+        totals = queries.get_totals(session, account_id, category_id, vendor_filter)
+
+    console = Console()
+    table = Table(box=None, pad_edge=False)
+    table.add_column("Date")
+    table.add_column("Description")
+    table.add_column("Vendor")
+    table.add_column("Category")
+    table.add_column("Amount", justify="right")
+    for txn in txns:
+        style = "red" if txn.amount_minor < 0 else "green"
+        table.add_row(
+            txn.posted_date,
+            txn.description,
+            txn.vendor,
+            txn.category,
+            f"[{style}]{txn.amount_minor / 100:,.2f}[/{style}]",
+        )
+    console.print(table)
+    console.print(
+        f"[bold]{totals.count} txns[/bold]   "
+        f"net {totals.net_minor / 100:,.2f}   "
+        f"out {totals.outflow_minor / 100:,.2f}   "
+        f"in {totals.inflow_minor / 100:,.2f}"
+    )
+    return 0
+
+
+def _cmd_rename(args: argparse.Namespace) -> int:
+    from . import vendors
+
+    engine = get_engine()
+    init_db(engine)
+    session_factory = get_sessionmaker(engine)
+    with session_factory() as session:
+        ok = vendors.set_override(session, args.raw, args.display)
+    if not ok:
+        print(f"No vendor named {args.raw!r}.")
+        return 1
+    print(f"Renamed {args.raw!r} -> {args.display!r}.")
+    return 0
+
+
 def _cmd_tui(args: argparse.Namespace) -> int:
     # Imported lazily so plain `import` runs without pulling in Textual.
     from .tui import run
@@ -96,6 +170,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="ISO currency code for the transactions (default: %(default)s).",
     )
     import_parser.set_defaults(func=_cmd_import)
+
+    list_parser = subparsers.add_parser(
+        "list", help="List transactions, optionally filtered."
+    )
+    list_parser.add_argument("--account", help="Filter by account name.")
+    list_parser.add_argument(
+        "--vendor", help="Filter by vendor (raw name or override display name)."
+    )
+    list_parser.add_argument("--category", help="Filter by category name.")
+    list_parser.add_argument(
+        "--limit", type=int, default=50, help="Max rows to show (default: %(default)s)."
+    )
+    list_parser.set_defaults(func=_cmd_list)
+
+    rename_parser = subparsers.add_parser(
+        "rename",
+        help="Override a raw vendor name with a readable name (aggregates when reused).",
+    )
+    rename_parser.add_argument("raw", help="The raw vendor name as seen in imports.")
+    rename_parser.add_argument("display", help="The readable display name.")
+    rename_parser.set_defaults(func=_cmd_rename)
 
     return parser
 

@@ -54,6 +54,12 @@ Conventions:
   excluded from spending/income totals (avoids double-counting).
 - `raw_description` preserves the bank's original text; `description` may be
   cleaned/normalized.
+- Each transaction points to a `vendor` (the raw merchant string seen in the import).
+  `vendor.vendor_name_id` is nullable: NULL means no override, so the raw `vendor.name`
+  is the display name. Setting it points the vendor at a `vendor_name` row, which both
+  gives a readable name and lets several raw vendors aggregate under one name. The
+  **effective vendor name** (the override if present, else the raw name) is what the UI
+  filters and groups by.
 - `category_source` records how the category was assigned (`manual` / `rule` / `unset`);
   only `manual` labels are treated as ground truth when learning new rules.
   `categorized_by_rule_id` records which rule fired (NULL if none).
@@ -63,11 +69,11 @@ Conventions:
   `budget.period` & `recurring.cadence` (`weekly`/`monthly`/`quarterly`/`yearly`),
   `rule.match_field` (`description`/`amount`/`account`), `rule.match_type`
   (`contains`/`equals`/`regex`), `category_source` (`manual`/`rule`/`unset`).
-- Lookup `value` columns are UNIQUE (`account_type`, `currency`, `tag`, marked `UK`);
-  `category` is unique on `(parent_id, value)`. `exchange_rate` is unique on
-  `(currency_id, base_currency_id, rate_date)`.
-- Lookup tables (`account_type`, `currency`, `tag`) and pure join tables
-  (`transaction_tag`) omit `created_at`/`updated_at`.
+- Lookup `value` columns are UNIQUE (`account_type`, `currency`, `tag`, `vendor_name`,
+  marked `UK`); `vendor.name` is UNIQUE; `category` is unique on `(parent_id, value)`.
+  `exchange_rate` is unique on `(currency_id, base_currency_id, rate_date)`.
+- Lookup tables (`account_type`, `currency`, `tag`, `vendor`, `vendor_name`) and pure
+  join tables (`transaction_tag`) omit `created_at`/`updated_at`.
 
 ```mermaid
 %%{init: {'theme':'base', 'themeVariables':{'background':'#ffffff','lineColor':'#ff5c5c'}}}%%
@@ -94,6 +100,8 @@ erDiagram
     currency ||--o| app_config : "base of"
     currency ||--o{ exchange_rate : "priced"
     currency ||--o{ exchange_rate : "quoted in"
+    vendor |o--o{ transaction : "vendor of"
+    vendor_name |o--o{ vendor : overrides
 
     account_type {
         int id PK
@@ -116,6 +124,7 @@ erDiagram
         int currency_id FK
         int import_id FK
         int categorized_by_rule_id FK
+        int vendor_id FK
         date posted_date
         str description
         str raw_description
@@ -125,6 +134,15 @@ erDiagram
         str import_hash UK
         datetime created_at
         datetime updated_at
+    }
+    vendor {
+        int id PK
+        str name UK
+        int vendor_name_id FK
+    }
+    vendor_name {
+        int id PK
+        str value UK
     }
     currency {
         int id PK

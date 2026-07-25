@@ -26,7 +26,7 @@ _ENCODINGS = ("utf-8-sig", "cp1252")
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .models import Account, Category, Currency, Import, Transaction
+from .models import Account, Category, Currency, Import, Transaction, Vendor
 
 DEFAULT_CURRENCY_CODE = "USD"
 EXPECTED_COLUMNS = [
@@ -65,6 +65,16 @@ def _get_or_create_account(session: Session, name: str, currency: Currency) -> A
         session.add(account)
         session.flush()
     return account
+
+
+def _get_or_create_vendor(session: Session, name: str) -> Vendor:
+    name = name.strip()
+    vendor = session.scalar(select(Vendor).where(Vendor.name == name))
+    if vendor is None:
+        vendor = Vendor(name=name)
+        session.add(vendor)
+        session.flush()
+    return vendor
 
 
 def _get_or_create_category(session: Session, value: str) -> Category:
@@ -175,6 +185,8 @@ def import_csv(
         )
         account_ids.add(account.id)
 
+        vendor = _get_or_create_vendor(session, description) if description else None
+
         category = None
         category_source = "unset"
         if bank_category:
@@ -190,6 +202,7 @@ def import_csv(
                 category_id=category.id if category else None,
                 currency_id=currency.id,
                 import_id=import_record.id,
+                vendor_id=vendor.id if vendor else None,
                 posted_date=posted_date,
                 description=description,
                 raw_description=description,

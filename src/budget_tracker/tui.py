@@ -23,7 +23,7 @@ from textual.widgets import (
     Static,
 )
 
-from . import queries
+from . import queries, vendors
 from .db import get_engine, get_sessionmaker, init_db
 from .importer import import_csv
 
@@ -33,6 +33,10 @@ TO_IMPORT_DIR = _REPO_ROOT / "data" / "to_import"
 
 def _fmt_amount(minor: int, decimal_places: int = 2) -> str:
     return f"{minor / (10 ** decimal_places):,.{decimal_places}f}"
+
+
+def _truncate(text: str, width: int) -> str:
+    return text if len(text) <= width else text[: width - 1] + "…"
 
 
 def _amount_cell(minor: int) -> Text:
@@ -62,8 +66,10 @@ class BudgetApp(App):
         init_db(self.engine)
         self.session_factory = get_sessionmaker(self.engine)
         self.account_filter: Optional[int] = None
+        self.vendor_filter: Optional[queries.VendorFilter] = None
         self.category_filter: Optional[int] = None
         self._accounts: List[queries.AccountRow] = []
+        self._vendors: List[queries.VendorRow] = []
         self._categories: List[queries.CategoryRow] = []
 
     def compose(self) -> ComposeResult:
@@ -72,6 +78,8 @@ class BudgetApp(App):
             with Vertical(id="sidebar"):
                 yield Label("Accounts", classes="heading")
                 yield ListView(id="accounts")
+                yield Label("Vendors", classes="heading")
+                yield ListView(id="vendors")
                 yield Label("Categories", classes="heading")
                 yield ListView(id="categories")
             with Vertical(id="main"):
@@ -89,8 +97,9 @@ class BudgetApp(App):
         table.cursor_type = "row"
         table.zebra_stripes = True
         table.add_column("Date", width=10)
-        table.add_column("Description", width=40)
-        table.add_column("Category", width=16)
+        table.add_column("Description", width=32)
+        table.add_column("Vendor", width=20)
+        table.add_column("Category", width=14)
         table.add_column("Amount", width=12)
         self.reload()
         self.query_one("#command", Input).focus()
@@ -99,14 +108,22 @@ class BudgetApp(App):
     def reload(self) -> None:
         with self.session_factory() as session:
             self._accounts = queries.get_accounts(session)
+            self._vendors = queries.get_vendors(session)
             self._categories = queries.get_categories(session)
             txns = queries.get_transactions(
-                session, self.account_filter, self.category_filter
+                session,
+                self.account_filter,
+                self.category_filter,
+                self.vendor_filter,
             )
             totals = queries.get_totals(
-                session, self.account_filter, self.category_filter
+                session,
+                self.account_filter,
+                self.category_filter,
+                self.vendor_filter,
             )
         self._fill_list("#accounts", [f"{a.name} ({a.count})" for a in self._accounts])
+        self._fill_list("#vendors", [f"{v.name} ({v.count})" for v in self._vendors])
         self._fill_list(
             "#categories",
             [f"{c.name} ({c.count})  {_fmt_amount(c.total_minor)}" for c in self._categories],
@@ -125,11 +142,11 @@ class BudgetApp(App):
         table = self.query_one("#txns", DataTable)
         table.clear()
         for txn in txns:
-            description = txn.description if len(txn.description) <= 40 else txn.description[:37] + "…"
             table.add_row(
                 txn.posted_date,
-                description,
-                txn.category,
+                _truncate(txn.description, 32),
+                _truncate(txn.vendor, 20),
+                _truncate(txn.category, 14),
                 _amount_cell(txn.amount_minor),
             )
 
@@ -137,6 +154,8 @@ class BudgetApp(App):
         scope = []
         if self.account_filter is not None:
             scope.append("account")
+        if self.vendor_filter is not None:
+            scope.append("vendor")
         if self.category_filter is not None:
             scope.append("category")
         scope_label = f" [filtered: {', '.join(scope)}]" if scope else ""
@@ -150,9 +169,16 @@ class BudgetApp(App):
     # ---------------------------------------------------------------- events
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         index = event.list_view.index or 0
-        if event.list_view.id == "accounts":
+        list_id = event.list_view.id
+        if list_id == "accounts":
             self.account_filter = None if index == 0 else self._accounts[index - 1].id
-        elif event.list_view.id == "categories":
+        elif list_id == "vendors":
+            if index == 0:
+                self.vendor_filter = None
+            else:
+                vendor = self._vendors[index - 1]
+                self.vendor_filter = (vendor.kind, vendor.id)
+        elif list_id == "categories":
             self.category_filter = None if index == 0 else self._categories[index - 1].id
         self.reload()
 
@@ -177,11 +203,14 @@ class BudgetApp(App):
             self.action_clear_filters()
         elif name == "import":
             self._do_import(arg)
+        elif name == "rename":
+            self._do_rename(arg)
         elif name == "help":
             self.notify(
                 "import [path] — import a CSV (or all in data/to_import)\n"
+                "rename <raw vendor> = <display name> — override / aggregate a vendor\n"
                 "all — clear filters   refresh — reload   quit — exit\n"
-                "Click an account/category to filter.",
+                "Click an account/vendor/category to filter.",
                 title="Commands",
                 timeout=8,
             )
@@ -212,12 +241,33 @@ class BudgetApp(App):
             f"Imported {len(paths)} file(s): {added} added, {skipped} skipped."
         )
 
+    def _do_rename(self, arg: str) -> None:
+        if "=" not in arg:
+            self.notify(
+                "Usage: rename <raw vendor> = <display name>", severity="warning"
+            )
+            return
+        raw, display = (part.strip() for part in arg.split("=", 1))
+        if not raw or not display:
+            self.notify(
+                "Usage: rename <raw vendor> = <display name>", severity="warning"
+            )
+            return
+        with self.session_factory() as session:
+            ok = vendors.set_override(session, raw, display)
+        if not ok:
+            self.notify(f"No vendor named {raw!r}.", severity="error")
+            return
+        self.reload()
+        self.notify(f"{raw!r} → {display!r}")
+
     # --------------------------------------------------------------- actions
     def action_refresh(self) -> None:
         self.reload()
 
     def action_clear_filters(self) -> None:
         self.account_filter = None
+        self.vendor_filter = None
         self.category_filter = None
         self.reload()
         self.notify("Filters cleared.")
