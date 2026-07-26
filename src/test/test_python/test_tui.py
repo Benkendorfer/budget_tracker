@@ -8,7 +8,7 @@ import asyncio
 
 from textual.widgets import DataTable, Input, ListView, Static
 
-from budget_tracker import formats, vendors
+from budget_tracker import formats, transfers, vendors
 from budget_tracker.db import get_engine, get_sessionmaker, init_db
 from budget_tracker.importer import import_csv, read_header_and_rows
 from helpers import learn_format
@@ -531,3 +531,70 @@ def test_shortcut_with_no_vendor_selected_does_nothing(tmp_path, monkeypatch):
             return app.query_one("#command", Input).value
 
     assert asyncio.run(run()) == ""
+
+
+TRANSFER_CSV = """Transaction Date,Posted Date,Card No.,Description,Category,Debit,Credit
+2025-10-01,2025-10-02,9999,MOVE OUT,Transfer,900.00,
+"""
+
+
+def test_transfer_rows_are_marked_in_the_table(tmp_path, monkeypatch):
+    """A row absent from the totals must look different, or it reads as a bug."""
+    session_factory = _setup(tmp_path, monkeypatch)
+    other = tmp_path / "other.csv"
+    other.write_text(TRANSFER_CSV, encoding="utf-8")
+    with session_factory() as session:
+        import_csv(session, other)  # a second account, opposite sign to nothing yet
+        currency_id = session.execute(
+            __import__("sqlalchemy").text("select id from currency limit 1")
+        ).scalar()
+        account_id = session.execute(
+            __import__("sqlalchemy").text(
+                "select id from account where name like '%8207%' limit 1"
+            )
+        ).scalar()
+        session.execute(
+            __import__("sqlalchemy").text(
+                "insert into transactions (account_id, currency_id, posted_date,"
+                " description, raw_description, value_minor, category_source, import_hash)"
+                " values (:a, :c, '2025-10-03', 'MOVE IN', 'MOVE IN', 90000, 'unset', 'h1')"
+            ),
+            {"a": account_id, "c": currency_id},
+        )
+        session.commit()
+        assert transfers.detect_transfers(session) == 1
+        session.commit()
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            table = app.query_one("#txns", DataTable)
+            rows = {}
+            for i in range(table.row_count):
+                cells = table.get_row_at(i)
+                rows[str(cells[1])] = cells
+            return rows
+
+    rows = asyncio.run(run())
+    transfer_row = rows["⇄ MOVE IN"]
+    assert "⇄" in str(transfer_row[1])  # flagged
+    assert "dim" in str(transfer_row[4].style)  # and greyed, not red/green
+    ordinary = next(v for k, v in rows.items() if "COFFEE" in k)
+    assert "⇄" not in str(ordinary[1])
+    assert "dim" not in str(ordinary[4].style)
+
+
+def test_transaction_table_shows_the_account_after_the_amount(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            table = app.query_one("#txns", DataTable)
+            headers = [str(c.label) for c in table.columns.values()]
+            first = [str(c) for c in table.get_row_at(0)]
+            return headers, first
+
+    headers, first = asyncio.run(run())
+    assert headers == ["Date", "Description", "Vendor", "Category", "Amount", "Account"]
+    assert first[-1] == "8207"  # the account each row belongs to

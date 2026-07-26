@@ -128,12 +128,13 @@ def _cmd_list(args: argparse.Namespace) -> int:
     table.add_column("Category")
     table.add_column("Amount", justify="right")
     for txn in txns:
-        style = "red" if txn.amount_minor < 0 else "green"
+        # Match the app: transfers are dimmed and flagged so their absence from the
+        # totals is visible rather than mysterious.
+        style = "dim" if txn.is_transfer else ("red" if txn.amount_minor < 0 else "green")
+        description = f"⇄ {txn.description}" if txn.is_transfer else txn.description
+        row = [txn.posted_date, description, txn.vendor, txn.category]
         table.add_row(
-            txn.posted_date,
-            txn.description,
-            txn.vendor,
-            txn.category,
+            *([f"[dim]{c}[/dim]" for c in row] if txn.is_transfer else row),
             f"[{style}]{txn.amount_minor / 100:,.2f}[/{style}]",
         )
     console.print(table)

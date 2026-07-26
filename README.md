@@ -191,9 +191,23 @@ were excluded:
 1939 txns (110 transfers excluded)   net -995.04   out -165,541.56   in 164,546.52
 ```
 
-Detection runs automatically after every import, since new rows are often the second leg
-of a transfer already stored. Running it again only looks at unpaired transactions, so it
-is cheap and safe to repeat.
+Detected transfers are **greyed out and flagged with `⇄`** in both the app and
+`budget list`, and their amounts lose the red/green colouring:
+
+```text
+2026-07-20  POS-: MTA*NYCT PAYGO       MTA                  Auto & Transport     -3.00
+2026-07-16  ⇄ CAPITAL ONE - MOBILE     Capital One Payment  Transfer         -4,673.24
+```
+
+Without the marker a transfer looks like ordinary spending that is mysteriously missing
+from the totals. Note that a row can carry the category `Transfer` from your bank's own
+export without being a detected transfer — a wire to an outside broker, say. Only the
+`⇄` rows are excluded from the figures.
+
+Detection runs in three places: **automatically at the end of every import** (new rows are
+often the second leg of something already stored), and on demand via `budget transfers` or
+the app's `transfers` command. It does not run on start-up or refresh. Repeat runs only
+look at unpaired transactions, so they are cheap and safe.
 
 Matching is by amount and date alone, so two unrelated transactions of the same size a
 few days apart in different accounts can be paired by mistake. Two things guard against

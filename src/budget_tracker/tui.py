@@ -64,9 +64,21 @@ def _truncate(text: str, width: int) -> str:
     return text if len(text) <= width else text[: width - 1] + "…"
 
 
-def _amount_cell(minor: int) -> Text:
+# Transfers are shown greyed and flagged, because the totals deliberately ignore them —
+# a row that looks like ordinary spending but is missing from the figures reads as a bug.
+TRANSFER_MARK = "⇄"
+TRANSFER_STYLE = "dim italic"
+
+
+def _amount_cell(minor: int, is_transfer: bool = False) -> Text:
+    if is_transfer:
+        return Text(_fmt_amount(minor), style=TRANSFER_STYLE, justify="right")
     style = "red" if minor < 0 else "green"
     return Text(_fmt_amount(minor), style=style, justify="right")
+
+
+def _txn_cell(text: str, width: int, is_transfer: bool) -> Text:
+    return Text(_truncate(text, width), style=TRANSFER_STYLE if is_transfer else "")
 
 
 class BudgetApp(App):
@@ -138,10 +150,11 @@ class BudgetApp(App):
         table.cursor_type = "row"
         table.zebra_stripes = True
         table.add_column("Date", width=10)
-        table.add_column("Description", width=32)
-        table.add_column("Vendor", width=20)
-        table.add_column("Category", width=14)
+        table.add_column("Description", width=26)
+        table.add_column("Vendor", width=18)
+        table.add_column("Category", width=12)
         table.add_column("Amount", width=12)
+        table.add_column("Account", width=18)
 
         rules = self.query_one("#rules", DataTable)
         rules.cursor_type = "row"
@@ -214,12 +227,14 @@ class BudgetApp(App):
         table.clear()
         self._txns = txns
         for txn in txns:
+            marked = f"{TRANSFER_MARK} {txn.description}" if txn.is_transfer else txn.description
             table.add_row(
-                txn.posted_date,
-                _truncate(txn.description, 32),
-                _truncate(txn.vendor, 20),
-                _truncate(txn.category, 14),
-                _amount_cell(txn.amount_minor),
+                _txn_cell(txn.posted_date, 10, txn.is_transfer),
+                _txn_cell(marked, 26, txn.is_transfer),
+                _txn_cell(txn.vendor, 18, txn.is_transfer),
+                _txn_cell(txn.category, 12, txn.is_transfer),
+                _amount_cell(txn.amount_minor, txn.is_transfer),
+                _txn_cell(txn.account, 18, txn.is_transfer),
             )
 
     def _fill_rules(self) -> None:

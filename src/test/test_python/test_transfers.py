@@ -249,3 +249,23 @@ def test_clear_transfers_leaves_manual_categories_alone(tmp_path):
         txns = {t.description: t for t in queries.get_transactions(session)}
     assert txns["Xfer To"].category == "Investing"  # untouched throughout
     assert txns["Xfer From"].category == ""  # cleared with the pairing
+
+
+def test_transactions_report_whether_they_are_transfers(tmp_path):
+    """The UI needs this to show why a row is missing from the totals."""
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        currency, accounts = _seed(session)
+        _txn(session, currency, accounts["Checking"], 1, -50000, "Xfer To")
+        _txn(session, currency, accounts["Savings"], 2, 50000, "Xfer From")
+        _txn(session, currency, accounts["Card"], 3, -2500, "Coffee")
+        session.commit()
+
+    with session_factory() as session:
+        assert not any(t.is_transfer for t in queries.get_transactions(session))
+        transfers.detect_transfers(session)
+        session.commit()
+
+    with session_factory() as session:
+        flags = {t.description: t.is_transfer for t in queries.get_transactions(session)}
+    assert flags == {"Xfer To": True, "Xfer From": True, "Coffee": False}

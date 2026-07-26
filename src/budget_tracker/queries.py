@@ -63,6 +63,8 @@ class TxnRow:
     category: str
     amount_minor: int
     currency: str
+    account: str = ""
+    is_transfer: bool = False  # paired with a leg in another account, so not counted
 
 
 @dataclass
@@ -213,6 +215,8 @@ def get_transactions(
                 category=txn.category.value if txn.category else "",
                 amount_minor=txn.value_minor,
                 currency=txn.currency.value,
+                account=txn.account.name,
+                is_transfer=txn.transfer_group_id is not None,
             )
         )
     return result
