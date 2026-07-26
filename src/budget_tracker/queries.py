@@ -75,10 +75,11 @@ class RuleRow:
 
 @dataclass
 class Totals:
-    count: int
+    count: int  # every matching transaction, transfers included
     net_minor: int
     outflow_minor: int
     inflow_minor: int
+    transfer_count: int = 0  # of `count`, how many were excluded from the money figures
 
 
 def get_accounts(session: Session) -> List[AccountRow]:
@@ -226,17 +227,29 @@ def get_totals(
     base = _txn_query(account_id, category_id, vendor_filter).subquery()
     amount = base.c.value_minor
     count = session.scalar(select(func.count()).select_from(base)) or 0
-    net = session.scalar(select(func.coalesce(func.sum(amount), 0))) or 0
-    outflow = (
-        session.scalar(select(func.coalesce(func.sum(amount), 0)).where(amount < 0))
+    transfer_count = (
+        session.scalar(
+            select(func.count())
+            .select_from(base)
+            .where(base.c.transfer_group_id.is_not(None))
+        )
         or 0
     )
-    inflow = (
-        session.scalar(select(func.coalesce(func.sum(amount), 0)).where(amount > 0))
-        or 0
+
+    # Both legs of a transfer are real rows, but they move money between your own
+    # accounts, so counting them would inflate spending and income alike. Filtering
+    # (rather than relying on the legs cancelling out) also keeps the figures right
+    # when a filter selects only one leg.
+    real = base.c.transfer_group_id.is_(None)
+    total = lambda condition: (  # noqa: E731 - reads better than three near-copies
+        session.scalar(select(func.coalesce(func.sum(amount), 0)).where(condition)) or 0
     )
     return Totals(
-        count=count, net_minor=net, outflow_minor=outflow, inflow_minor=inflow
+        count=count,
+        net_minor=total(real),
+        outflow_minor=total(real & (amount < 0)),
+        inflow_minor=total(real & (amount > 0)),
+        transfer_count=transfer_count,
     )
 
 

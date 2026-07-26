@@ -152,6 +152,19 @@ def save_format(session: Session, spec: FormatSpec) -> FormatSpec:
     return spec
 
 
+def set_account_prefix(session: Session, name: str, prefix: str) -> FormatSpec:
+    """Change the prefix a layout puts in front of derived account names. No commit.
+
+    Worth doing after merging accounts: leaving the old prefix in place would split them
+    apart again on the next import.
+    """
+    spec = get_format(session, name)
+    prefix = prefix.strip()
+    if prefix and not prefix.endswith(" "):
+        prefix += " "
+    return save_format(session, FormatSpec(**{**to_dict(spec), "account_prefix": prefix}))
+
+
 def remove_format(session: Session, name: str) -> bool:
     """Delete a format. Does not commit."""
     row = session.scalar(select(CsvFormat).where(CsvFormat.name == name.strip()))

@@ -383,3 +383,24 @@ def test_dedup_hash_is_the_joined_column_values(tmp_path):
 
         hashes = set(session.scalars(sqlalchemy.select(Transaction.import_hash)))
     assert expected in hashes
+
+
+def test_set_account_prefix_keeps_a_merge_from_being_undone(tmp_path):
+    """Without this, the next import recreates the account the merge just folded away."""
+    session_factory = _session_factory(tmp_path)
+    path = _write(tmp_path, "pair.csv", PAIR_CSV)
+    with session_factory() as session:
+        _learn(session, path, "cards")
+        spec = formats.set_account_prefix(session, "cards", "Card")
+        session.commit()
+    assert spec.account_prefix == "Card "  # a separator is added for you
+
+    with session_factory() as session:
+        import_csv(session, path)
+    with session_factory() as session:
+        assert [a.name for a in queries.get_accounts(session)] == ["Card 8207"]
+
+    with session_factory() as session:
+        formats.set_account_prefix(session, "cards", "")  # removing it is allowed
+        session.commit()
+        assert formats.get_format(session, "cards").account_prefix == ""

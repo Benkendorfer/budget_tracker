@@ -308,6 +308,11 @@ def import_csv(
 
     apply_rules(session)
 
+    # New rows may be the other leg of a transfer already in the database.
+    from .transfers import detect_transfers
+
+    detect_transfers(session)
+
     session.commit()
     return ImportResult(
         source_file=path.name,

@@ -10,6 +10,7 @@
     - [The command line](#the-command-line)
     - [Renaming and grouping vendors](#renaming-and-grouping-vendors)
     - [Vendor rename rules](#vendor-rename-rules)
+    - [Transfers between your own accounts](#transfers-between-your-own-accounts)
     - [Importing data](#importing-data)
     - [Where the data lives](#where-the-data-lives)
     - [Running the tests](#running-the-tests)
@@ -63,6 +64,7 @@ the bottom:
 | `import <path>` | Import a single CSV |
 | `rename <raw vendor> = <display name>` | Give one vendor a readable name (see below) |
 | `rule <pattern> = <display name>` | Rename every matching vendor, now and in future imports |
+| `transfers` | Pair up movements between your own accounts (`transfers reset` undoes it) |
 | `rules` | Open the rules panel (`rule` on its own does the same); `escape` returns |
 | `all` | Clear all filters |
 | `refresh` | Reload from the database |
@@ -97,6 +99,10 @@ budget list --vendor Coffee          # accepts a raw name or an override name
 
 # Give a raw vendor string a readable display name.
 budget rename "COFFEE SHOP A" "Coffee"
+
+# Pair up money moved between your own accounts.
+budget transfers --days 5
+budget transfers --reset
 ```
 
 `budget --help`, or `budget <subcommand> --help`, documents every flag.
@@ -167,6 +173,33 @@ name:
 
 Rules are stored, not baked in: they are re-evaluated rather than rewriting transactions,
 and `raw_description` always preserves the bank's original text.
+
+### Transfers between your own accounts
+
+Paying your card from your checking account produces two transactions: money leaving one
+account and arriving in the other. Both are real rows, but counting them as spending and
+income double-counts money that never left your control.
+
+`budget transfers` (or `transfers` in the app) pairs them up. Two transactions match when
+they have **the same amount with opposite signs**, sit in **different accounts**, and post
+**within a few days** of each other — `--days` controls the window, five by default.
+Paired rows are categorised as `Transfer`, share a `transfer_group_id`, and drop out of
+the inflow and outflow figures. They are still listed, and the totals line says how many
+were excluded:
+
+```text
+1939 txns (110 transfers excluded)   net -995.04   out -165,541.56   in 164,546.52
+```
+
+Detection runs automatically after every import, since new rows are often the second leg
+of a transfer already stored. Running it again only looks at unpaired transactions, so it
+is cheap and safe to repeat.
+
+Matching is by amount and date alone, so two unrelated transactions of the same size a
+few days apart in different accounts can be paired by mistake. Two things guard against
+that: a category you set by hand is never overwritten, and `budget transfers --reset`
+un-pairs everything and restores the categories detection assigned, leaving manual ones
+alone. If you get spurious matches, a smaller `--days` window is the first thing to try.
 
 ### Importing data
 

@@ -8,7 +8,8 @@ import sys
 from pathlib import Path
 from typing import List, Optional
 
-from . import formats
+from . import formats, queries
+from . import transfers as transfers_module
 from .db import DEFAULT_DB_PATH, get_engine, get_sessionmaker, init_db
 from .importer import DEFAULT_CURRENCY_CODE, import_csv, read_header_and_rows
 
@@ -92,8 +93,6 @@ def _cmd_list(args: argparse.Namespace) -> int:
     from rich.console import Console
     from rich.table import Table
 
-    from . import queries
-
     engine = get_engine()
     init_db(engine)
     session_factory = get_sessionmaker(engine)
@@ -139,7 +138,9 @@ def _cmd_list(args: argparse.Namespace) -> int:
         )
     console.print(table)
     console.print(
-        f"[bold]{totals.count} txns[/bold]   "
+        f"[bold]{totals.count} txns[/bold]"
+        + (f" ({totals.transfer_count} transfers excluded)" if totals.transfer_count else "")
+        + "   "
         f"net {totals.net_minor / 100:,.2f}   "
         f"out {totals.outflow_minor / 100:,.2f}   "
         f"in {totals.inflow_minor / 100:,.2f}"
@@ -294,6 +295,15 @@ def _cmd_format(args: argparse.Namespace) -> int:
 
     with session_factory() as session:
         try:
+            if args.format_command == "prefix":
+                spec = formats.set_account_prefix(session, args.name, args.prefix)
+                session.commit()
+                print(
+                    f"{spec.name!r} now names accounts "
+                    f"{spec.account_prefix + '<value>' if spec.account_prefix else '<value>'}."
+                )
+                return 0
+
             if args.format_command == "remove":
                 if not formats.remove_format(session, args.name):
                     print(f"No format named {args.name!r}.")
@@ -332,6 +342,67 @@ def _cmd_format(args: argparse.Namespace) -> int:
     for spec in specs:
         account = spec.account_column or "requires --account"
         print(f"  {spec.name:<{width}}  {spec.amount_style:<13}  account: {account}")
+    return 0
+
+
+def _cmd_account(args: argparse.Namespace) -> int:
+    from . import accounts
+
+    engine = get_engine()
+    init_db(engine)
+    session_factory = get_sessionmaker(engine)
+    with session_factory() as session:
+        try:
+            if args.account_command == "rename":
+                accounts.rename_account(session, args.old, args.new)
+                session.commit()
+                print(f"Renamed {args.old!r} -> {args.new!r}.")
+                return 0
+            if args.account_command == "merge":
+                result = accounts.merge_accounts(session, args.source, args.target)
+                session.commit()
+                print(
+                    f"Merged {result.source!r} into {result.target!r}: "
+                    f"{result.moved_transactions} transactions, "
+                    f"{result.moved_imports} import record(s) moved."
+                )
+                if result.unpaired_transfers:
+                    print(
+                        f"{result.unpaired_transfers} transaction(s) were un-paired: "
+                        "both legs are now in the same account."
+                    )
+                return 0
+        except accounts.AccountError as error:
+            print(error)
+            return 1
+        rows = queries.get_accounts(session)  # "list"
+
+    if not rows:
+        print("No accounts yet.")
+        return 0
+    width = max(len(r.name) for r in rows)
+    for row in rows:
+        print(f"  {row.name:<{width}}  {row.count:>6} txns  {row.currency}")
+    return 0
+
+
+def _cmd_transfers(args: argparse.Namespace) -> int:
+    from . import transfers
+
+    engine = get_engine()
+    init_db(engine)
+    session_factory = get_sessionmaker(engine)
+    with session_factory() as session:
+        if args.reset:
+            reset = transfers.clear_transfers(session)
+            session.commit()
+            print(f"Un-paired {reset} transaction(s).")
+            return 0
+        pairs = transfers.detect_transfers(session, window_days=args.days)
+        session.commit()
+        totals = queries.get_totals(session)
+    print(f"Found {pairs} new transfer pair(s) within {args.days} day(s).")
+    print(f"{totals.transfer_count} transaction(s) are now excluded from totals.")
     return 0
 
 
@@ -424,6 +495,38 @@ def build_parser() -> argparse.ArgumentParser:
     )
     rule_remove.add_argument("pattern", help="The exact pattern to remove.")
 
+    account_parser = subparsers.add_parser(
+        "account", help="List, rename, or merge accounts."
+    )
+    account_parser.set_defaults(func=_cmd_account, account_command="list")
+    account_subparsers = account_parser.add_subparsers(dest="account_command")
+    account_subparsers.add_parser("list", help="Show every account (default).")
+
+    account_rename = account_subparsers.add_parser("rename", help="Rename an account.")
+    account_rename.add_argument("old", help="Current account name.")
+    account_rename.add_argument("new", help="New account name.")
+
+    account_merge = account_subparsers.add_parser(
+        "merge", help="Move everything from one account into another, then delete it."
+    )
+    account_merge.add_argument("source", help="Account to merge from (deleted).")
+    account_merge.add_argument("target", help="Account to merge into (kept).")
+
+    transfers_parser = subparsers.add_parser(
+        "transfers",
+        help="Pair up transactions that move money between your own accounts.",
+    )
+    transfers_parser.add_argument(
+        "--days",
+        type=int,
+        default=transfers_module.DEFAULT_WINDOW_DAYS,
+        help="How many days apart the two legs may post (default: %(default)s).",
+    )
+    transfers_parser.add_argument(
+        "--reset", action="store_true", help="Un-pair every detected transfer."
+    )
+    transfers_parser.set_defaults(func=_cmd_transfers)
+
     format_parser = subparsers.add_parser(
         "format",
         help=(
@@ -438,6 +541,12 @@ def build_parser() -> argparse.ArgumentParser:
     format_remove.add_argument("name", help="The format name to remove.")
 
     format_subparsers.add_parser("list", help="Show defined formats (default).")
+
+    format_prefix = format_subparsers.add_parser(
+        "prefix", help="Set the prefix used for account names derived from a column."
+    )
+    format_prefix.add_argument("name", help="The format to change.")
+    format_prefix.add_argument("prefix", help="New prefix; pass '' to remove it.")
 
     format_export = format_subparsers.add_parser(
         "export", help="Print or write format definitions as JSON."

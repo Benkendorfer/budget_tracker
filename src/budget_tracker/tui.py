@@ -25,7 +25,7 @@ from textual.widgets import (
     Static,
 )
 
-from . import formats, queries, vendors
+from . import accounts, formats, queries, transfers, vendors
 from .db import get_engine, get_sessionmaker, init_db
 from .importer import (
     ImportCandidate,
@@ -280,8 +280,13 @@ class BudgetApp(App):
         if self.category_filter is not None:
             scope.append("category")
         scope_label = f" [filtered: {', '.join(scope)}]" if scope else ""
+        transfers_label = (
+            f"   ({totals.transfer_count} transfers excluded)"
+            if totals.transfer_count
+            else ""
+        )
         self.query_one("#status", Static).update(
-            f"{totals.count} txns{scope_label}   "
+            f"{totals.count} txns{scope_label}{transfers_label}   "
             f"net {_fmt_amount(totals.net_minor)}   "
             f"out {_fmt_amount(totals.outflow_minor)}   "
             f"in {_fmt_amount(totals.inflow_minor)}"
@@ -503,6 +508,10 @@ class BudgetApp(App):
             self._do_rule(arg)
         elif name == "rules":
             self._show_rules()
+        elif name == "transfers":
+            self._do_transfers(arg)
+        elif name == "merge":
+            self._do_merge(arg)
         elif name == "help":
             self.notify(
                 "import — browse data/to_import; enter imports the selected file\n"
@@ -511,6 +520,8 @@ class BudgetApp(App):
                 "rule <pattern> = <display name> — rename every matching vendor,\n"
                 "  now and on future imports (e.g. rule Kindle Svcs* = Kindle)\n"
                 "rules — list the rules you have defined (escape returns)\n"
+                "transfers [reset] — pair up movements between your own accounts\n"
+                "merge <account> = <account> — fold one account into another\n"
                 "all — clear filters   refresh — reload   quit — exit\n"
                 "Click an account/vendor/category to filter.\n"
                 "ctrl+n — prefill rename for the selected transaction's vendor,\n"
@@ -615,6 +626,43 @@ class BudgetApp(App):
         self._set_panel("imports")
         if not self._candidates:
             self.notify(f"No CSVs in {TO_IMPORT_DIR}", severity="warning")
+
+    def _do_merge(self, arg: str) -> None:
+        if "=" not in arg:
+            self.notify("Usage: merge <source account> = <target account>", severity="warning")
+            return
+        source, target = (part.strip() for part in arg.split("=", 1))
+        if not source or not target:
+            self.notify("Usage: merge <source account> = <target account>", severity="warning")
+            return
+        with self.session_factory() as session:
+            try:
+                result = accounts.merge_accounts(session, source, target)
+            except accounts.AccountError as error:
+                self.notify(str(error), severity="error", markup=False)
+                return
+            session.commit()
+        self.reload()
+        message = (
+            f"Merged {result.source!r} into {result.target!r}: "
+            f"{result.moved_transactions} transactions moved."
+        )
+        if result.unpaired_transfers:
+            message += f"\n{result.unpaired_transfers} same-account transfer legs un-paired."
+        self.notify(message, markup=False, timeout=8)
+
+    def _do_transfers(self, arg: str) -> None:
+        with self.session_factory() as session:
+            if arg.strip() in {"reset", "clear"}:
+                reset = transfers.clear_transfers(session)
+                session.commit()
+                message = f"Un-paired {reset} transaction(s)."
+            else:
+                pairs = transfers.detect_transfers(session)
+                session.commit()
+                message = f"Found {pairs} new transfer pair(s)."
+        self.reload()
+        self.notify(message)
 
     def _do_rule(self, arg: str) -> None:
         if not arg:
