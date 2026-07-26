@@ -42,9 +42,6 @@ class TextFilter:
 
     text: str
     field: str = "all"
-    # Searching ignores case. The matching helper can do either, so making this an
-    # option is a small change if it is ever wanted.
-    case_sensitive: bool = False
 
     def __post_init__(self):
         if self.field not in TEXT_FIELDS:
@@ -192,36 +189,32 @@ def get_rules(session: Session) -> List[RuleRow]:
     ]
 
 
-def _contains(column, text: str, case_sensitive: bool):
-    """A substring test.
+def _contains(column, text: str):
+    """A case-insensitive substring test.
 
-    ``instr`` rather than ``LIKE`` because SQLite's LIKE ignores ASCII case whatever you
-    write, so a case-sensitive search cannot be expressed with it. It also means ``%``
-    and ``_`` in the user's text need no escaping — they are ordinary characters here.
-    (On Postgres the equivalent would be ``strpos``.)
+    ``instr`` rather than ``LIKE`` so that ``%`` and ``_`` in the user's text need no
+    escaping — they are ordinary characters here. (The Postgres equivalent is ``strpos``,
+    if the database ever moves.)
     """
-    if case_sensitive:
-        return func.instr(column, text) > 0
     return func.instr(func.lower(column), text.lower()) > 0
 
 
 def _text_condition(text_filter: TextFilter):
     text = text_filter.text.strip()
     field = text_filter.field
-    sensitive = text_filter.case_sensitive
     # The display name is the override when there is one, else the raw name, so it has
     # to be matched through the join rather than on a single column.
     display = func.coalesce(VendorName.value, Vendor.name)
 
     vendor_conditions = []
     if field in ("all", "vendor"):
-        vendor_conditions.append(_contains(display, text, sensitive))
+        vendor_conditions.append(_contains(display, text))
     if field in ("all", "raw"):
-        vendor_conditions.append(_contains(Vendor.name, text, sensitive))
+        vendor_conditions.append(_contains(Vendor.name, text))
 
     conditions = []
     if field in ("all", "description"):
-        conditions.append(_contains(Transaction.description, text, sensitive))
+        conditions.append(_contains(Transaction.description, text))
     if vendor_conditions:
         matching_vendors = (
             select(Vendor.id)
