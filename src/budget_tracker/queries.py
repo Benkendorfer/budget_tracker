@@ -13,7 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from .models import (
@@ -27,6 +27,30 @@ from .models import (
 )
 
 VendorFilter = Tuple[str, int]
+
+# Which fields a text search looks at.
+TEXT_FIELDS = ("all", "description", "vendor", "raw")
+
+
+@dataclass(frozen=True)
+class TextFilter:
+    """A case-insensitive substring search over one or all of the text fields.
+
+    ``vendor`` is the effective (display) name, ``raw`` the original merchant string,
+    and ``all`` matches any of description, display name, or raw name.
+    """
+
+    text: str
+    field: str = "all"
+    # Searching ignores case. The matching helper can do either, so making this an
+    # option is a small change if it is ever wanted.
+    case_sensitive: bool = False
+
+    def __post_init__(self):
+        if self.field not in TEXT_FIELDS:
+            raise ValueError(
+                f"Unknown search field {self.field!r}; expected one of {list(TEXT_FIELDS)}."
+            )
 
 
 @dataclass
@@ -168,10 +192,51 @@ def get_rules(session: Session) -> List[RuleRow]:
     ]
 
 
+def _contains(column, text: str, case_sensitive: bool):
+    """A substring test.
+
+    ``instr`` rather than ``LIKE`` because SQLite's LIKE ignores ASCII case whatever you
+    write, so a case-sensitive search cannot be expressed with it. It also means ``%``
+    and ``_`` in the user's text need no escaping — they are ordinary characters here.
+    (On Postgres the equivalent would be ``strpos``.)
+    """
+    if case_sensitive:
+        return func.instr(column, text) > 0
+    return func.instr(func.lower(column), text.lower()) > 0
+
+
+def _text_condition(text_filter: TextFilter):
+    text = text_filter.text.strip()
+    field = text_filter.field
+    sensitive = text_filter.case_sensitive
+    # The display name is the override when there is one, else the raw name, so it has
+    # to be matched through the join rather than on a single column.
+    display = func.coalesce(VendorName.value, Vendor.name)
+
+    vendor_conditions = []
+    if field in ("all", "vendor"):
+        vendor_conditions.append(_contains(display, text, sensitive))
+    if field in ("all", "raw"):
+        vendor_conditions.append(_contains(Vendor.name, text, sensitive))
+
+    conditions = []
+    if field in ("all", "description"):
+        conditions.append(_contains(Transaction.description, text, sensitive))
+    if vendor_conditions:
+        matching_vendors = (
+            select(Vendor.id)
+            .outerjoin(VendorName, VendorName.id == Vendor.vendor_name_id)
+            .where(or_(*vendor_conditions))
+        )
+        conditions.append(Transaction.vendor_id.in_(matching_vendors))
+    return or_(*conditions)
+
+
 def _txn_query(
     account_id: Optional[int],
     category_id: Optional[int],
     vendor_filter: Optional[VendorFilter],
+    text_filter: "Optional[TextFilter]" = None,
 ):
     query = select(Transaction)
     if account_id is not None:
@@ -188,6 +253,8 @@ def _txn_query(
             )
         else:
             query = query.where(Transaction.vendor_id == vendor_id)
+    if text_filter is not None and text_filter.text.strip():
+        query = query.where(_text_condition(text_filter))
     return query
 
 
@@ -197,9 +264,10 @@ def get_transactions(
     category_id: Optional[int] = None,
     vendor_filter: Optional[VendorFilter] = None,
     limit: int = 2000,
+    text_filter: Optional[TextFilter] = None,
 ) -> List[TxnRow]:
     query = (
-        _txn_query(account_id, category_id, vendor_filter)
+        _txn_query(account_id, category_id, vendor_filter, text_filter)
         .order_by(Transaction.posted_date.desc(), Transaction.id.desc())
         .limit(limit)
     )
@@ -227,8 +295,9 @@ def get_totals(
     account_id: Optional[int] = None,
     category_id: Optional[int] = None,
     vendor_filter: Optional[VendorFilter] = None,
+    text_filter: Optional[TextFilter] = None,
 ) -> Totals:
-    base = _txn_query(account_id, category_id, vendor_filter).subquery()
+    base = _txn_query(account_id, category_id, vendor_filter, text_filter).subquery()
     amount = base.c.value_minor
     count = session.scalar(select(func.count()).select_from(base)) or 0
     transfer_count = (

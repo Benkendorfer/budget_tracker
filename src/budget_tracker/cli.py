@@ -115,10 +115,20 @@ def _cmd_list(args: argparse.Namespace) -> int:
             if vendor_filter is None:
                 print(f"No vendor named {args.vendor!r}.")
                 return 1
-        txns = queries.get_transactions(
-            session, account_id, category_id, vendor_filter, limit=args.limit
+        text_filter = (
+queries.TextFilter(args.search, args.search_in) if args.search else None
         )
-        totals = queries.get_totals(session, account_id, category_id, vendor_filter)
+        txns = queries.get_transactions(
+            session,
+            account_id,
+            category_id,
+            vendor_filter,
+            limit=args.limit,
+            text_filter=text_filter,
+        )
+        totals = queries.get_totals(
+            session, account_id, category_id, vendor_filter, text_filter=text_filter
+        )
 
     console = Console()
     table = Table(box=None, pad_edge=False)
@@ -464,6 +474,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--vendor", help="Filter by vendor (raw name or override display name)."
     )
     list_parser.add_argument("--category", help="Filter by category name.")
+    list_parser.add_argument(
+        "--search", help="Case-insensitive substring to look for."
+    )
+    list_parser.add_argument(
+        "--search-in",
+        choices=list(queries.TEXT_FIELDS),
+        default="all",
+        help="Which field --search looks at (default: %(default)s).",
+    )
     list_parser.add_argument(
         "--limit", type=int, default=50, help="Max rows to show (default: %(default)s)."
     )

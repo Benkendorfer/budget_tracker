@@ -598,3 +598,122 @@ def test_transaction_table_shows_the_account_after_the_amount(tmp_path, monkeypa
     headers, first = asyncio.run(run())
     assert headers == ["Date", "Description", "Vendor", "Category", "Amount", "Account"]
     assert first[-1] == "8207"  # the account each row belongs to
+
+
+def test_filter_command_searches_all_three_fields(tmp_path, monkeypatch):
+    session_factory = _setup(tmp_path, monkeypatch)
+    with session_factory() as session:
+        vendors.set_override(session, "COFFEE SHOP A", "Beanery")
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._run_command("filter Beanery")
+            await pilot.pause()
+            matched = [t.description for t in app._txns]
+            status = _panel_state(app)[2]
+
+            app._run_command("filter")  # bare filter clears it
+            await pilot.pause()
+            return matched, status, len(app._txns), app.text_filter
+
+    matched, status, cleared_count, text_filter = asyncio.run(run())
+    assert matched == ["COFFEE SHOP A", "COFFEE SHOP A"]  # found via display name
+    assert 'all~"Beanery"' in status  # the filter is visible in the status line
+    assert cleared_count == 3 and text_filter is None
+
+
+def test_filter_command_can_target_one_field(tmp_path, monkeypatch):
+    session_factory = _setup(tmp_path, monkeypatch)
+    with session_factory() as session:
+        vendors.set_override(session, "COFFEE SHOP A", "Beanery")
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            results = {}
+            for command in ("vendor:Beanery", "raw:Beanery", "description:SHOP B"):
+                app._run_command(f"filter {command}")
+                await pilot.pause()
+                results[command] = [t.description for t in app._txns]
+            return results
+
+    results = asyncio.run(run())
+    assert results["vendor:Beanery"] == ["COFFEE SHOP A", "COFFEE SHOP A"]
+    assert results["raw:Beanery"] == []  # the raw string is not "Beanery"
+    assert results["description:SHOP B"] == ["COFFEE SHOP B"]
+
+
+def test_unprefixed_text_with_a_colon_is_searched_literally(tmp_path, monkeypatch):
+    """`filter POS-: MTA` must not be read as a field prefix."""
+    _setup(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._run_command("filter nonsense:SHOP A")
+            await pilot.pause()
+            return [t.description for t in app._txns], app.text_filter
+
+    matched, text_filter = asyncio.run(run())
+    assert text_filter.field == "all"
+    assert text_filter.text == "nonsense:SHOP A"  # kept whole
+    assert matched == []
+
+
+def test_clear_filters_also_clears_the_text_filter(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._run_command("filter SHOP B")
+            await pilot.pause()
+            filtered = len(app._txns)
+            await pilot.press("ctrl+l")
+            await pilot.pause()
+            return filtered, len(app._txns), app.text_filter
+
+    filtered, after, text_filter = asyncio.run(run())
+    assert filtered == 1
+    assert after == 3 and text_filter is None
+
+
+def test_filter_flag_controls_case_sensitivity(tmp_path, monkeypatch):
+    session_factory = _setup(tmp_path, monkeypatch)
+    lower = tmp_path / "lower.csv"
+    lower.write_text(
+        "Transaction Date,Posted Date,Card No.,Description,Category,Debit,Credit\n"
+        "2025-07-05,2025-07-06,8207,coffee shop a,Dining,1.00,\n",
+        encoding="utf-8",
+    )
+    with session_factory() as session:
+        import_csv(session, lower)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            results = {}
+            for command in ("COFFEE SHOP A", "-c COFFEE SHOP A", "-c raw:coffee shop a"):
+                app._run_command(f"filter {command}")
+                await pilot.pause()
+                results[command] = (
+                    sorted(t.description for t in app._txns),
+                    app.text_filter.case_sensitive,
+                    _panel_state(app)[2],
+                )
+            return results
+
+    results = asyncio.run(run())
+    insensitive, flag, status = results["COFFEE SHOP A"]
+    assert insensitive == ["COFFEE SHOP A", "COFFEE SHOP A", "coffee shop a"]
+    assert flag is False and 'all~"COFFEE SHOP A"' in status
+
+    sensitive, flag, status = results["-c COFFEE SHOP A"]
+    assert sensitive == ["COFFEE SHOP A", "COFFEE SHOP A"]
+    assert flag is True
+    assert 'all=="COFFEE SHOP A"' in status  # the status line shows which mode is on
+
+    # The flag combines with a field prefix.
+    scoped, flag, _ = results["-c raw:coffee shop a"]
+    assert scoped == ["coffee shop a"] and flag is True

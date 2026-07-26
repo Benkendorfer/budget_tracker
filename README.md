@@ -8,6 +8,7 @@
     - [Setup](#setup)
     - [The interactive app](#the-interactive-app)
     - [The command line](#the-command-line)
+    - [Searching transactions](#searching-transactions)
     - [Renaming and grouping vendors](#renaming-and-grouping-vendors)
     - [Vendor rename rules](#vendor-rename-rules)
     - [Transfers between your own accounts](#transfers-between-your-own-accounts)
@@ -64,6 +65,9 @@ the bottom:
 | `import <path>` | Import a single CSV |
 | `rename <raw vendor> = <display name>` | Give one vendor a readable name (see below) |
 | `rule <pattern> = <display name>` | Rename every matching vendor, now and in future imports |
+| `filter <text>` | Search description, vendor name, and raw vendor name |
+| `filter <field>:<text>` | Search one of `description`, `vendor`, `raw` |
+| `filter` | Clear the text filter |
 | `transfers` | Pair up movements between your own accounts (`transfers reset` undoes it) |
 | `rules` | Open the rules panel (`rule` on its own does the same); `escape` returns |
 | `all` | Clear all filters |
@@ -96,6 +100,8 @@ budget list
 budget list --account "Card 8207" --limit 100
 budget list --category Dining
 budget list --vendor Coffee          # accepts a raw name or an override name
+budget list --search cava            # substring, across all three text fields
+budget list --search Kindle --search-in vendor
 
 # Give a raw vendor string a readable display name.
 budget rename "COFFEE SHOP A" "Coffee"
@@ -106,6 +112,31 @@ budget transfers --reset
 ```
 
 `budget --help`, or `budget <subcommand> --help`, documents every flag.
+
+### Searching transactions
+
+`filter` narrows the table to transactions whose text matches, and the totals follow the
+filter:
+
+```text
+filter cava                 # description, vendor name, or raw vendor name
+filter vendor:Lyft          # just the display name
+filter raw:Kindle Svcs*     # just the original merchant string
+filter description:PAYROLL  # just the description
+filter                      # clear it
+```
+
+Matching is a case-insensitive substring, so `shop b` finds `COFFEE SHOP B`. The three
+fields differ once vendors are renamed: `raw` searches what the bank wrote, `vendor`
+searches the name you gave it, and `description` searches the transaction text — so
+searching for a display name like `Beanery` finds nothing under `raw`. Wildcards are not
+special here; a `%` or `_` in your text is searched for literally.
+
+The active search shows up in the status line (`[filtered: vendor~"Lyft"]`) and stacks
+with the sidebar filters. `all`, or `ctrl+l`, clears everything.
+
+On the command line the same search is `budget list --search <text>`, with
+`--search-in description|vendor|raw|all`.
 
 ### Renaming and grouping vendors
 

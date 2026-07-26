@@ -110,6 +110,7 @@ class BudgetApp(App):
         self.account_filter: Optional[int] = None
         self.vendor_filter: Optional[queries.VendorFilter] = None
         self.category_filter: Optional[int] = None
+        self.text_filter: Optional[queries.TextFilter] = None
         self._accounts: List[queries.AccountRow] = []
         self._vendors: List[queries.VendorRow] = []
         self._categories: List[queries.CategoryRow] = []
@@ -139,7 +140,7 @@ class BudgetApp(App):
                 yield DataTable(id="setup")
                 yield Static("", id="status")
         yield Input(
-            placeholder="command: import | rules | all | refresh | help | quit",
+            placeholder="command: import | filter | rules | all | refresh | help | quit",
             id="command",
         )
         yield Footer()
@@ -197,12 +198,14 @@ class BudgetApp(App):
                 self.account_filter,
                 self.category_filter,
                 self.vendor_filter,
+                text_filter=self.text_filter,
             )
             totals = queries.get_totals(
                 session,
                 self.account_filter,
                 self.category_filter,
                 self.vendor_filter,
+                text_filter=self.text_filter,
             )
         self._fill_list("#accounts", [f"{a.name} ({a.count})" for a in self._accounts])
         self._fill_list("#vendors", [f"{v.name} ({v.count})" for v in self._vendors])
@@ -294,6 +297,8 @@ class BudgetApp(App):
             scope.append("vendor")
         if self.category_filter is not None:
             scope.append("category")
+        if self.text_filter is not None:
+            scope.append(f'{self.text_filter.field}~"{self.text_filter.text}"')
         scope_label = f" [filtered: {', '.join(scope)}]" if scope else ""
         transfers_label = (
             f"   ({totals.transfer_count} transfers excluded)"
@@ -527,6 +532,8 @@ class BudgetApp(App):
             self._do_transfers(arg)
         elif name == "merge":
             self._do_merge(arg)
+        elif name == "filter":
+            self._do_filter(arg)
         elif name == "help":
             self.notify(
                 "import — browse data/to_import; enter imports the selected file\n"
@@ -537,6 +544,9 @@ class BudgetApp(App):
                 "rules — list the rules you have defined (escape returns)\n"
                 "transfers [reset] — pair up movements between your own accounts\n"
                 "merge <account> = <account> — fold one account into another\n"
+                "filter <text> — search description, vendor, and raw name\n"
+                "filter vendor:<text> — search one field (description/vendor/raw)\n"
+                "filter — clear the text filter\n"
                 "all — clear filters   refresh — reload   quit — exit\n"
                 "Click an account/vendor/category to filter.\n"
                 "ctrl+n — prefill rename for the selected transaction's vendor,\n"
@@ -641,6 +651,31 @@ class BudgetApp(App):
         self._set_panel("imports")
         if not self._candidates:
             self.notify(f"No CSVs in {TO_IMPORT_DIR}", severity="warning")
+
+    def _do_filter(self, arg: str) -> None:
+        """`filter text` searches everything; `filter vendor:text` narrows the field."""
+        arg = arg.strip()
+        if not arg:
+            self.text_filter = None
+            self.reload()
+            self.notify("Text filter cleared.")
+            return
+
+        field, _, rest = arg.partition(":")
+        if rest.strip() and field.strip().lower() in queries.TEXT_FIELDS:
+            text_filter = queries.TextFilter(rest.strip(), field.strip().lower())
+        else:
+            # No recognised prefix, so the whole argument is the search text. This also
+            # means a colon inside ordinary text is treated literally.
+            text_filter = queries.TextFilter(arg, "all")
+        self.text_filter = text_filter
+        self.reload()
+        where = (
+            "description, vendor, and raw name"
+            if text_filter.field == "all"
+            else text_filter.field
+        )
+        self.notify(f"Filtering {where} for {text_filter.text!r}.", markup=False)
 
     def _do_merge(self, arg: str) -> None:
         if "=" not in arg:
@@ -773,6 +808,7 @@ class BudgetApp(App):
         self.account_filter = None
         self.vendor_filter = None
         self.category_filter = None
+        self.text_filter = None
         self.reload()
         self.notify("Filters cleared.")
 

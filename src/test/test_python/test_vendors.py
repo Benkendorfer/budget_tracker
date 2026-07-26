@@ -88,3 +88,118 @@ def test_override_survives_reimport(tmp_path):
         txns = queries.get_transactions(session, vendor_filter=vendor_filter)
         assert len(txns) == 5
         assert all(t.vendor == "Coffee" for t in txns)
+
+
+def test_text_filter_searches_description_vendor_and_raw_name(tmp_path):
+    session_factory = _setup(tmp_path)
+    with session_factory() as session:
+        vendors.set_override(session, "COFFEE SHOP A", "Beanery")
+
+    with session_factory() as session:
+        def find(text, field="all"):
+            rows = queries.get_transactions(
+                session, text_filter=queries.TextFilter(text, field)
+            )
+            return sorted(r.description for r in rows)
+
+        # The raw string survives on the description, so it matches either way.
+        assert find("COFFEE SHOP A") == ["COFFEE SHOP A", "COFFEE SHOP A"]
+        # "Beanery" exists only as the display name.
+        assert find("Beanery") == ["COFFEE SHOP A", "COFFEE SHOP A"]
+        assert find("Beanery", "vendor") == ["COFFEE SHOP A", "COFFEE SHOP A"]
+        assert find("Beanery", "description") == []  # not in the description text
+        assert find("Beanery", "raw") == []  # nor in the raw merchant string
+        assert find("COFFEE SHOP A", "raw") == ["COFFEE SHOP A", "COFFEE SHOP A"]
+        assert find("shop b") == ["COFFEE SHOP B"]  # case-insensitive
+        assert find("nothing here") == []
+
+
+def test_text_filter_applies_to_totals(tmp_path):
+    session_factory = _setup(tmp_path)
+    with session_factory() as session:
+        totals = queries.get_totals(
+            session, text_filter=queries.TextFilter("COFFEE SHOP B")
+        )
+    assert totals.count == 1
+    assert totals.outflow_minor == -400
+
+
+def test_text_filter_treats_like_wildcards_literally(tmp_path):
+    """A % or _ typed by the user is text to search for, not a pattern."""
+    session_factory = _setup(tmp_path)
+    with session_factory() as session:
+        rows = queries.get_transactions(
+            session, text_filter=queries.TextFilter("%")
+        )
+        assert rows == []  # would match everything if passed through to LIKE
+        assert (
+            queries.get_transactions(session, text_filter=queries.TextFilter("_"))
+            == []
+        )
+
+
+def test_text_filter_combines_with_other_filters(tmp_path):
+    session_factory = _setup(tmp_path)
+    with session_factory() as session:
+        category_id = queries.resolve_category(session, "Dining")
+        rows = queries.get_transactions(
+            session,
+            category_id=category_id,
+            text_filter=queries.TextFilter("SHOP A"),
+        )
+    assert len(rows) == 2
+
+
+CASE_CSV = """Transaction Date,Posted Date,Card No.,Description,Category,Debit,Credit
+2025-07-05,2025-07-06,8207,coffee shop a,Dining,1.00,
+"""
+
+
+def test_case_sensitive_search_distinguishes_case(tmp_path):
+    session_factory = _setup(tmp_path)
+    lower = tmp_path / "lower.csv"
+    lower.write_text(CASE_CSV, encoding="utf-8")
+    with session_factory() as session:
+        import_csv(session, lower)  # adds a lowercase "coffee shop a"
+
+    with session_factory() as session:
+        def find(text, **kwargs):
+            rows = queries.get_transactions(
+                session, text_filter=queries.TextFilter(text, **kwargs)
+            )
+            return sorted(r.description for r in rows)
+
+        # Insensitive is the default and sees both spellings.
+        assert find("COFFEE SHOP A") == ["COFFEE SHOP A", "COFFEE SHOP A", "coffee shop a"]
+        # Case-sensitive separates them.
+        assert find("COFFEE SHOP A", case_sensitive=True) == [
+            "COFFEE SHOP A",
+            "COFFEE SHOP A",
+        ]
+        assert find("coffee shop a", case_sensitive=True) == ["coffee shop a"]
+
+
+def test_case_sensitivity_applies_to_vendor_names_too(tmp_path):
+    session_factory = _setup(tmp_path)
+    with session_factory() as session:
+        vendors.set_override(session, "COFFEE SHOP A", "Beanery")
+
+    with session_factory() as session:
+        sensitive = queries.TextFilter("beanery", "vendor", case_sensitive=True)
+        insensitive = queries.TextFilter("beanery", "vendor")
+        assert queries.get_transactions(session, text_filter=sensitive) == []
+        assert len(queries.get_transactions(session, text_filter=insensitive)) == 2
+
+
+def test_case_sensitive_totals_match_the_rows(tmp_path):
+    session_factory = _setup(tmp_path)
+    lower = tmp_path / "lower.csv"
+    lower.write_text(CASE_CSV, encoding="utf-8")
+    with session_factory() as session:
+        import_csv(session, lower)
+    with session_factory() as session:
+        totals = queries.get_totals(
+            session, text_filter=queries.TextFilter("coffee shop a", case_sensitive=True)
+        )
+    assert totals.count == 1
+    assert totals.outflow_minor == -100
