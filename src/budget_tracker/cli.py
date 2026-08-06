@@ -108,6 +108,78 @@ def _cmd_import(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_imports(args: argparse.Namespace) -> int:
+    """List past imports — where an ``unimport`` id comes from."""
+    engine = get_engine()
+    init_db(engine)
+    session_factory = get_sessionmaker(engine)
+    with session_factory() as session:
+        rows = queries.get_imports(session)
+
+    if not rows:
+        print("No imports yet.")
+        return 0
+    width = max(len(row.source_file) for row in rows)
+    for row in rows:
+        account = row.account or "multiple/none"
+        print(
+            f"  [{row.id:>4}] {row.source_file:<{width}}  "
+            f"{row.transaction_count:>6} txns  {account}  {row.imported_at}"
+        )
+    return 0
+
+
+def _cmd_unimport(args: argparse.Namespace) -> int:
+    """Delete a past import and its transactions. Destructive, so ``--yes`` is required.
+
+    Without it, this only previews what would happen — the source file, the transaction
+    count, and any transfer pairings that would be broken — read up front through
+    :func:`queries.preview_import_delete`, the same numbers the app's own confirmation
+    shows, never found out by deleting first.
+    """
+    from .importer import UnknownImport, delete_import
+
+    engine = get_engine()
+    init_db(engine)
+    session_factory = get_sessionmaker(engine)
+    with session_factory() as session:
+        preview = queries.preview_import_delete(session, args.import_id)
+        if preview is None:
+            print(f"No import with id {args.import_id}.")
+            return 1
+
+        if not args.yes:
+            transfers_note = (
+                f", breaking {preview.transfers_broken} transfer pairing(s)"
+                if preview.transfers_broken
+                else ""
+            )
+            print(
+                f"Would delete import #{args.import_id} ({preview.source_file}): "
+                f"{preview.transaction_count} transaction(s){transfers_note}."
+            )
+            print("Re-run with --yes to actually delete it.")
+            return 1
+
+        try:
+            result = delete_import(session, args.import_id)
+        except UnknownImport as error:
+            print(error)
+            return 1
+        session.commit()
+
+    transfers_note = (
+        f", {result.transfers_broken} transfer pairing(s) broken"
+        if result.transfers_broken
+        else ""
+    )
+    print(
+        f"Deleted import #{result.import_id} ({preview.source_file}): "
+        f"{result.transactions_deleted} transaction(s) removed{transfers_note}."
+    )
+    return 0
+
+
 def _cmd_list(args: argparse.Namespace) -> int:
     from rich.console import Console
     from rich.table import Table
@@ -442,6 +514,13 @@ def _cmd_format(args: argparse.Namespace) -> int:
 
     with session_factory() as session:
         try:
+            if args.format_command == "invert":
+                spec = formats.set_invert_amount(session, args.name, args.state == "on")
+                session.commit()
+                state = "on" if spec.invert_amount else "off"
+                print(f"{spec.name!r}: invert {state}.")
+                return 0
+
             if args.format_command == "prefix":
                 spec = formats.set_account_prefix(session, args.name, args.prefix)
                 session.commit()
@@ -488,7 +567,14 @@ def _cmd_format(args: argparse.Namespace) -> int:
     width = max(len(s.name) for s in specs)
     for spec in specs:
         account = spec.account_column or "requires --account"
-        print(f"  {spec.name:<{width}}  {spec.amount_style:<13}  account: {account}")
+        # invert only means anything for a single signed column; a debit/credit pair
+        # already says which side is an outflow, so it is left off there.
+        polarity = (
+            f"  invert: {'on' if spec.invert_amount else 'off'}"
+            if spec.amount_style == formats.SIGNED
+            else ""
+        )
+        print(f"  {spec.name:<{width}}  {spec.amount_style:<13}  account: {account}{polarity}")
     return 0
 
 
@@ -601,6 +687,26 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     import_parser.set_defaults(func=_cmd_import)
+
+    imports_parser = subparsers.add_parser(
+        "imports", help="List past imports (id, source file, transaction count)."
+    )
+    imports_parser.set_defaults(func=_cmd_imports)
+
+    unimport_parser = subparsers.add_parser(
+        "unimport",
+        help=(
+            "Delete a past import and its transactions (destructive; see 'budget "
+            "imports' for ids)."
+        ),
+    )
+    unimport_parser.add_argument("import_id", type=int, help="The import id to delete.")
+    unimport_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Actually delete. Without it, only preview what would be deleted.",
+    )
+    unimport_parser.set_defaults(func=_cmd_unimport)
 
     list_parser = subparsers.add_parser(
         "list", help="List transactions, optionally filtered."
@@ -779,6 +885,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     format_export.add_argument("name", nargs="?", help="Export just this format.")
     format_export.add_argument("--output", help="Write to this file instead of stdout.")
+
+    format_invert = format_subparsers.add_parser(
+        "invert",
+        help=(
+            "Flip whether a positive amount means money leaving the account "
+            "(providers disagree; future imports only)."
+        ),
+    )
+    format_invert.add_argument("name", help="The format to change.")
+    format_invert.add_argument("state", choices=["on", "off"], help="New polarity.")
 
     rule_subparsers.add_parser("list", help="Show every rule (default).")
     rule_subparsers.add_parser(

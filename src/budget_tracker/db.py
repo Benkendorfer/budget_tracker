@@ -46,6 +46,7 @@ def get_engine(db_path: Optional[Path] = None) -> Engine:
 # missing *tables*, so these are applied by hand; SQLite ADD COLUMN is cheap and safe.
 _ADDED_COLUMNS = {
     "vendor": {"vendor_name_source": "VARCHAR"},
+    "csv_format": {"invert_amount": "BOOLEAN NOT NULL DEFAULT 0"},
 }
 
 

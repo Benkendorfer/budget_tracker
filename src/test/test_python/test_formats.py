@@ -44,11 +44,28 @@ def _write(tmp_path, name, text):
 
 
 def _learn(session, path, name):
-    """Infer a format from a file and save it, as interactive setup would."""
+    """Infer a format from a file and save it, as interactive setup would.
+
+    Loops until every question is resolved rather than asserting one-pass completeness,
+    because a question with a default (the ambiguous-date and invert-amount questions
+    among them) is meant to be answerable by accepting the suggestion, and a real
+    walkthrough would do exactly that.
+    """
     fieldnames, rows = read_header_and_rows(path)
     inference = formats.infer(name, fieldnames, rows)
-    assert inference.complete, f"unexpected questions: {inference.questions}"
-    spec = formats.spec_from_values(inference.values)
+    values, questions = inference.values, inference.questions
+    while questions:
+        answers = {}
+        for question in questions:
+            if question.default is not None:
+                answers[question.field] = question.default
+            elif question.choices:
+                answers[question.field] = question.choices[0]
+            else:
+                raise AssertionError(f"_learn cannot answer {question.field!r}")
+        values = formats.apply_answers(values, answers, fieldnames, rows)
+        questions = formats.remaining_questions(values, rows, fieldnames)
+    spec = formats.spec_from_values(values)
     formats.save_format(session, spec)
     session.commit()
     return spec
@@ -76,7 +93,9 @@ def test_infers_a_signed_layout_with_an_id_column(tmp_path):
     path = _write(tmp_path, "signed.csv", SIGNED_CSV)
     fieldnames, rows = read_header_and_rows(path)
     inference = formats.infer("signed", fieldnames, rows)
-    assert inference.complete
+    # Everything is inferred except the amount's polarity, which nothing in a single
+    # signed column can settle on its own (see test_signed_layout_asks_about_polarity).
+    assert [q.field for q in inference.questions] == ["invert_amount"]
     values = inference.values
     assert values["amount_style"] == formats.SIGNED
     assert values["amount_column"] == "Amount"
@@ -86,6 +105,34 @@ def test_infers_a_signed_layout_with_an_id_column(tmp_path):
     assert values["date_formats"] == ["%m/%d/%Y"]
     # A unique id column identifies a row on its own.
     assert values["dedup_columns"] == ["Transaction ID"]
+
+
+def test_signed_layout_asks_about_polarity(tmp_path):
+    """A single signed column carries no signal of which sign is an outflow, so it is
+    always asked, with a real sample value so the choice is answerable at a glance."""
+    path = _write(tmp_path, "signed.csv", SIGNED_CSV)
+    fieldnames, rows = read_header_and_rows(path)
+    inference = formats.infer("signed", fieldnames, rows)
+    question = next(q for q in inference.questions if q.field == "invert_amount")
+    assert "-200.00000" in question.prompt  # the file's own first sample amount
+    assert list(question.choices) == ["yes", "no"]
+    assert question.default == "no"
+
+    values = formats.apply_answers(
+        inference.values, {"invert_amount": "yes"}, fieldnames, rows
+    )
+    assert not formats.remaining_questions(values, rows, fieldnames)
+    assert formats.spec_from_values(values).invert_amount is True
+
+
+def test_debit_credit_layout_is_never_asked_about_polarity(tmp_path):
+    """A debit/credit pair already says which side is an outflow, so no question."""
+    path = _write(tmp_path, "pair.csv", PAIR_CSV)
+    fieldnames, rows = read_header_and_rows(path)
+    inference = formats.infer("pair", fieldnames, rows)
+    assert "invert_amount" not in [q.field for q in inference.questions]
+    assert inference.values.get("invert_amount") is None  # unset; the default holds
+    assert formats.spec_from_values(inference.values).invert_amount is False
 
 
 def test_dedup_falls_back_to_mapped_columns_in_a_fixed_order(tmp_path):
@@ -163,12 +210,17 @@ def test_date_question_appears_only_once_the_date_column_is_known():
         rows,
     )
     followups = formats.remaining_questions(values, rows, fieldnames)
-    assert [q.field for q in followups] == ["date_formats"]
+    # Naming the amount column also settles amount_style as signed, which is what
+    # makes the invert-amount question askable in the same pass as the date one.
+    assert {q.field for q in followups} == {"date_formats", "invert_amount"}
 
-    values = formats.apply_answers(values, {"date_formats": "day"}, fieldnames, rows)
+    values = formats.apply_answers(
+        values, {"date_formats": "day", "invert_amount": "no"}, fieldnames, rows
+    )
     assert not formats.remaining_questions(values, rows, fieldnames)
     spec = formats.spec_from_values(values)
     assert spec.date_formats == ["%d/%m/%Y"]
+    assert spec.invert_amount is False
     assert spec.dedup_columns  # recomputed once the columns were known
 
 
@@ -404,3 +456,70 @@ def test_set_account_prefix_keeps_a_merge_from_being_undone(tmp_path):
         formats.set_account_prefix(session, "cards", "")  # removing it is allowed
         session.commit()
         assert formats.get_format(session, "cards").account_prefix == ""
+
+
+def test_set_invert_amount_flips_a_stored_format(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    path = _write(tmp_path, "pair.csv", PAIR_CSV)
+    with session_factory() as session:
+        _learn(session, path, "cards")
+        spec = formats.set_invert_amount(session, "cards", True)
+        session.commit()
+    assert spec.invert_amount is True
+
+    with session_factory() as session:
+        assert formats.get_format(session, "cards").invert_amount is True
+        spec = formats.set_invert_amount(session, "cards", False)  # reversible
+        session.commit()
+    assert spec.invert_amount is False
+
+
+def test_set_invert_amount_reports_an_unknown_format(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        with pytest.raises(formats.UnknownFormat):
+            formats.set_invert_amount(session, "nope", True)
+
+
+# --------------------------------------------------------------------- schema migration
+
+def test_init_db_adds_invert_amount_to_a_preexisting_csv_format_table(tmp_path):
+    """Databases created before this flag existed must survive init_db()."""
+    import sqlalchemy
+
+    db_path = tmp_path / "old.db"
+    engine = get_engine(db_path)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.text(
+                "CREATE TABLE csv_format (id INTEGER PRIMARY KEY, name VARCHAR UNIQUE, "
+                "signature VARCHAR, posted_date_column VARCHAR, description_column "
+                "VARCHAR, date_formats VARCHAR, amount_style VARCHAR, dedup_columns "
+                "VARCHAR, txn_date_column VARCHAR, category_column VARCHAR, "
+                "debit_column VARCHAR, credit_column VARCHAR, amount_column VARCHAR, "
+                "account_column VARCHAR, account_prefix VARCHAR, created_at DATETIME)"
+            )
+        )
+        connection.execute(
+            sqlalchemy.text(
+                "INSERT INTO csv_format (name, signature, posted_date_column, "
+                "description_column, date_formats, amount_style, dedup_columns, "
+                "account_prefix) VALUES ('old', '[]', 'Date', 'Desc', '[]', 'signed', "
+                "'[]', '')"
+            )
+        )
+
+    init_db(engine)
+
+    with engine.begin() as connection:
+        columns = {
+            row[1]
+            for row in connection.execute(sqlalchemy.text("PRAGMA table_info(csv_format)"))
+        }
+    assert "invert_amount" in columns
+
+    # The pre-existing row is intact and defaults to no inversion, matching the
+    # behaviour every format had before this column existed.
+    session_factory = get_sessionmaker(engine)
+    with session_factory() as session:
+        assert formats.get_format(session, "old").invert_amount is False

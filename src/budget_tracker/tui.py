@@ -30,6 +30,8 @@ from . import accounts, categories, formats, queries, stats, transfers, vendors
 from .db import get_engine, get_sessionmaker, init_db
 from .importer import (
     ImportCandidate,
+    UnknownImport,
+    delete_import,
     import_csv,
     inspect_csv,
     read_header_and_rows,
@@ -150,6 +152,9 @@ class BudgetApp(App):
         self._rules: List[queries.RuleRow] = []
         self._category_rules: List[queries.CategoryRuleRow] = []
         self._candidates: List[ImportCandidate] = []
+        # Past imports (from the database), shown alongside the candidates so an
+        # ``unimport`` id is something the user can actually look up.
+        self._imports: List[queries.ImportRow] = []
         self._panel = "txns"
         self._setup: Optional[_Setup] = None
         self._totals = queries.Totals(count=0, net_minor=0, outflow_minor=0, inflow_minor=0)
@@ -157,6 +162,9 @@ class BudgetApp(App):
         self.window: Optional[stats.Window] = None
         self._report: Optional[stats.Report] = None
         self._range_pending = False  # awaiting a typed date range for the picker
+        # Awaiting a typed "yes" to confirm a pending `unimport`; holds what it would
+        # destroy, read up front so the confirmation names real numbers.
+        self._pending_unimport: Optional[queries.ImportDeletePreview] = None
         self._prompt_panel: Optional[str] = None  # which panel the #prompt belongs to
         # True only while the transactions panel is showing exactly what a statistics
         # drill-down put there — the left arrow's "back" is only meaningful then.
@@ -195,8 +203,8 @@ class BudgetApp(App):
                 yield Static("", id="status")
         yield Input(
             placeholder=(
-                "command: import | filter | categorize | category | stats | rules | "
-                "all | refresh | help | quit"
+                "command: import | unimport | filter | categorize | category | format | "
+                "stats | rules | all | refresh | help | quit"
             ),
             id="command",
         )
@@ -247,6 +255,10 @@ class BudgetApp(App):
         imports.add_column("File", width=34)
         imports.add_column("Rows", width=5)
         imports.add_column("Status", width=15)
+        # Blank for a not-yet-imported candidate; past imports carry the id `unimport`
+        # needs, so this is the only place that id is ever shown. Wide enough for a
+        # five-digit id — plausible after years of monthly imports — without clipping.
+        imports.add_column("ID", width=6)
         imports.display = False
 
         setup = self.query_one("#setup", DataTable)
@@ -381,6 +393,16 @@ class BudgetApp(App):
                 _truncate(candidate.path.name, 34),
                 Text(str(candidate.row_count), justify="right"),
                 status,
+                "",  # not imported yet, so no id
+            )
+        # Already-imported files, dimmed: not actionable by enter here (that only
+        # imports a candidate), but this is where an `unimport <id>` id comes from.
+        for imp in self._imports:
+            table.add_row(
+                Text(_truncate(imp.source_file, 34), style=TRANSFER_STYLE),
+                Text(str(imp.transaction_count), justify="right", style=TRANSFER_STYLE),
+                Text("imported", style=TRANSFER_STYLE),
+                Text(str(imp.id), justify="right", style=TRANSFER_STYLE),
             )
 
     def _build_report(self) -> None:
@@ -484,7 +506,9 @@ class BudgetApp(App):
             ready = sum(1 for c in self._candidates if c.ready)
             status.update(
                 f"{len(self._candidates)} file(s), {ready} ready   "
-                "enter to import   escape to return to transactions"
+                "enter to import   "
+                f"{len(self._imports)} past   unimport <id>   "
+                "escape returns"
             )
             return
         self._set_status(self._totals)
@@ -790,6 +814,9 @@ class BudgetApp(App):
         if self._range_pending:
             self._answer_range(text)
             return
+        if self._pending_unimport is not None:
+            self._answer_unimport(text)
+            return
         self._run_command(text.strip())
 
     def _run_command(self, command: str) -> None:
@@ -808,6 +835,10 @@ class BudgetApp(App):
             self.action_clear_filters()
         elif name == "import":
             self._do_import(arg)
+        elif name == "unimport":
+            self._do_unimport(arg)
+        elif name == "format":
+            self._do_format(arg)
         elif name == "rename":
             self._do_rename(arg)
         elif name == "rule":
@@ -828,8 +859,15 @@ class BudgetApp(App):
             self._do_stats(arg)
         elif name == "help":
             self.notify(
-                "import — browse data/to_import; enter imports the selected file\n"
+                "import — browse data/to_import; enter imports the selected file,\n"
+                "  and lists past imports (with their id) below the candidates\n"
                 "import all | import <path> — import without browsing\n"
+                "unimport <id> — delete a past import and its transactions;\n"
+                "  asks for confirmation, naming what it will destroy\n"
+                "format — list learned CSV layouts and their amount polarity\n"
+                "format <name> invert on|off — flip whether a positive amount means\n"
+                "  money out for that layout (future imports only; fix a bad import\n"
+                "  with unimport, then re-import)\n"
                 "rename <raw vendor> = <display name> — override / aggregate a vendor\n"
                 "rule <pattern> = <display name> — rename every matching vendor,\n"
                 "  now and on future imports (e.g. rule Kindle Svcs* = Kindle)\n"
@@ -909,6 +947,79 @@ class BudgetApp(App):
                 markup=False,
             )
 
+    def _do_unimport(self, arg: str) -> None:
+        """``unimport <id>`` — destructive, so it only asks; ``_answer_unimport`` acts.
+
+        The confirmation names the file, the transaction count, and any transfer
+        pairings it would break — read up front through
+        :func:`queries.preview_import_delete`, never guessed and never found out by
+        deleting first.
+        """
+        arg = arg.strip()
+        if not arg.isdigit():
+            self.notify(
+                "Usage: unimport <id>  (see the id column in 'import')",
+                severity="warning",
+            )
+            return
+        import_id = int(arg)
+        with self.session_factory() as session:
+            preview = queries.preview_import_delete(session, import_id)
+        if preview is None:
+            self.notify(f"No import with id {import_id}.", severity="error")
+            return
+
+        self._pending_unimport = preview
+        self._prompt_panel = self._panel
+        transfers_note = (
+            f", breaking {preview.transfers_broken} transfer pairing(s)"
+            if preview.transfers_broken
+            else ""
+        )
+        prompt = self.query_one("#prompt", Static)
+        # Text(), not markup: the source file name is user data and may hold brackets.
+        prompt.update(
+            Text.assemble(
+                (
+                    f"Delete import #{import_id} ({preview.source_file}): "
+                    f"{preview.transaction_count} transaction(s){transfers_note}?\n",
+                    "bold",
+                ),
+                ("Type yes to confirm; anything else, or escape, cancels.", "dim"),
+            )
+        )
+        prompt.display = True
+        self.query_one("#command", Input).focus()
+
+    def _answer_unimport(self, text: str) -> None:
+        pending = self._pending_unimport
+        self._cancel_unimport()
+        if text.strip().lower() != "yes":
+            self.notify("Unimport cancelled.")
+            return
+        with self.session_factory() as session:
+            try:
+                result = delete_import(session, pending.import_id)
+            except UnknownImport as error:
+                self.notify(str(error), severity="error", markup=False)
+                return
+            session.commit()
+        self.reload()
+        if self._panel == "imports":
+            self._show_imports()
+        message = (
+            f"Deleted import #{result.import_id} ({pending.source_file}): "
+            f"{result.transactions_deleted} transaction(s) removed"
+        )
+        if result.transfers_broken:
+            message += f", {result.transfers_broken} transfer pairing(s) broken"
+        self.notify(message + ".", markup=False)
+
+    def _cancel_unimport(self) -> None:
+        self._pending_unimport = None
+        self._prompt_panel = None
+        self.query_one("#prompt", Static).display = False
+
     def _do_rename(self, arg: str) -> None:
         if "=" not in arg:
             self.notify(
@@ -969,10 +1080,11 @@ class BudgetApp(App):
             )
 
     def _show_imports(self) -> None:
-        """List the files in the inbox, with whatever blocks each one."""
+        """List the files in the inbox, with whatever blocks each one, plus history."""
         paths = sorted(TO_IMPORT_DIR.glob("*.csv"))
         with self.session_factory() as session:
             self._candidates = [inspect_csv(session, path) for path in paths]
+            self._imports = queries.get_imports(session)
         self._fill_imports()
         self._set_panel("imports")
         if not self._candidates:
@@ -1151,6 +1263,52 @@ class BudgetApp(App):
         lines = [f"{'  ' * c.depth}{c.name} ({c.count})" for c in self._categories]
         self.notify("\n".join(lines), title="Categories", markup=False, timeout=8)
 
+    FORMAT_USAGE = "Usage: format | format <name> invert on|off"
+
+    def _do_format(self, arg: str) -> None:
+        """Bare ``format`` lists learned layouts; ``format <name> invert on|off`` flips one.
+
+        A positive amount means money leaving the account on some providers' exports and
+        money arriving on others; flipping ``invert_amount`` here fixes every future
+        import of that layout, without touching anything already imported (undo a bad
+        import with ``unimport`` first, then re-import).
+        """
+        arg = arg.strip()
+        if not arg:
+            self._notify_formats()
+            return
+        parts = arg.split()
+        if len(parts) < 3 or parts[-2].lower() != "invert" or parts[-1].lower() not in (
+            "on",
+            "off",
+        ):
+            self.notify(self.FORMAT_USAGE, severity="warning")
+            return
+        name = " ".join(parts[:-2])
+        invert = parts[-1].lower() == "on"
+        with self.session_factory() as session:
+            try:
+                spec = formats.set_invert_amount(session, name, invert)
+            except formats.UnknownFormat as error:
+                self.notify(str(error), severity="error", markup=False)
+                return
+            session.commit()
+        state = "on" if spec.invert_amount else "off"
+        self.notify(f"{spec.name!r}: invert {state}.", markup=False)
+
+    def _notify_formats(self) -> None:
+        with self.session_factory() as session:
+            specs = formats.list_formats(session)
+        if not specs:
+            self.notify("No CSV layouts learned yet. Import a file to learn one.")
+            return
+        lines = [
+            f"{s.name} — {s.amount_style}, invert "
+            + ("on" if s.invert_amount else "off")
+            for s in specs
+        ]
+        self.notify("\n".join(lines), title="Formats", markup=False, timeout=8)
+
     # ------------------------------------------------------------- drill-down
     def _drill_into_category(self, row: int) -> None:
         """Enter, or the right arrow, on a statistics row lists the transactions behind it.
@@ -1290,6 +1448,10 @@ class BudgetApp(App):
         if self._range_pending:
             self.notify("Custom range cancelled.")
             self._cancel_range()
+            return
+        if self._pending_unimport is not None:
+            self.notify("Unimport cancelled.")
+            self._cancel_unimport()
             return
         if self._panel != "txns":
             self._set_panel("txns")

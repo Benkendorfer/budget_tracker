@@ -4,7 +4,7 @@
 and the database is pointed at a temporary file through ``BUDGET_DB``.
 """
 
-from budget_tracker import categories, cli
+from budget_tracker import categories, cli, formats, queries
 from budget_tracker.db import get_engine, get_sessionmaker, init_db
 from budget_tracker.importer import import_csv
 from helpers import learn_format
@@ -173,3 +173,83 @@ def test_list_dash_dash_category_reports_an_unknown_name(tmp_path, monkeypatch, 
 
     assert cli.main(["list", "--category", "Nope"]) == 1
     assert "No category named 'Nope'" in capsys.readouterr().out
+
+
+# ------------------------------------------------------------------------- unimport
+
+
+def test_imports_command_lists_past_imports(tmp_path, monkeypatch, capsys):
+    session_factory = _setup(tmp_path, monkeypatch)
+    with session_factory() as session:
+        import_id = queries.get_imports(session)[0].id
+
+    assert cli.main(["imports"]) == 0
+    out = capsys.readouterr().out
+    assert f"[{import_id:>4}]" in out
+    assert "in.csv" in out
+    assert "3 txns" in out
+
+
+def test_unimport_without_yes_only_previews(tmp_path, monkeypatch, capsys):
+    session_factory = _setup(tmp_path, monkeypatch)
+    with session_factory() as session:
+        import_id = queries.get_imports(session)[0].id
+
+    assert cli.main(["unimport", str(import_id)]) == 1
+    out = capsys.readouterr().out
+    assert "Would delete" in out and "3 transaction(s)" in out
+    assert "--yes" in out
+    with session_factory() as session:
+        assert len(queries.get_transactions(session)) == 3  # untouched
+
+
+def test_unimport_with_yes_deletes(tmp_path, monkeypatch, capsys):
+    session_factory = _setup(tmp_path, monkeypatch)
+    with session_factory() as session:
+        import_id = queries.get_imports(session)[0].id
+
+    assert cli.main(["unimport", str(import_id), "--yes"]) == 0
+    out = capsys.readouterr().out
+    assert f"Deleted import #{import_id}" in out
+    assert "3 transaction(s) removed" in out
+    with session_factory() as session:
+        assert queries.get_transactions(session) == []
+
+
+def test_unimport_reports_an_unknown_id(tmp_path, monkeypatch, capsys):
+    _setup(tmp_path, monkeypatch)
+
+    assert cli.main(["unimport", "999", "--yes"]) == 1
+    assert "No import with id 999" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------- format
+
+
+def test_format_list_shows_polarity(tmp_path, monkeypatch, capsys):
+    _setup(tmp_path, monkeypatch)
+
+    assert cli.main(["format"]) == 0
+    out = capsys.readouterr().out
+    assert "test_layout" in out and "debit_credit" in out
+
+
+def test_format_invert_flips_and_is_reflected_in_list(tmp_path, monkeypatch, capsys):
+    session_factory = _setup(tmp_path, monkeypatch)
+
+    assert cli.main(["format", "invert", "test_layout", "on"]) == 0
+    assert "invert on" in capsys.readouterr().out
+    with session_factory() as session:
+        assert formats.get_format(session, "test_layout").invert_amount is True
+
+    assert cli.main(["format", "invert", "test_layout", "off"]) == 0
+    assert "invert off" in capsys.readouterr().out
+    with session_factory() as session:
+        assert formats.get_format(session, "test_layout").invert_amount is False
+
+
+def test_format_invert_reports_an_unknown_format(tmp_path, monkeypatch, capsys):
+    _setup(tmp_path, monkeypatch)
+
+    assert cli.main(["format", "invert", "nope", "on"]) == 1
+    assert "Unknown format" in capsys.readouterr().out

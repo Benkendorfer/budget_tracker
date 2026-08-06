@@ -280,6 +280,11 @@ def import_csv(
                 cell(row, fmt.credit_column),
                 currency.decimal_places,
             )
+        if fmt.invert_amount:
+            # Applied once, after either parse path, so the flag means the same thing
+            # whichever amount_style the format uses. The dedup hash is built from raw
+            # cell text (below), not this value, so flipping it never changes import_hash.
+            value_minor = -value_minor
 
         session.add(
             Transaction(
@@ -324,4 +329,77 @@ def import_csv(
         total_rows=len(rows),
         inserted=inserted,
         skipped_duplicates=skipped,
+    )
+
+
+class UnknownImport(ValueError):
+    """No import exists with the given id."""
+
+
+@dataclass
+class DeleteResult:
+    import_id: int
+    transactions_deleted: int
+    transfers_broken: int
+
+
+def delete_import(session: Session, import_id: int) -> DeleteResult:
+    """Remove an import and the transactions it created. No commit.
+
+    Accounts, vendors, and categories the import touched are left in place — a
+    hand-written rule or another transaction may now depend on them, and an unused
+    category is harmless (``get_categories`` already hides categories with no
+    transactions).
+
+    A transaction whose *partner* leg is being deleted stops being a transfer: its
+    ``transfer_group_id`` is cleared, and if transfer detection is what categorised it
+    (``category_source == "transfer"``), that category is cleared too, leaving it in the
+    same "unset" state :func:`.transfers.clear_transfers` would. A category set by hand
+    or by the import itself is left alone.
+    """
+    import_record = session.get(Import, import_id)
+    if import_record is None:
+        raise UnknownImport(f"No import with id {import_id}.")
+
+    doomed = list(
+        session.scalars(select(Transaction).where(Transaction.import_id == import_id))
+    )
+    doomed_ids = {t.id for t in doomed}
+    group_ids = {
+        t.transfer_group_id for t in doomed if t.transfer_group_id is not None
+    }
+
+    # Imported here, as elsewhere in this module, to keep the module-level dependency
+    # one-way (transfers -> models only).
+    from .transfers import TRANSFER_SOURCE
+
+    transfers_broken = 0
+    if group_ids:
+        survivors = session.scalars(
+            select(Transaction).where(
+                Transaction.transfer_group_id.in_(group_ids),
+                Transaction.id.not_in(doomed_ids),
+            )
+        )
+        for leg in survivors:
+            leg.transfer_group_id = None
+            if leg.category_source == TRANSFER_SOURCE:
+                leg.category_id = None
+                leg.category_source = "unset"
+            transfers_broken += 1
+
+    for txn in doomed:
+        session.delete(txn)
+    # Flushed separately: Import <-> Transaction has no ORM-level relationship telling
+    # the unit of work which side must go first, so without this the import row can be
+    # sent to the database before the rows that reference it, and SQLite's foreign key
+    # check rejects it.
+    session.flush()
+    session.delete(import_record)
+    session.flush()
+
+    return DeleteResult(
+        import_id=import_id,
+        transactions_deleted=len(doomed),
+        transfers_broken=transfers_broken,
     )

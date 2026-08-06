@@ -23,6 +23,7 @@ from .models import (
     Category,
     CategoryRule,
     Currency,
+    Import,
     Transaction,
     Vendor,
     VendorName,
@@ -157,6 +158,31 @@ class BucketTotal:
     count: int
     outflow_minor: int
     inflow_minor: int
+
+
+@dataclass
+class ImportRow:
+    """One past import, for browsing history and finding the id ``unimport`` needs."""
+
+    id: int
+    source_file: str
+    account: str  # "" when the import spanned more than one account
+    transaction_count: int  # transactions still linked to it right now
+    imported_at: str
+
+
+@dataclass
+class ImportDeletePreview:
+    """What ``importer.delete_import`` would do, read without doing it.
+
+    Mirrors its counting exactly (see :func:`preview_import_delete`), so a confirmation
+    shown before deleting matches what deleting actually does.
+    """
+
+    import_id: int
+    source_file: str
+    transaction_count: int
+    transfers_broken: int
 
 
 def get_accounts(session: Session) -> List[AccountRow]:
@@ -587,6 +613,77 @@ def get_bucket_totals(
         BucketTotal(key=r[0], label=r[1], count=r[2], outflow_minor=r[3], inflow_minor=r[4])
         for r in rows
     ]
+
+
+def get_imports(session: Session) -> List[ImportRow]:
+    """Past imports, most recent first — where an ``unimport`` id comes from."""
+    rows = session.execute(
+        select(
+            Import.id,
+            Import.source_file,
+            Account.name,
+            func.count(Transaction.id),
+            Import.imported_at,
+        )
+        .join(Account, Account.id == Import.account_id, isouter=True)
+        .join(Transaction, Transaction.import_id == Import.id, isouter=True)
+        .group_by(Import.id)
+        .order_by(Import.id.desc())
+    ).all()
+    return [
+        ImportRow(
+            id=r[0],
+            source_file=r[1],
+            account=r[2] or "",
+            transaction_count=r[3],
+            imported_at=r[4].isoformat(sep=" ", timespec="minutes") if r[4] else "",
+        )
+        for r in rows
+    ]
+
+
+def preview_import_delete(
+    session: Session, import_id: int
+) -> Optional[ImportDeletePreview]:
+    """Count what deleting ``import_id`` would do, without doing it.
+
+    Mirrors ``importer.delete_import``'s own counting: every transaction the import
+    created, plus every surviving transfer leg whose partner is among them (which would
+    have its ``transfer_group_id`` cleared). Returns ``None`` for an unknown id, the same
+    thing :func:`importer.delete_import` would raise :class:`importer.UnknownImport` for.
+    """
+    import_record = session.get(Import, import_id)
+    if import_record is None:
+        return None
+    doomed_ids = list(
+        session.scalars(select(Transaction.id).where(Transaction.import_id == import_id))
+    )
+    transfers_broken = 0
+    if doomed_ids:
+        group_ids = set(
+            session.scalars(
+                select(Transaction.transfer_group_id).where(
+                    Transaction.id.in_(doomed_ids),
+                    Transaction.transfer_group_id.is_not(None),
+                )
+            )
+        )
+        if group_ids:
+            transfers_broken = (
+                session.scalar(
+                    select(func.count(Transaction.id)).where(
+                        Transaction.transfer_group_id.in_(group_ids),
+                        Transaction.id.not_in(doomed_ids),
+                    )
+                )
+                or 0
+            )
+    return ImportDeletePreview(
+        import_id=import_id,
+        source_file=import_record.source_file,
+        transaction_count=len(doomed_ids),
+        transfers_broken=transfers_broken,
+    )
 
 
 # --------------------------------------------------------------------- resolvers

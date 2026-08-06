@@ -63,9 +63,12 @@ the bottom:
 
 | Command | Effect |
 | --- | --- |
-| `import` | Browse `data/to_import/`; `enter` imports the highlighted file |
+| `import` | Browse `data/to_import/`; `enter` imports the highlighted file, and past imports (with their id) are listed below it |
 | `import all` | Import every CSV in `data/to_import/` without browsing |
 | `import <path>` | Import a single CSV |
+| `unimport <id>` | Delete a past import and its transactions; asks for confirmation naming what it will destroy (see below) |
+| `format` | List the CSV layouts you have learned, and each one's amount polarity |
+| `format <name> invert on\|off` | Flip whether a positive amount means money leaving the account for that layout (see below) |
 | `rename <raw vendor> = <display name>` | Give one vendor a readable name (see below) |
 | `rule <pattern> = <display name>` | Rename every matching vendor, now and in future imports |
 | `categorize <vendor> = <category>` | Categorise that vendor's transactions by hand (see below) |
@@ -110,6 +113,16 @@ budget import ~/Downloads/statement.csv
 budget import --currency EUR ~/Downloads/statement_eur.csv
 # Exports that do not name their account (see "Importing data") need --account.
 budget import --account "Checking" ~/Downloads/checking.csv
+
+# List past imports (id, source file, transaction count), and undo one.
+budget imports
+budget unimport 7               # previews only: names what would be deleted
+budget unimport 7 --yes         # actually deletes it
+
+# See what a CSV layout is set to, and flip its amount polarity if it was
+# learned backwards (see "Importing data").
+budget format
+budget format invert current on
 
 # List transactions, most recent first (default limit: 50).
 budget list
@@ -416,14 +429,16 @@ layout the importer works out the mapping from the header and a sample of rows, 
 asks about anything it could not settle. This works the same way from either interface.
 
 **In the app**, `import` lists the files in `data/to_import/` with what stands in the way
-of each one:
+of each one, and — dimmed, below them — the imports already done, with the id an
+`unimport` needs:
 
 ```text
- File                                Rows  Status
+ File                                Rows  Status           ID
  statement-june.csv                   516  cards
  new-bank-export.csv                  387  needs setup
+ statement-may.csv                    498  imported          6
 
- 2 file(s), 1 ready   enter to import   escape to return to transactions
+ 2 file(s), 1 ready   enter to import   1 past   unimport <id>   escape returns
 ```
 
 Press `enter` on a file. A ready one imports straight away; one needing setup starts the
@@ -450,9 +465,39 @@ Saved layout 'current'. Future imports of this shape are automatic.
 ```
 
 Layouts are saved in the database, **not in the source tree**, so the repository never
-records which institutions you bank with. `budget format list` shows what has been
-learned, `budget format export` prints the definitions as JSON, and
+records which institutions you bank with. `budget format list` (or `format` in the app)
+shows what has been learned, `budget format export` prints the definitions as JSON, and
 `budget format remove <name>` forgets one.
+
+**Amount polarity.** A `Debit`/`Credit` pair always says which side is an outflow, but a
+single signed amount column does not — most exports follow this app's convention
+(negative = money out), but some card providers write a purchase as a *positive* number
+instead. The first time you teach the app a single-signed-column layout it asks which
+convention that file uses; if you answered wrong (every charge on that account reads
+backwards), fix the layout rather than every transaction:
+
+```bash
+budget format invert current on     # or: format current invert on, in the app
+```
+
+This only affects **future** imports of that layout — it does not touch transactions
+already imported. To fix the ones that already came in backwards, undo the bad import and
+bring it back in under the corrected setting:
+
+```bash
+budget imports                      # find the id of the wrong-polarity import
+budget unimport 6 --yes             # delete it and its transactions
+budget format invert current on     # fix the layout
+budget import ~/Downloads/statement-may.csv   # re-import; nothing is mistaken as a duplicate
+```
+
+`unimport` (in the app or on the command line) deletes an import and the transactions it
+created; the account, vendor, and category rows it touched are left in place, since a
+rule or another transaction may still depend on them. If the import paired up a transfer
+with a transaction from another import, that surviving leg is un-paired rather than left
+looking like a transfer with no partner. It is destructive, so the app always asks first
+— naming the source file, the transaction count, and any transfer pairings that would
+break — and the CLI refuses to act without `--yes`, printing the same preview instead.
 
 What it works out for itself: which columns hold the dates, description, category, and
 account; whether the amount is one signed column or a `Debit`/`Credit` pair; the date

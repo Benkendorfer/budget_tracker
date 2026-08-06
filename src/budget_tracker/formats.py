@@ -39,6 +39,7 @@ _SCALAR_FIELDS = (
     "amount_column",
     "account_column",
     "account_prefix",
+    "invert_amount",
 )
 
 
@@ -70,6 +71,10 @@ class FormatSpec:
     amount_column: Optional[str] = None
     account_column: Optional[str] = None
     account_prefix: str = ""
+    # True when a positive value in this layout means money leaving the account (the
+    # opposite of our convention). Only meaningful for amount_style == SIGNED; a
+    # debit/credit pair already says which side is an outflow.
+    invert_amount: bool = False
 
     @property
     def needs_account(self) -> bool:
@@ -163,6 +168,19 @@ def set_account_prefix(session: Session, name: str, prefix: str) -> FormatSpec:
     if prefix and not prefix.endswith(" "):
         prefix += " "
     return save_format(session, FormatSpec(**{**to_dict(spec), "account_prefix": prefix}))
+
+
+def set_invert_amount(session: Session, name: str, invert: bool) -> FormatSpec:
+    """Flip a stored format's amount polarity. No commit.
+
+    For when a format was learned the wrong way round: every provider using this layout
+    keeps the same convention, so the fix belongs on the format, not on individual rows.
+    Existing transactions already imported are unaffected; only future imports change.
+    """
+    spec = get_format(session, name)
+    return save_format(
+        session, FormatSpec(**{**to_dict(spec), "invert_amount": bool(invert)})
+    )
 
 
 def remove_format(session: Session, name: str) -> bool:
@@ -384,7 +402,31 @@ def remaining_questions(values, rows, fieldnames):
     date_question = _date_question(values, rows)
     if date_question is not None:
         questions.append(date_question)
+    invert_question = _invert_amount_question(values, rows)
+    if invert_question is not None:
+        questions.append(invert_question)
     return questions
+
+
+def _invert_amount_question(values, rows) -> Optional[Question]:
+    """A debit/credit pair already says which side is an outflow; a single signed
+    column does not, and providers disagree on which sign means money leaving the
+    account. Ask, with a real sample so the answer is obvious at a glance.
+    """
+    if values.get("amount_style") != SIGNED or "invert_amount" in values:
+        return None
+    column = values.get("amount_column")
+    samples = _samples(rows, column) if column else []
+    example = samples[0] if samples else "617.66"
+    return Question(
+        field="invert_amount",
+        prompt=(
+            f"In this file a purchase appears as {example}. Does a positive amount "
+            "mean money leaving the account?"
+        ),
+        choices=("yes", "no"),
+        default="no",
+    )
 
 
 def infer(name, fieldnames, rows):
@@ -436,6 +478,8 @@ def apply_answers(values, answers, fieldnames, rows=()):
             values["amount_column"] = answer
             values["amount_style"] = SIGNED
             values["debit_column"] = values["credit_column"] = None
+        elif field == "invert_amount":
+            values["invert_amount"] = answer.lower() in ("yes", "y", "true", "1")
         else:
             values[field] = answer
     # The dedup key depends on the mapped columns, so it is only final once they are.

@@ -250,6 +250,9 @@ def test_walkthrough_defines_the_layout_then_imports(tmp_path, monkeypatch):
                 "amount_column": "Turnover",
                 "posted_date_column": "1",  # by number, as shown in the panel
                 "description_column": "Counterparty",
+                # A single signed amount column, so the format also asks which way its
+                # sign points; -200.00 in the sample already matches our convention.
+                "invert_amount": "no",
                 "__account": "Euro Account",
             }
             for _ in range(8):
@@ -267,6 +270,7 @@ def test_walkthrough_defines_the_layout_then_imports(tmp_path, monkeypatch):
         "amount_column",
         "posted_date_column",
         "description_column",
+        "invert_amount",
         "__account",
     ]
     assert after == before + 1  # the single row imported
@@ -1983,3 +1987,231 @@ def test_category_command_reports_a_cycle_without_crashing(tmp_path, monkeypatch
     assert any("cycle" in m for m in messages)
     assert panel == "txns"  # the app is still up, on the panel it started on
     assert food_depth == 0  # the rejected move left Food where it was
+
+
+# ------------------------------------------------------------------------- unimport
+
+
+def test_imports_panel_lists_past_imports_with_their_id(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)  # already imported one file: in.csv
+    _inbox(tmp_path, monkeypatch)  # empty inbox, so only history rows show
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._run_command("import")
+            await pilot.pause()
+            return _rows_of(app, "imports"), app._imports
+
+    rows, history = asyncio.run(run())
+    assert len(history) == 1 and history[0].source_file == "in.csv"
+    # The empty inbox means the candidate section is empty; the history row (dimmed,
+    # not actionable by enter) still carries the id an `unimport` needs.
+    assert rows[0] == ["in.csv", "3", "imported", str(history[0].id)]
+
+
+def test_unimport_asks_for_confirmation_naming_what_it_will_destroy(tmp_path, monkeypatch):
+    session_factory = _setup(tmp_path, monkeypatch)
+    with session_factory() as session:
+        import_id = queries.get_imports(session)[0].id
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._run_command(f"unimport {import_id}")
+            await pilot.pause()
+            prompt = app.query_one("#prompt", Static)
+            return str(prompt.content), prompt.display, app._pending_unimport is not None
+
+    text, visible, pending = asyncio.run(run())
+    assert visible is True and pending is True
+    assert f"#{import_id}" in text
+    assert "in.csv" in text
+    assert "3 transaction(s)" in text
+
+
+def test_unimport_confirmed_deletes_the_transactions(tmp_path, monkeypatch):
+    session_factory = _setup(tmp_path, monkeypatch)
+    with session_factory() as session:
+        import_id = queries.get_imports(session)[0].id
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            before = len(app._txns)
+            app._run_command(f"unimport {import_id}")
+            await pilot.pause()
+            app.query_one("#command", Input).value = "yes"
+            await pilot.press("enter")
+            await pilot.pause()
+            messages = [n.message for n in app._notifications]
+            return before, len(app._txns), messages, app._pending_unimport
+
+    before, after, messages, pending = asyncio.run(run())
+    assert before == 3 and after == 0
+    assert pending is None
+    assert any(
+        f"Deleted import #{import_id}" in m and "3 transaction(s) removed" in m
+        for m in messages
+    )
+    with session_factory() as session:
+        assert queries.get_imports(session) == []
+
+
+def test_unimport_cancelled_by_any_other_answer(tmp_path, monkeypatch):
+    session_factory = _setup(tmp_path, monkeypatch)
+    with session_factory() as session:
+        import_id = queries.get_imports(session)[0].id
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            before = len(app._txns)
+            app._run_command(f"unimport {import_id}")
+            await pilot.pause()
+            app.query_one("#command", Input).value = "no thanks"
+            await pilot.press("enter")
+            await pilot.pause()
+            messages = [n.message for n in app._notifications]
+            return before, len(app._txns), messages, app.query_one("#prompt", Static).display
+
+    before, after, messages, prompt_visible = asyncio.run(run())
+    assert before == after == 3  # nothing was touched
+    assert any("Unimport cancelled" in m for m in messages)
+    assert prompt_visible is False
+
+
+def test_unimport_escape_cancels(tmp_path, monkeypatch):
+    session_factory = _setup(tmp_path, monkeypatch)
+    with session_factory() as session:
+        import_id = queries.get_imports(session)[0].id
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._run_command(f"unimport {import_id}")
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause()
+            messages = [n.message for n in app._notifications]
+            return len(app._txns), messages, app._pending_unimport
+
+    count, messages, pending = asyncio.run(run())
+    assert count == 3  # nothing deleted
+    assert any("Unimport cancelled" in m for m in messages)
+    assert pending is None
+
+
+def test_unimport_reports_an_unknown_id(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._run_command("unimport 999")
+            await pilot.pause()
+            return [n.message for n in app._notifications], app._pending_unimport
+
+    messages, pending = asyncio.run(run())
+    assert any("No import with id 999" in m for m in messages)
+    assert pending is None
+
+
+XFER_OUT_CSV = """Transaction Date,Posted Date,Card No.,Description,Amount
+2025-07-01,2025-07-02,CHK,TRANSFER TO CARD,-100.00
+"""
+XFER_IN_CSV = """Transaction Date,Posted Date,Card No.,Description,Amount
+2025-07-01,2025-07-02,CRD,PAYMENT RECEIVED,100.00
+"""
+
+
+def _setup_transfer(tmp_path, monkeypatch):
+    """A fresh DB holding one already-paired transfer, split across two imports."""
+    db_path = tmp_path / "xfer.db"
+    engine = get_engine(db_path)
+    init_db(engine)
+    session_factory = get_sessionmaker(engine)
+    out_path = tmp_path / "out.csv"
+    out_path.write_text(XFER_OUT_CSV, encoding="utf-8")
+    in_path = tmp_path / "in_xfer.csv"
+    in_path.write_text(XFER_IN_CSV, encoding="utf-8")
+    with session_factory() as session:
+        learn_format(session, out_path, name="card")
+        import_csv(session, out_path)
+        import_csv(session, in_path)  # same signature, auto-detected; pairs as a transfer
+    monkeypatch.setenv("BUDGET_DB", str(db_path))
+    return session_factory
+
+
+def test_unimport_reports_transfer_pairings_it_would_break(tmp_path, monkeypatch):
+    session_factory = _setup_transfer(tmp_path, monkeypatch)
+    with session_factory() as session:
+        out_import_id = next(
+            row.id for row in queries.get_imports(session) if row.source_file == "out.csv"
+        )
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._run_command(f"unimport {out_import_id}")
+            await pilot.pause()
+            prompt_text = str(app.query_one("#prompt", Static).content)
+
+            app.query_one("#command", Input).value = "yes"
+            await pilot.press("enter")
+            await pilot.pause()
+            messages = [n.message for n in app._notifications]
+            return prompt_text, messages, app._txns
+
+    prompt_text, messages, txns = asyncio.run(run())
+    assert "breaking 1 transfer pairing(s)" in prompt_text
+    assert any("1 transfer pairing(s) broken" in m for m in messages)
+    assert len(txns) == 1
+    assert txns[0].is_transfer is False  # its partner is gone, so it is ordinary again
+
+
+# --------------------------------------------------------------------------- format
+
+
+def test_format_command_lists_layouts_and_their_polarity(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._run_command("format")
+            await pilot.pause()
+            return [n.message for n in app._notifications]
+
+    messages = asyncio.run(run())
+    assert any("test_layout" in m and "debit_credit" in m for m in messages)
+
+
+def test_format_invert_flips_polarity(tmp_path, monkeypatch):
+    session_factory = _setup(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._run_command("format test_layout invert on")
+            await pilot.pause()
+            return [n.message for n in app._notifications]
+
+    messages = asyncio.run(run())
+    assert any("test_layout" in m and "invert on" in m for m in messages)
+    with session_factory() as session:
+        assert formats.get_format(session, "test_layout").invert_amount is True
+
+
+def test_format_invert_reports_an_unknown_format(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._run_command("format nope invert on")
+            await pilot.pause()
+            return [n.message for n in app._notifications]
+
+    messages = asyncio.run(run())
+    assert any("Unknown format" in m and "nope" in m for m in messages)
