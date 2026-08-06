@@ -7,3 +7,18 @@
 3. Avoid premature optimization.
 4. Do not introduce native C++ extensions unless explicitly requested.
 5. Avoid large refactors. A small amount of tech debt is ok if it keeps individual changes small. Prefer to keep small amounts of tech debt and save them for independent refactoring steps later.
+
+## Running work in parallel
+
+Split parallel agents by **dependency, not by file**. Two agents may edit the same file
+and be merged afterwards; what cannot be parallelised is work whose tests will not run
+until another agent's module exists. An agent that cannot verify itself hands back
+plausible untested code, which is worse than waiting for it.
+
+Two consequences worth remembering:
+
+- Merging cleanly is not the same as working. Independent changes can each be correct,
+  merge without a conflict, and still not fit together — so the merged state has been
+  tested by nobody and needs its own run.
+- A git worktree contains only **committed** files, so uncommitted work is invisible to
+  agents running in one.

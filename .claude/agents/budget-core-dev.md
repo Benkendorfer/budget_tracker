@@ -90,8 +90,25 @@ non-obvious choice. Do not over-comment.
 
 ## Before you report done
 
-Run the full suite: `.venv/bin/python -m pytest -q` from the repo root. Every
-pre-existing test must still pass alongside yours.
+Run the full suite from the repo root:
+
+```bash
+PYTHONPATH="$PWD/src" .venv/bin/python -m pytest -q
+```
+
+Every pre-existing test must still pass alongside yours.
+
+The `PYTHONPATH` is not decoration. The package is installed editable via a `.pth` file
+holding an **absolute** path to the original checkout. A git worktree has no `.venv` of
+its own — it is gitignored, so it is never checked out — so the interpreter you reach for
+there is the main checkout's, and its `.pth` will import the *original* source. Your tests
+then pass without ever touching your changes. Setting `PYTHONPATH` puts your checkout
+first. It is harmless in the main checkout and load-bearing anywhere else, so always use
+it. If you are ever unsure which source you tested, check it:
+
+```bash
+PYTHONPATH="$PWD/src" .venv/bin/python -c "import budget_tracker,os; print(os.path.dirname(budget_tracker.__file__))"
+```
 
 Report: the exact public API you settled on (signatures), anything you deviated from in
 your brief and why, any tech debt you deliberately left, anything surprising you found in

@@ -103,7 +103,19 @@ do not restructure it. The house style is that every TUI feature has a CLI twin.
 
 ## Before you report done
 
-Run the full suite: `.venv/bin/python -m pytest -q` from the repo root.
+Run the full suite from the repo root:
+
+```bash
+PYTHONPATH="$PWD/src" .venv/bin/python -m pytest -q
+```
+
+The `PYTHONPATH` is not decoration. The package is installed editable via a `.pth` file
+holding an **absolute** path to the original checkout. A git worktree has no `.venv` of
+its own — it is gitignored, so it is never checked out — so the interpreter you reach for
+there is the main checkout's, and its `.pth` will import the *original* source. Your tests
+then pass without ever touching your changes. Setting `PYTHONPATH` puts your checkout
+first. It is harmless in the main checkout and load-bearing anywhere else, so always use
+it.
 
 Report: every command and key you added, the final column widths **with the rendered
 evidence they fit**, anything you deviated from in your brief and why, and the final
