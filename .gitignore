@@ -1,6 +1,11 @@
 .vscode/
 data/
 
+# Agent worktrees are checked out inside the repo, at .claude/worktrees/agent-<id>.
+# They are whole nested copies of the tree, so without this a `git add -A` while one
+# is live would commit a second checkout into the repo.
+.claude/worktrees/
+
 # Python
 .venv/
 __pycache__/

@@ -11,6 +11,8 @@
     - [Searching transactions](#searching-transactions)
     - [Renaming and grouping vendors](#renaming-and-grouping-vendors)
     - [Vendor rename rules](#vendor-rename-rules)
+    - [Categorising transactions](#categorising-transactions)
+    - [Statistics](#statistics)
     - [Transfers between your own accounts](#transfers-between-your-own-accounts)
     - [Importing data](#importing-data)
     - [Where the data lives](#where-the-data-lives)
@@ -65,24 +67,34 @@ the bottom:
 | `import <path>` | Import a single CSV |
 | `rename <raw vendor> = <display name>` | Give one vendor a readable name (see below) |
 | `rule <pattern> = <display name>` | Rename every matching vendor, now and in future imports |
+| `categorize <vendor> = <category>` | Categorise that vendor's transactions by hand (see below) |
+| `categorize <vendor> =` | Undo a manual category |
+| `categorize rule <pattern> = <category>` | Categorise every matching vendor, now and in future imports |
+| `categorize rules` | Open the rules panel (`categorize` on its own does the same) |
 | `filter <text>` | Search description, vendor name, and raw vendor name |
 | `filter <field>:<text>` | Search one of `description`, `vendor`, `raw` |
 | `filter` | Clear the text filter |
+| `stats` | Pick a time window, then see spending per category (see below) |
+| `stats <window>` | Skip the picker: `stats 6m`, `stats 1 year`, `stats 2025-01-01..2025-06-30` |
 | `transfers` | Pair up movements between your own accounts (`transfers reset` undoes it) |
-| `rules` | Open the rules panel (`rule` on its own does the same); `escape` returns |
+| `rules` | Open the rules panel — both kinds of rule (`rule` on its own does the same); `escape` returns |
 | `all` | Clear all filters |
 | `refresh` | Reload from the database |
 | `help` | Show this list in-app |
 | `quit` | Exit |
 
 Keyboard shortcuts: `ctrl+l` clears filters, `ctrl+r` refreshes, `escape` returns to the
-transactions from the rules panel, and `ctrl+c` quits.
+transactions from the rules panel, and `ctrl+c` quits. On a statistics row, the right
+arrow drills into that category's transactions (same as `enter`); the left arrow goes
+back to the breakdown it came from, once you have drilled into one — see "Statistics"
+below. The footer shows both only while they do something.
 
-`ctrl+n` prefills a `rename` command for whichever vendor you are pointing at. With the
-transaction table focused, that is the vendor of the transaction under the cursor —
-which works even for vendors you have already grouped, because each row remembers the
-raw merchant string. Otherwise it falls back to the vendor sidebar: the active vendor
-filter if there is one, else the highlighted row.
+`ctrl+n` prefills a `rename` command for whichever vendor you are pointing at, and
+`ctrl+t` prefills a `categorize` command for the same vendor. With the transaction table
+focused, that is the vendor of the transaction under the cursor — which works even for
+vendors you have already grouped, because each row remembers the raw merchant string.
+Otherwise both fall back to the vendor sidebar: the active vendor filter if there is one,
+else the highlighted row.
 
 ### The command line
 
@@ -105,6 +117,16 @@ budget list --search Kindle --search-in vendor
 
 # Give a raw vendor string a readable display name.
 budget rename "COFFEE SHOP A" "Coffee"
+
+# Categorise a vendor by hand, or undo it.
+budget categorize "COFFEE SHOP A" "Dining"
+budget categorize "COFFEE SHOP A" --clear
+
+# Categorise by pattern instead, now and on every future import.
+budget category-rule add "*COFFEE*" "Dining"
+budget category-rule list
+budget category-rule remove "*COFFEE*"
+budget category-rule apply
 
 # Pair up money moved between your own accounts.
 budget transfers --days 5
@@ -169,18 +191,24 @@ budget rule apply                          # re-run every rule
 ```
 
 In the app, the equivalent command is `rule Kindle Svcs* = Kindle`. Typing `rules` (or a
-bare `rule`) replaces the transaction table with a rules panel listing every pattern,
-the name it maps to, and how many raw vendors it currently covers — which is the quickest
-way to see whether a pattern is doing anything:
+bare `rule`) replaces the transaction table with a rules panel listing every pattern, the
+value it maps to, and how much it currently covers — which is the quickest way to see
+whether a pattern is doing anything. Category rules (below) share the panel, so the first
+column says which kind each rule is:
 
 ```text
- Pattern                       Display name        Vendors
- Kindle Svcs*                  Kindle                    5
- AMAZON*                       Amazon                   12
- *CAVA*                        CAVA                      3
+ Kind       Pattern                     Value               Count
+ vendor     Kindle Svcs*                Kindle                    5
+ vendor     AMAZON*                     Amazon                   12
+ category   *CAVA*                      Dining                   34
+ category   RENT PAYMENT*               Housing                  12
 
- 3 rules   naming 20 vendors   escape to return to transactions
+ 4 rules   17 vendors named   46 txns categorised   escape to return to transactions
 ```
+
+`Count` means raw vendors for a vendor rule and transactions for a category rule — in
+both cases, what that rule currently owns. A row a category rule matched but could not
+take, because you had categorised it by hand, is not counted.
 
 Press `escape` to go back to the transactions. Adding a rule while the panel is open
 updates it in place. Removing a rule is CLI-only for now.
@@ -205,6 +233,87 @@ name:
 Rules are stored, not baked in: they are re-evaluated rather than rewriting transactions,
 and `raw_description` always preserves the bank's original text.
 
+### Categorising transactions
+
+Imports keep whatever category the bank supplied, which is often wrong and often blank.
+There are two ways to fix that, and they behave differently:
+
+```bash
+budget categorize "COFFEE SHOP A" "Dining"   # by hand, this vendor's transactions
+budget category-rule add "*COFFEE*" "Dining" # by pattern, now and in future imports
+```
+
+In the app the same two are `categorize COFFEE SHOP A = Dining` and
+`categorize rule *COFFEE* = Dining`. `ctrl+t` prefills the first for whichever vendor you
+are pointing at, so categorising a row you are looking at is one keystroke and a word.
+Leaving the right-hand side blank undoes a manual category — `categorize COFFEE SHOP A =`,
+or `budget categorize "COFFEE SHOP A" --clear` — the same way a bare `filter` clears the
+filter.
+
+The two coexist by the same rules vendor renames do, and each transaction records which
+set its category:
+
+- **A manual category always wins.** Rules skip transactions you categorised by hand, and
+  so does the next import. Clearing one hands it back to the rules.
+- **Rules own the transactions they categorise.** Re-pointing a rule updates them, and
+  removing a rule clears them again. A rule overwrites the bank's own category, but never
+  touches a detected transfer, so both legs of one keep reading as a transfer.
+- **Rules re-apply at the end of every import**, so new transactions arrive already
+  categorised. `budget category-rule apply` is only needed if the database is changed
+  outside the app.
+
+A rule pattern is a case-insensitive glob matched against **the raw merchant string or
+the display name**, so `*CAVA*` keeps working after you rename the vendor, and a rule
+written against a name you chose catches every raw vendor grouped under it. When several
+rules match, the oldest one wins. A manual `categorize` accepts either name too: give it a
+display name and the whole override group is categorised.
+
+The important difference between the two is what happens next month. **A manual category
+applies to the transactions that exist right now.** Rows imported later come in
+uncategorised — the vendor is not remembered, only its transactions were changed — so use
+a rule for anything recurring, and keep manual categories for one-offs and for the rows
+where a rule gets it wrong.
+
+### Statistics
+
+`stats` opens a list of time windows — 1 month, 3 months, 6 months, 1 year, 2 years, or a
+custom range — and shows what you spent per category over the one you pick, with an
+average per month beside each total. `stats 6m` or `stats 2025-01-01..2025-06-30` skips
+the list. `escape` returns to the transactions.
+
+Windows end **today**, not at your most recent transaction, so a window that looks thin is
+telling you the imports are stale rather than quietly hiding the gap. The status line
+always spells out the dates it resolved to.
+
+Press `enter`, or the right arrow, on a category row to see the transactions behind it.
+The table comes back filtered to that category **and** to the window you were looking at,
+so the rows add up to the number you just clicked rather than to everything that category
+ever held. The status line says so:
+
+```text
+ 85 txns [filtered: category, 2026-05-06→08-06]   net -1,234.56   out -1,234.56   in 0.00
+```
+
+The left arrow goes back to the breakdown you drilled in from, restoring whatever
+category or date filter you had before — not blanking it — and puts the cursor back on
+the row you drilled into. It only does this right after a drill-down: change the filters
+some other way, or leave the panel, and the left arrow goes back to being an ordinary key
+again. The footer shows `→ Drill down` while a stats row is highlighted and `← Back to
+stats` once you have drilled in; neither status line has room left to say so, having both
+already measured out to their 92-column budget with a real year of five-figure totals.
+
+The `Uncategorised` row drills in like any other, which is the quickest way to find what
+still needs a rule. `ctrl+l`, or `all`, clears the window again along with the rest of the
+filters — a drill-down is not sticky.
+
+The panel is scoped by whatever filters are already active: click an account in the
+sidebar, or run `filter`, and the statistics narrow to match. Transfers are left out of
+the figures, and the status line reports how many (`⇄ 43`) so the money is never missing
+without explanation.
+
+Averages are per *average* month (30.44 days) rather than per calendar month, so a window
+starting mid-month is not penalised by partial months at either end.
+
 ### Transfers between your own accounts
 
 Paying your card from your checking account produces two transactions: money leaving one
@@ -227,7 +336,7 @@ Detected transfers are **greyed out and flagged with `⇄`** in both the app and
 
 ```text
 2026-07-20  POS-: MTA*NYCT PAYGO       MTA                  Auto & Transport     -3.00
-2026-07-16  ⇄ CAPITAL ONE - MOBILE     Capital One Payment  Transfer         -4,673.24
+2026-07-16  ⇄ CARD PAYMENT - MOBILE    Card Payment         Transfer         -4,673.24
 ```
 
 Without the marker a transfer looks like ordinary spending that is mysteriously missing
@@ -343,8 +452,8 @@ BUDGET_DB=/tmp/scratch.db budget import ~/Downloads/statement.csv
 pytest
 ```
 
-The suite covers CSV importing, vendor overrides, and the TUI's rename shortcut. It
-builds a temporary database per test, so it never touches `data/budget.db`.
+The suite covers CSV importing, vendor overrides, categorisation, and the TUI's shortcuts
+and panels. It builds a temporary database per test, so it never touches `data/budget.db`.
 
 ## Technical details
 
