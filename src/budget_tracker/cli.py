@@ -214,6 +214,85 @@ def _cmd_rule(args: argparse.Namespace) -> int:
         return 0
 
 
+def _cmd_categorize(args: argparse.Namespace) -> int:
+    from . import categories
+
+    engine = get_engine()
+    init_db(engine)
+    session_factory = get_sessionmaker(engine)
+    with session_factory() as session:
+        # Both calls return 0 for an unknown vendor and for one with nothing to change,
+        # so the vendor is resolved up front to keep those answers apart.
+        if queries.resolve_vendor_filter(session, args.vendor) is None:
+            print(f"No vendor named {args.vendor!r}.")
+            return 1
+        if args.clear:
+            changed = categories.clear_category(session, args.vendor)
+            session.commit()
+            print(f"Cleared the category on {changed} transaction(s) of {args.vendor!r}.")
+            return 0
+        if not args.category:
+            print("A category is required, unless you pass --clear.")
+            return 1
+        changed = categories.set_category(session, args.vendor, args.category)
+        session.commit()
+        print(
+            f"Categorised {changed} transaction(s) of {args.vendor!r} "
+            f"as {args.category!r}."
+        )
+        return 0
+
+
+def _cmd_category_rule(args: argparse.Namespace) -> int:
+    from . import categories
+
+    engine = get_engine()
+    init_db(engine)
+    session_factory = get_sessionmaker(engine)
+
+    # argparse's subparser action defaults the dest to None, which wins over the
+    # parser-level default, so a bare `budget category-rule` arrives with nothing set.
+    command = args.category_rule_command or "list"
+
+    with session_factory() as session:
+        if command == "list":
+            rules = categories.list_rules(session)
+            if not rules:
+                print("No category rules defined.")
+                return 0
+            width = max(len(r.pattern) for r in rules)
+            for rule in rules:
+                print(f"  {rule.pattern:<{width}}  ->  {rule.category.value}")
+            return 0
+
+        if command == "add":
+            categories.add_rule(session, args.pattern, args.category)
+            changed = categories.apply_category_rules(session)
+            session.commit()
+            print(
+                f"Rule {args.pattern!r} -> {args.category!r}; "
+                f"{changed} transactions updated."
+            )
+            return 0
+
+        if command == "remove":
+            if not categories.remove_rule(session, args.pattern):
+                print(f"No category rule with pattern {args.pattern!r}.")
+                return 1
+            changed = categories.apply_category_rules(session)
+            session.commit()
+            print(f"Removed {args.pattern!r}; {changed} transactions updated.")
+            return 0
+
+        changed = categories.apply_category_rules(session)  # "apply"
+        session.commit()
+        print(
+            f"Applied {len(categories.list_rules(session))} rules; "
+            f"{changed} transactions updated."
+        )
+        return 0
+
+
 def _ask(question: formats.Question) -> str:
     """Put one unresolved mapping question to the user."""
     print()
@@ -514,6 +593,52 @@ def build_parser() -> argparse.ArgumentParser:
         "remove", help="Delete a rule and revert the vendors it named."
     )
     rule_remove.add_argument("pattern", help="The exact pattern to remove.")
+
+    categorize_parser = subparsers.add_parser(
+        "categorize",
+        help="Categorise every transaction of a vendor by hand (outranks rules).",
+    )
+    categorize_parser.add_argument(
+        "vendor", help="Raw vendor name, or an override display name."
+    )
+    categorize_parser.add_argument(
+        "category", nargs="?", help="The category to apply. Omit with --clear."
+    )
+    categorize_parser.add_argument(
+        "--clear",
+        action="store_true",
+        help="Undo a manual category instead of setting one.",
+    )
+    categorize_parser.set_defaults(func=_cmd_categorize)
+
+    category_rule_parser = subparsers.add_parser(
+        "category-rule", help="Manage pattern-based categorisation rules."
+    )
+    category_rule_parser.set_defaults(
+        func=_cmd_category_rule, category_rule_command="list"
+    )
+    category_rule_subparsers = category_rule_parser.add_subparsers(
+        dest="category_rule_command"
+    )
+
+    category_rule_add = category_rule_subparsers.add_parser(
+        "add", help="Add or re-target a rule, then apply it."
+    )
+    category_rule_add.add_argument(
+        "pattern",
+        help="Glob matched against the raw vendor name or its display name.",
+    )
+    category_rule_add.add_argument("category", help="The category to apply.")
+
+    category_rule_remove = category_rule_subparsers.add_parser(
+        "remove", help="Delete a rule and clear the transactions it categorised."
+    )
+    category_rule_remove.add_argument("pattern", help="The exact pattern to remove.")
+
+    category_rule_subparsers.add_parser("list", help="Show every rule (default).")
+    category_rule_subparsers.add_parser(
+        "apply", help="Re-run all rules, e.g. after importing outside the app."
+    )
 
     account_parser = subparsers.add_parser(
         "account", help="List, rename, or merge accounts."

@@ -13,6 +13,7 @@ from typing import List, Optional
 
 from rich.text import Text
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.widgets import (
     DataTable,
@@ -25,7 +26,7 @@ from textual.widgets import (
     Static,
 )
 
-from . import accounts, formats, queries, transfers, vendors
+from . import accounts, categories, formats, queries, stats, transfers, vendors
 from .db import get_engine, get_sessionmaker, init_db
 from .importer import (
     ImportCandidate,
@@ -69,6 +70,10 @@ def _truncate(text: str, width: int) -> str:
 TRANSFER_MARK = "⇄"
 TRANSFER_STYLE = "dim italic"
 
+# The last row of the period picker, and the format its answer has to take.
+CUSTOM_PERIOD = "Custom…"
+RANGE_EXAMPLE = "2025-01-01..2025-06-30"
+
 
 def _amount_cell(minor: int, is_transfer: bool = False) -> Text:
     if is_transfer:
@@ -81,24 +86,47 @@ def _txn_cell(text: str, width: int, is_transfer: bool) -> Text:
     return Text(_truncate(text, width), style=TRANSFER_STYLE if is_transfer else "")
 
 
+def _range_label(date_range: queries.DateRange) -> str:
+    """``2025-07-01→12-31``, dropping a repeated year.
+
+    The status line has 90 columns for a count, a scope list, and three money figures, so
+    five columns of year that the start date has already given are not worth spending.
+    """
+    start, end = date_range
+    tail = end.isoformat()[5:] if end.year == start.year else end.isoformat()
+    return f"{start}→{tail}"
+
+
 class BudgetApp(App):
     CSS = """
     #sidebar { width: 36; }
     #accounts, #categories { border: round $accent; height: 1fr; }
-    #txns, #rules, #imports, #setup { border: round $accent; height: 1fr; }
+    #txns, #rules, #imports, #setup, #periods { border: round $accent; height: 1fr; }
+    #stats { height: 1fr; }
+    #stats_table { border: round $accent; height: 1fr; }
     #prompt { height: auto; padding: 1 1 0 1; color: $accent; }
     #status { height: 1; padding: 0 1; color: $text-muted; background: $panel; }
     #command { border: tall $accent; }
     .heading { padding: 0 1; text-style: bold; color: $accent; }
     """
 
-    PANELS = ("txns", "rules", "imports", "setup")
+    PANELS = ("txns", "rules", "imports", "setup", "periods", "stats")
+    # Panels whose widget is not itself focusable name the child that takes focus.
+    PANEL_FOCUS = {"stats": "#stats_table"}
 
     BINDINGS = [
         ("ctrl+r", "refresh", "Refresh"),
         ("ctrl+l", "clear_filters", "Clear filters"),
         ("ctrl+n", "rename_vendor", "Rename vendor"),
+        ("ctrl+t", "categorize_vendor", "Categorise vendor"),
         ("escape", "show_transactions", "Back to transactions"),
+        # DataTable binds left/right itself (cursor movement between cells), which would
+        # otherwise eat these before an ordinary App binding ever saw them. priority=True
+        # checks the App first; check_action() below opts out — returning False, not just
+        # doing nothing — everywhere but the one row cursor_type="row" already leaves
+        # left/right without a visible job of their own, so falling through there is safe.
+        Binding("right", "drill_down", "Drill down", show=True, priority=True),
+        Binding("left", "drill_up", "Back to stats", show=True, priority=True),
         ("ctrl+c", "quit", "Quit"),
     ]
 
@@ -111,16 +139,36 @@ class BudgetApp(App):
         self.vendor_filter: Optional[queries.VendorFilter] = None
         self.category_filter: Optional[int] = None
         self.text_filter: Optional[queries.TextFilter] = None
+        # Only the statistics drill-down sets this: the transactions it opens have to be
+        # the window's, not all of history, or they will not add up to the row clicked.
+        self.date_filter: Optional[queries.DateRange] = None
         self._accounts: List[queries.AccountRow] = []
         self._vendors: List[queries.VendorRow] = []
         self._categories: List[queries.CategoryRow] = []
         # Parallel to the rows in #txns, so a cursor index maps back to a transaction.
         self._txns: List[queries.TxnRow] = []
         self._rules: List[queries.RuleRow] = []
+        self._category_rules: List[queries.CategoryRuleRow] = []
         self._candidates: List[ImportCandidate] = []
         self._panel = "txns"
         self._setup: Optional[_Setup] = None
         self._totals = queries.Totals(count=0, net_minor=0, outflow_minor=0, inflow_minor=0)
+        # The statistics window survives panel switches, so reload() can re-scope it.
+        self.window: Optional[stats.Window] = None
+        self._report: Optional[stats.Report] = None
+        self._range_pending = False  # awaiting a typed date range for the picker
+        self._prompt_panel: Optional[str] = None  # which panel the #prompt belongs to
+        # True only while the transactions panel is showing exactly what a statistics
+        # drill-down put there — the left arrow's "back" is only meaningful then.
+        # Anything that changes the view out from under it (a new filter, ctrl+l,
+        # escape, opening another panel) has to clear it, or a stale flag could send a
+        # later, unrelated left-arrow press somewhere the user did not ask for.
+        self._drilled_from_stats = False
+        # What the drill-down overwrote, so going back restores it rather than
+        # unconditionally blanking a filter the user had set on purpose.
+        self._pre_drill_category_filter: Optional[int] = None
+        self._pre_drill_date_filter: Optional[queries.DateRange] = None
+        self._drill_source_row: Optional[int] = None  # stats_table row to land back on
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -138,12 +186,35 @@ class BudgetApp(App):
                 yield DataTable(id="imports")
                 yield Static("", id="prompt")
                 yield DataTable(id="setup")
+                yield DataTable(id="periods")
+                with Vertical(id="stats"):
+                    yield DataTable(id="stats_table")
+                    # Seam for the charts to come: a bar chart of spending per bucket and
+                    # a category pie go here, under the table, fed by
+                    # stats.spending_series() and CategoryStat.share.
                 yield Static("", id="status")
         yield Input(
-            placeholder="command: import | filter | rules | all | refresh | help | quit",
+            placeholder=(
+                "command: import | filter | categorize | stats | rules | all | "
+                "refresh | help | quit"
+            ),
             id="command",
         )
         yield Footer()
+
+    def check_action(self, action: str, parameters: tuple) -> Optional[bool]:
+        """Gate the priority left/right bindings so they only act where they mean something.
+
+        Returning ``False`` (not just a no-op action body) matters: it is what makes
+        ``_check_bindings`` fall through to the focused ``DataTable``'s own binding
+        instead of swallowing the key everywhere, and it is also what hides the footer
+        hint outside the panel it applies to.
+        """
+        if action == "drill_down":
+            return self._panel == "stats"
+        if action == "drill_up":
+            return self._drilled_from_stats
+        return True
 
     def on_mount(self) -> None:
         self.title = "Budget Tracker"
@@ -160,11 +231,14 @@ class BudgetApp(App):
         rules = self.query_one("#rules", DataTable)
         rules.cursor_type = "row"
         rules.zebra_stripes = True
-        # Widths are chosen so all three columns fit beside the 36-wide sidebar without
-        # the count — the point of the panel — scrolling off the right edge.
-        rules.add_column("Pattern", width=28)
-        rules.add_column("Display name", width=18)
-        rules.add_column("Vendors", width=7)
+        # Vendor and category rules share the panel, so a Kind column says which is which
+        # and Value covers both a display name and a category. 9 + 26 + 18 + 7 plus two
+        # cells of padding each is 68 of the ~92 the main panel has beside the 36-wide
+        # sidebar, so the count — the point of the panel — never scrolls off the edge.
+        rules.add_column("Kind", width=9)
+        rules.add_column("Pattern", width=26)
+        rules.add_column("Value", width=18)
+        rules.add_column("Count", width=7)
         rules.display = False  # the transactions table owns the panel by default
 
         imports = self.query_one("#imports", DataTable)
@@ -181,6 +255,27 @@ class BudgetApp(App):
         setup.add_column("#", width=4)
         setup.add_column("Choice", width=44)
         setup.display = False
+
+        periods = self.query_one("#periods", DataTable)
+        periods.cursor_type = "row"
+        periods.zebra_stripes = True
+        periods.add_column("Period", width=10)
+        periods.add_column("Range", width=24)
+        periods.display = False
+
+        stats_table = self.query_one("#stats_table", DataTable)
+        stats_table.cursor_type = "row"
+        stats_table.zebra_stripes = True
+        # 26 + 5 + 12 + 12 + 7 plus two cells of padding each: 74 of the ~92 the main
+        # panel has beside the 36-wide sidebar, so Share is never pushed off-screen.
+        stats_table.add_column("Category", width=26)
+        stats_table.add_column("Txns", width=5)
+        stats_table.add_column("Total", width=12)
+        stats_table.add_column("Avg/month", width=12)
+        # Named for what it is a share *of*: income rows sit in the same table, and a
+        # "Share" beside a positive total invites reading it as a share of that.
+        stats_table.add_column("% spend", width=7)
+        self.query_one("#stats", Vertical).display = False
         self.query_one("#prompt", Static).display = False
 
         self.reload()
@@ -193,12 +288,14 @@ class BudgetApp(App):
             self._vendors = queries.get_vendors(session)
             self._categories = queries.get_categories(session)
             self._rules = queries.get_rules(session)
+            self._category_rules = queries.get_category_rules(session)
             txns = queries.get_transactions(
                 session,
                 self.account_filter,
                 self.category_filter,
                 self.vendor_filter,
                 text_filter=self.text_filter,
+                date_range=self.date_filter,
             )
             totals = queries.get_totals(
                 session,
@@ -206,6 +303,7 @@ class BudgetApp(App):
                 self.category_filter,
                 self.vendor_filter,
                 text_filter=self.text_filter,
+                date_range=self.date_filter,
             )
         self._fill_list("#accounts", [f"{a.name} ({a.count})" for a in self._accounts])
         self._fill_list("#vendors", [f"{v.name} ({v.count})" for v in self._vendors])
@@ -216,6 +314,11 @@ class BudgetApp(App):
         self._fill_txns(txns)
         self._fill_rules()
         self._totals = totals
+        # Statistics are scoped by exactly the filters above, so an open panel has to be
+        # recomputed whenever they change.
+        if self._panel == "stats" and self.window is not None:
+            self._build_report()
+            self._fill_stats()
         self._refresh_status()
 
     def _fill_list(self, selector: str, labels: List[str]) -> None:
@@ -245,9 +348,17 @@ class BudgetApp(App):
         table.clear()
         for rule in self._rules:
             table.add_row(
-                _truncate(rule.pattern, 28),
+                "vendor",
+                _truncate(rule.pattern, 26),
                 _truncate(rule.name, 18),
                 Text(str(rule.vendor_count), justify="right"),
+            )
+        for rule in self._category_rules:
+            table.add_row(
+                "category",
+                _truncate(rule.pattern, 26),
+                _truncate(rule.category, 18),
+                Text(str(rule.txn_count), justify="right"),
             )
 
     def _fill_imports(self) -> None:
@@ -264,14 +375,89 @@ class BudgetApp(App):
                 status,
             )
 
+    def _build_report(self) -> None:
+        with self.session_factory() as session:
+            self._report = stats.build_report(
+                session,
+                self.window,
+                self.account_filter,
+                self.category_filter,
+                self.vendor_filter,
+                text_filter=self.text_filter,
+            )
+
+    def _fill_stats(self) -> None:
+        table = self.query_one("#stats_table", DataTable)
+        table.clear()
+        if self._report is None:
+            return
+        for stat in self._report.categories:
+            table.add_row(
+                _truncate(stat.name, 26),
+                Text(str(stat.count), justify="right"),
+                _amount_cell(stat.total_minor),
+                _amount_cell(stat.avg_month_minor),
+                # Shares are a fraction of a negative outflow, so a category that spent
+                # nothing comes out as -0.0; abs() keeps that off the screen.
+                Text(f"{abs(stat.share) * 100:.1f}%", justify="right"),
+            )
+
+    def _fill_periods(self) -> None:
+        table = self.query_one("#periods", DataTable)
+        table.clear()
+        # Spelling out the dates each preset resolves to saves the user working out what
+        # "3 months" means when their imports are a month stale.
+        for key, label, _months in stats.PRESETS:
+            window = stats.resolve(key)
+            table.add_row(label, f"{window.start} → {window.end}")
+        table.add_row(CUSTOM_PERIOD, RANGE_EXAMPLE)
+
+    def _stats_status(self) -> str:
+        """One line: the main panel gives the status 92 columns, so every field is terse.
+
+        No "escape returns" hint here, unlike the other panels — the footer already spells
+        that key out, and against a real year of five-figure totals the sentence ran the
+        line to exactly the panel width, one digit away from truncating the money. The
+        right-arrow drill-down hint lives in the footer for the same reason: this line has
+        no slack left to spend on it (see test_stats_status_line_fits_the_main_panel).
+        """
+        report = self._report
+        window = report.window
+        # A custom window's label is its own date range, which follows anyway.
+        label = "custom" if window.key == "custom" else window.label
+        # The money figures leave transfers out, so say how many vanished — silently
+        # dropping a payment between your own accounts reads as missing spending.
+        excluded = (
+            f"{TRANSFER_MARK} {report.transfer_count} " if report.transfer_count else ""
+        )
+        return (
+            f"{label} {window.start}→{window.end} "
+            f"{report.count} txns "
+            f"{excluded}"
+            f"out {_fmt_amount(report.outflow_minor)} "
+            f"in {_fmt_amount(report.inflow_minor)} "
+            f"/mo {_fmt_amount(report.avg_month_outflow_minor)}"
+        )
+
     def _refresh_status(self) -> None:
         status = self.query_one("#status", Static)
+        if self._panel == "stats" and self._report is not None:
+            status.update(self._stats_status())
+            return
+        if self._panel == "periods":
+            status.update(
+                "choose a period   enter selects   "
+                "escape to return to transactions"
+            )
+            return
         if self._panel == "rules":
-            count = len(self._rules)
+            count = len(self._rules) + len(self._category_rules)
             named = sum(rule.vendor_count for rule in self._rules)
+            owned = sum(rule.txn_count for rule in self._category_rules)
             status.update(
                 f"{count} rule{'s' if count != 1 else ''}   "
-                f"naming {named} vendors   "
+                f"{named} vendors named   "
+                f"{owned} txns categorised   "
                 "escape to return to transactions"
             )
             return
@@ -290,6 +476,10 @@ class BudgetApp(App):
         self._set_status(self._totals)
 
     def _set_status(self, totals: queries.Totals) -> None:
+        # A drilled-down view's "back to stats" hint lives in the footer, not here: this
+        # line already lands on the panel's 92-column budget with a year window and
+        # five-figure amounts (test_drill_down_status_line_fits_the_main_panel), before
+        # spending anything on a hint.
         scope = []
         if self.account_filter is not None:
             scope.append("account")
@@ -297,6 +487,11 @@ class BudgetApp(App):
             scope.append("vendor")
         if self.category_filter is not None:
             scope.append("category")
+        if self.date_filter is not None:
+            # Spelled out rather than labelled "date": the drill-down from a statistics
+            # row is the only thing that sets it, and the user needs to see which window
+            # they landed in to reconcile the numbers they just clicked.
+            scope.append(_range_label(self.date_filter))
         if self.text_filter is not None:
             scope.append(f'{self.text_filter.field}~"{self.text_filter.text}"')
         scope_label = f" [filtered: {', '.join(scope)}]" if scope else ""
@@ -314,6 +509,9 @@ class BudgetApp(App):
 
     # ---------------------------------------------------------------- events
     def on_list_view_selected(self, event: ListView.Selected) -> None:
+        # A sidebar filter is a new view; the flag it might invalidate is checked in
+        # _set_drilled_from_stats() (no-op if it was already clear).
+        self._set_drilled_from_stats(False)
         index = event.list_view.index or 0
         list_id = event.list_view.id
         if list_id == "accounts":
@@ -330,11 +528,21 @@ class BudgetApp(App):
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         """Enter on a row in the imports panel imports that file."""
+        if event.data_table.id == "stats_table":
+            self._drill_into_category(event.cursor_row)
+            return
         if event.data_table.id == "setup":
             if self._setup is not None and self._setup.question is not None:
                 choices = self._setup.question.choices
                 if 0 <= event.cursor_row < len(choices):
                     self._answer_setup(str(choices[event.cursor_row]))
+            return
+        if event.data_table.id == "periods":
+            row = event.cursor_row
+            if row == len(stats.PRESETS):  # the Custom… row, always last
+                self._ask_range()
+            elif 0 <= row < len(stats.PRESETS):
+                self._show_stats(stats.resolve(stats.PRESETS[row][0]))
             return
         if event.data_table.id != "imports":
             return
@@ -444,6 +652,7 @@ class BudgetApp(App):
     def _show_setup_question(self) -> None:
         table = self.query_one("#setup", DataTable)
         table.clear()
+        self._prompt_panel = "setup"
         question = self._setup.question
         for index, choice in enumerate(question.choices, start=1):
             table.add_row(Text(str(index), justify="right"), _truncate(str(choice), 44))
@@ -466,6 +675,66 @@ class BudgetApp(App):
         table.display = bool(question.choices)
         if not question.choices:
             self.query_one("#command", Input).focus()
+
+    # ----------------------------------------------------------- statistics
+    def _do_stats(self, arg: str) -> None:
+        """Bare ``stats`` opens the period picker; ``stats <spec>`` skips it."""
+        if not arg:
+            self._show_periods()
+            return
+        window = self._parse_window(arg)
+        if window is not None:
+            self._show_stats(window)
+
+    def _parse_window(self, text: str) -> Optional[stats.Window]:
+        try:
+            return stats.parse(text)
+        except ValueError as error:
+            # The message names every accepted spelling, and may quote the user's text.
+            self.notify(str(error), severity="error", markup=False)
+            return None
+
+    def _show_periods(self) -> None:
+        self._fill_periods()
+        self._range_pending = False
+        self._prompt_panel = None
+        self._set_panel("periods")
+
+    def _show_stats(self, window: stats.Window) -> None:
+        self.window = window
+        self._range_pending = False
+        self._prompt_panel = None
+        self._build_report()
+        self._fill_stats()
+        self._set_panel("stats")
+
+    def _ask_range(self) -> None:
+        """Ask for an explicit range, answered in the command bar below the picker."""
+        self._range_pending = True
+        self._prompt_panel = "periods"
+        prompt = self.query_one("#prompt", Static)
+        prompt.update(
+            Text.assemble(
+                ("Date range for the statistics\n", "bold"),
+                (
+                    f"Type it in the command bar below, as {RANGE_EXAMPLE}.  "
+                    "Escape returns to the list.",
+                    "dim",
+                ),
+            )
+        )
+        prompt.display = True
+        self.query_one("#command", Input).focus()
+
+    def _answer_range(self, text: str) -> None:
+        window = self._parse_window(text)
+        if window is None:
+            return  # a bad range leaves the prompt up, over the picker
+        self._show_stats(window)
+
+    def _cancel_range(self) -> None:
+        # _show_periods() drops the pending question and hides the prompt with it.
+        self._show_periods()
 
     def _answer_setup(self, text: str) -> None:
         """Apply one answer, then move on to whatever is next."""
@@ -504,6 +773,9 @@ class BudgetApp(App):
         if self._setup is not None and self._setup.question is not None:
             self._answer_setup(text)
             return
+        if self._range_pending:
+            self._answer_range(text)
+            return
         self._run_command(text.strip())
 
     def _run_command(self, command: str) -> None:
@@ -528,12 +800,16 @@ class BudgetApp(App):
             self._do_rule(arg)
         elif name == "rules":
             self._show_rules()
+        elif name in {"categorize", "categorise", "cat"}:
+            self._do_categorize(arg)
         elif name == "transfers":
             self._do_transfers(arg)
         elif name == "merge":
             self._do_merge(arg)
         elif name == "filter":
             self._do_filter(arg)
+        elif name == "stats":
+            self._do_stats(arg)
         elif name == "help":
             self.notify(
                 "import — browse data/to_import; enter imports the selected file\n"
@@ -542,15 +818,26 @@ class BudgetApp(App):
                 "rule <pattern> = <display name> — rename every matching vendor,\n"
                 "  now and on future imports (e.g. rule Kindle Svcs* = Kindle)\n"
                 "rules — list the rules you have defined (escape returns)\n"
+                "categorize <vendor> = <category> — categorise that vendor's\n"
+                "  transactions by hand (cat is short for categorize)\n"
+                "categorize <vendor> = — undo a manual category\n"
+                "categorize rule <pattern> = <category> — categorise every matching\n"
+                "  vendor, now and on future imports\n"
+                "categorize rules — list the rules you have defined (escape returns)\n"
                 "transfers [reset] — pair up movements between your own accounts\n"
                 "merge <account> = <account> — fold one account into another\n"
                 "filter <text> — search description, vendor, and raw name\n"
                 "filter vendor:<text> — search one field (description/vendor/raw)\n"
                 "filter — clear the text filter\n"
+                "stats — pick a period, then see spending per category\n"
+                "stats <period> — skip the picker (e.g. stats 6m, stats 1 year,\n"
+                f"  stats {RANGE_EXAMPLE})\n"
+                "  enter, or the right arrow, on a category row lists that window's\n"
+                "  transactions; the left arrow goes back to the breakdown\n"
                 "all — clear filters   refresh — reload   quit — exit\n"
                 "Click an account/vendor/category to filter.\n"
-                "ctrl+n — prefill rename for the selected transaction's vendor,\n"
-                "  or for the selected vendor in the sidebar.",
+                "ctrl+n / ctrl+t — prefill rename / categorize for the selected\n"
+                "  transaction's vendor, or for the selected vendor in the sidebar.",
                 title="Commands",
                 timeout=8,
             )
@@ -622,24 +909,43 @@ class BudgetApp(App):
         self.reload()
         self.notify(f"{raw!r} → {display!r}")
 
+    def _set_drilled_from_stats(self, value: bool) -> None:
+        """Flip the "back to stats" flag, and nudge the footer to match.
+
+        The footer only recomputes on its own when focus changes; a filter typed into
+        the command bar clears this flag without moving focus, so the hint would go
+        stale without an explicit refresh.
+        """
+        if value == self._drilled_from_stats:
+            return
+        self._drilled_from_stats = value
+        self.screen.refresh_bindings()
+
     def _set_panel(self, panel: str) -> None:
         """Show one of the main-view panels; escape always returns to transactions."""
+        # Leaving the drilled-down view for any other panel invalidates "back to
+        # stats". _drill_into_category() and _go_back_to_stats() both set the flag to
+        # its real value themselves, after calling this, so this cannot undo either.
+        self._set_drilled_from_stats(False)
         self._panel = panel
         for name in self.PANELS:
-            self.query_one(f"#{name}", DataTable).display = name == panel
-        self.query_one("#prompt", Static).display = panel == "setup"
+            self.query_one(f"#{name}").display = name == panel
+        # The prompt belongs to whichever panel last raised a question.
+        self.query_one("#prompt", Static).display = panel == self._prompt_panel
         if panel == "txns":
             self.query_one("#command", Input).focus()
         else:
-            self.query_one(f"#{panel}", DataTable).focus()
+            self.query_one(self.PANEL_FOCUS.get(panel, f"#{panel}")).focus()
         self._refresh_status()
 
     def _show_rules(self) -> None:
         self.reload()
         self._set_panel("rules")
-        if not self._rules:
+        if not self._rules and not self._category_rules:
             self.notify(
-                "No vendor rules yet. Add one with:  rule <pattern> = <display name>"
+                "No vendor rules yet, and no category rules. Add one with:\n"
+                "  rule <pattern> = <display name>\n"
+                "  categorize rule <pattern> = <category>"
             )
 
     def _show_imports(self) -> None:
@@ -654,6 +960,7 @@ class BudgetApp(App):
 
     def _do_filter(self, arg: str) -> None:
         """`filter text` searches everything; `filter vendor:text` narrows the field."""
+        self._set_drilled_from_stats(False)  # a new search is a new view, not the drill-down's
         arg = arg.strip()
         if not arg:
             self.text_filter = None
@@ -736,6 +1043,117 @@ class BudgetApp(App):
         self.reload()
         self.notify(f"{pattern!r} → {display!r} ({changed} vendors updated)")
 
+    CATEGORIZE_USAGE = "Usage: categorize <vendor> = <category>   (blank category undoes it)"
+    CATEGORY_RULE_USAGE = "Usage: categorize rule <pattern> = <category>"
+
+    def _do_categorize(self, arg: str) -> None:
+        """``categorize <vendor> = <category>``, its blank-category undo, and its rules."""
+        arg = arg.strip()
+        if not arg or arg.lower() == "rules":
+            self._show_rules()
+            return
+        head, _, rest = arg.partition(" ")
+        if head.lower() == "rule":
+            self._do_category_rule(rest.strip())
+            return
+        if "=" not in arg:
+            self.notify(self.CATEGORIZE_USAGE, severity="warning")
+            return
+        vendor, value = (part.strip() for part in arg.split("=", 1))
+        if not vendor:
+            self.notify(self.CATEGORIZE_USAGE, severity="warning")
+            return
+
+        with self.session_factory() as session:
+            # Checked up front because both calls return 0 for an unknown vendor and for
+            # one with nothing to change, and those deserve different answers.
+            if queries.resolve_vendor_filter(session, vendor) is None:
+                self.notify(f"No vendor named {vendor!r}.", severity="error", markup=False)
+                return
+            if value:
+                changed = categories.set_category(session, vendor, value)
+                message = f"{vendor!r} → {value!r} ({changed} transactions categorised)"
+            else:
+                # Mirrors a bare `filter`: leaving the right-hand side empty undoes it.
+                changed = categories.clear_category(session, vendor)
+                message = f"{vendor!r}: cleared the category on {changed} transactions."
+            session.commit()
+        self.reload()
+        self.notify(message, markup=False)
+
+    def _do_category_rule(self, arg: str) -> None:
+        if not arg:
+            self._show_rules()
+            return
+        if "=" not in arg:
+            self.notify(self.CATEGORY_RULE_USAGE, severity="warning")
+            return
+        pattern, value = (part.strip() for part in arg.split("=", 1))
+        if not pattern or not value:
+            self.notify(self.CATEGORY_RULE_USAGE, severity="warning")
+            return
+        with self.session_factory() as session:
+            categories.add_rule(session, pattern, value)
+            changed = categories.apply_category_rules(session)
+            session.commit()
+        self.reload()
+        # markup=False: patterns are globs, and may carry brackets.
+        self.notify(
+            f"{pattern!r} → {value!r} ({changed} transactions categorised)", markup=False
+        )
+
+    # ------------------------------------------------------------- drill-down
+    def _drill_into_category(self, row: int) -> None:
+        """Enter, or the right arrow, on a statistics row lists the transactions behind it.
+
+        The report's window comes along as a date filter. Without it the table would show
+        every transaction that category ever had, and the figures the user just clicked
+        would not match the rows they are now looking at.
+        """
+        if self._report is None or not 0 <= row < len(self._report.categories):
+            return
+        stat = self._report.categories[row]
+        # Remember what the drill-down is about to overwrite, and where it came from, so
+        # a left arrow can undo exactly this rather than blanking filters the user set
+        # themselves, and can put the cursor back where it was.
+        self._pre_drill_category_filter = self.category_filter
+        self._pre_drill_date_filter = self.date_filter
+        self._drill_source_row = row
+        self.category_filter = stat.category_id
+        self.date_filter = (self._report.window.start, self._report.window.end)
+        # Panel first: reload() only rebuilds the report while the stats panel is up, and
+        # rebuilding it under the new filter would rewrite the rows we just read.
+        self._set_panel("txns")
+        self._set_drilled_from_stats(True)
+        self.reload()
+
+    def _go_back_to_stats(self) -> None:
+        """Left arrow, undoing exactly the drill-down that produced this view.
+
+        Mirrors _drill_into_category(): restores the filters it overwrote (which may be
+        None, or may be a filter the user had set before drilling in), rebuilds the
+        report under them, and returns the stats cursor to the row that was drilled
+        from.
+        """
+        row = self._drill_source_row
+        self.category_filter = self._pre_drill_category_filter
+        self.date_filter = self._pre_drill_date_filter
+        self._pre_drill_category_filter = None
+        self._pre_drill_date_filter = None
+        self._drill_source_row = None
+        self._set_drilled_from_stats(False)
+        # reload() while the panel is still "txns" resyncs the transactions/totals to
+        # the restored filters without rebuilding the report (see its own guard), so the
+        # report is rebuilt explicitly here, the same way _show_stats() does.
+        self.reload()
+        self._build_report()
+        self._fill_stats()
+        self._set_panel("stats")
+        if row is not None:
+            table = self.query_one("#stats_table", DataTable)
+            if 0 <= row < table.row_count:
+                table.move_cursor(row=row)
+
     # --------------------------------------------------------------- actions
     def _selected_vendor(self) -> Optional[queries.VendorRow]:
         """The vendor ctrl+n targets: the active filter, else the highlighted row."""
@@ -767,15 +1185,19 @@ class BudgetApp(App):
             return None
         return self._txns[row]
 
-    def action_rename_vendor(self) -> None:
-        # In the transaction table, target the selected transaction's vendor. Rows carry
-        # the raw merchant string, so this works even for already-grouped vendors.
+    def _prefill_for_vendor(self, verb: str) -> None:
+        """Prefill ``<verb> <raw vendor> = `` for whichever vendor is being pointed at.
+
+        In the transaction table, that is the selected transaction's vendor. Rows carry
+        the raw merchant string, so this works even for already-grouped vendors.
+        Otherwise the sidebar decides: the active vendor filter, else the highlighted row.
+        """
         txn = self._cursor_txn()
         if txn is not None:
             if not txn.vendor_raw:
                 self.notify("That transaction has no vendor.", severity="warning")
                 return
-            self._prefill_command(f"rename {txn.vendor_raw} = ")
+            self._prefill_command(f"{verb} {txn.vendor_raw} = ")
             return
 
         vendor = self._selected_vendor()
@@ -783,20 +1205,42 @@ class BudgetApp(App):
             self.notify("Select a vendor in the sidebar first.", severity="warning")
             return
         if vendor.kind != "raw":
-            # set_override() matches on the raw vendor string, which the sidebar no
+            # These commands are keyed on the raw vendor string, which the sidebar no
             # longer shows once a group exists, so we can only prefill the verb.
             self.notify(
-                f"{vendor.name!r} is an override group — rename a raw vendor instead.",
+                f"{vendor.name!r} is an override group — pick a raw vendor instead.",
                 severity="warning",
             )
-            self._prefill_command("rename ")
+            self._prefill_command(f"{verb} ")
             return
-        self._prefill_command(f"rename {vendor.name} = ")
+        self._prefill_command(f"{verb} {vendor.name} = ")
+
+    def action_drill_down(self) -> None:
+        """The right arrow's twin of enter on a statistics row."""
+        table = self.query_one("#stats_table", DataTable)
+        self._drill_into_category(table.cursor_row)
+
+    def action_drill_up(self) -> None:
+        """The left arrow's "back" out of a statistics drill-down."""
+        self._go_back_to_stats()
+
+    def action_rename_vendor(self) -> None:
+        self._prefill_for_vendor("rename")
+
+    def action_categorize_vendor(self) -> None:
+        self._prefill_for_vendor("categorize")
 
     def action_show_transactions(self) -> None:
+        # Escape is the general-purpose "leave this view" key, so it drops the
+        # drill-down's back-link even when the panel is already "txns".
+        self._set_drilled_from_stats(False)
         if self._setup is not None:
             self.notify(f"Setup for {self._setup.path.name} cancelled.")
             self._cancel_setup()
+            return
+        if self._range_pending:
+            self.notify("Custom range cancelled.")
+            self._cancel_range()
             return
         if self._panel != "txns":
             self._set_panel("txns")
@@ -805,10 +1249,12 @@ class BudgetApp(App):
         self.reload()
 
     def action_clear_filters(self) -> None:
+        self._set_drilled_from_stats(False)
         self.account_filter = None
         self.vendor_filter = None
         self.category_filter = None
         self.text_filter = None
+        self.date_filter = None
         self.reload()
         self.notify("Filters cleared.")
 

@@ -11,14 +11,16 @@ matches a single un-overridden vendor.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from datetime import date
+from typing import Dict, List, Optional, Tuple
 
-from sqlalchemy import func, or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy import case, func, or_, select, true
+from sqlalchemy.orm import Session, selectinload
 
 from .models import (
     Account,
     Category,
+    CategoryRule,
     Currency,
     Transaction,
     Vendor,
@@ -27,9 +29,30 @@ from .models import (
 )
 
 VendorFilter = Tuple[str, int]
+# Inclusive on both ends, so a one-day range is ``(day, day)``.
+DateRange = Tuple[date, date]
 
 # Which fields a text search looks at.
 TEXT_FIELDS = ("all", "description", "vendor", "raw")
+
+# A category filter meaning "the ones with no category at all". Real ids come from SQLite
+# autoincrement and are always positive, so a negative sentinel keeps every signature
+# ``Optional[int]`` rather than growing a parallel "uncategorised?" flag through them.
+UNCATEGORISED_ID = -1
+
+# Time buckets a series can be grouped into.
+BUCKETS = ("day", "week", "month")
+
+# ``(sort key, axis label)`` strftime patterns per bucket. SQLite and Python agree on
+# every code used here — including ``%W``, week-of-year counting from the first Monday —
+# so the same pattern serves the SQL grouping and any Python-side zero-filling.
+BUCKET_FORMATS: Dict[str, Tuple[str, str]] = {
+    # Day and week windows are short enough that the year is noise on an axis; a monthly
+    # series routinely spans a year boundary, so it keeps the year.
+    "day": ("%Y-%m-%d", "%m-%d"),
+    "week": ("%Y-W%W", "W%W"),
+    "month": ("%Y-%m", "%Y-%m"),
+}
 
 
 @dataclass(frozen=True)
@@ -97,12 +120,39 @@ class RuleRow:
 
 
 @dataclass
+class CategoryRuleRow:
+    id: int
+    pattern: str
+    category: str
+    txn_count: int  # transactions this rule currently categorises
+
+
+@dataclass
 class Totals:
     count: int  # every matching transaction, transfers included
     net_minor: int
     outflow_minor: int
     inflow_minor: int
     transfer_count: int = 0  # of `count`, how many were excluded from the money figures
+
+
+@dataclass
+class CategoryTotal:
+    id: Optional[int]  # None for uncategorised transactions
+    name: str  # "" when uncategorised — the caller picks the label
+    count: int
+    total_minor: int  # signed sum
+    outflow_minor: int  # sum of the negatives, so <= 0
+    inflow_minor: int  # sum of the positives, so >= 0
+
+
+@dataclass
+class BucketTotal:
+    key: str  # sortable bucket key, e.g. "2026-03", "2026-W12", "2026-03-04"
+    label: str  # short human label for an axis
+    count: int
+    outflow_minor: int
+    inflow_minor: int
 
 
 def get_accounts(session: Session) -> List[AccountRow]:
@@ -189,6 +239,44 @@ def get_rules(session: Session) -> List[RuleRow]:
     ]
 
 
+def get_category_rules(session: Session) -> List[CategoryRuleRow]:
+    """Category rules with the number of transactions each one currently owns.
+
+    "Owns" means the rows :func:`categories.apply_category_rules` stamped ``rule``, and
+    attribution mirrors it — patterns are tried per vendor in ``id`` order and the first
+    match wins — so two rules pointing at the same category are still counted separately.
+    Rows a rule would have matched but could not take (a manual choice, or a transfer leg)
+    are not counted, because the rule does not own them.
+    """
+    from .categories import RULE, matches  # local import keeps the dependency one-way
+
+    rules = list(session.scalars(select(CategoryRule).order_by(CategoryRule.id)))
+    counts = {rule.id: 0 for rule in rules}
+    owner = {}
+    for vendor in session.scalars(select(Vendor)):
+        match = next((r for r in rules if matches(r.pattern, vendor)), None)
+        if match is not None:
+            owner[vendor.id] = match.id
+    rows = session.execute(
+        select(Transaction.vendor_id, func.count())
+        .where(Transaction.category_source == RULE)
+        .group_by(Transaction.vendor_id)
+    ).all()
+    for vendor_id, count in rows:
+        rule_id = owner.get(vendor_id)
+        if rule_id is not None:
+            counts[rule_id] += count
+    return [
+        CategoryRuleRow(
+            id=rule.id,
+            pattern=rule.pattern,
+            category=rule.category.value,
+            txn_count=counts[rule.id],
+        )
+        for rule in rules
+    ]
+
+
 def _contains(column, text: str):
     """A case-insensitive substring test.
 
@@ -230,11 +318,19 @@ def _txn_query(
     category_id: Optional[int],
     vendor_filter: Optional[VendorFilter],
     text_filter: "Optional[TextFilter]" = None,
+    date_range: "Optional[DateRange]" = None,
 ):
     query = select(Transaction)
+    if date_range is not None:
+        start, end = date_range
+        query = query.where(
+            Transaction.posted_date >= start, Transaction.posted_date <= end
+        )
     if account_id is not None:
         query = query.where(Transaction.account_id == account_id)
-    if category_id is not None:
+    if category_id == UNCATEGORISED_ID:
+        query = query.where(Transaction.category_id.is_(None))
+    elif category_id is not None:
         query = query.where(Transaction.category_id == category_id)
     if vendor_filter is not None:
         kind, vendor_id = vendor_filter
@@ -258,9 +354,20 @@ def get_transactions(
     vendor_filter: Optional[VendorFilter] = None,
     limit: int = 2000,
     text_filter: Optional[TextFilter] = None,
+    date_range: Optional[DateRange] = None,
 ) -> List[TxnRow]:
     query = (
-        _txn_query(account_id, category_id, vendor_filter, text_filter)
+        _txn_query(account_id, category_id, vendor_filter, text_filter, date_range)
+        # Every row below reads through all four of these relationships. Left lazy, each
+        # distinct related object costs its own SELECT — ~900 of them on a real database,
+        # for a query that should take one apiece. ``vendor_name`` is nested because
+        # ``display_name`` reaches through the vendor to it.
+        .options(
+            selectinload(Transaction.vendor).selectinload(Vendor.vendor_name),
+            selectinload(Transaction.category),
+            selectinload(Transaction.currency),
+            selectinload(Transaction.account),
+        )
         .order_by(Transaction.posted_date.desc(), Transaction.id.desc())
         .limit(limit)
     )
@@ -289,8 +396,11 @@ def get_totals(
     category_id: Optional[int] = None,
     vendor_filter: Optional[VendorFilter] = None,
     text_filter: Optional[TextFilter] = None,
+    date_range: Optional[DateRange] = None,
 ) -> Totals:
-    base = _txn_query(account_id, category_id, vendor_filter, text_filter).subquery()
+    base = _txn_query(
+        account_id, category_id, vendor_filter, text_filter, date_range
+    ).subquery()
     amount = base.c.value_minor
     count = session.scalar(select(func.count()).select_from(base)) or 0
     transfer_count = (
@@ -317,6 +427,108 @@ def get_totals(
         inflow_minor=total(real & (amount > 0)),
         transfer_count=transfer_count,
     )
+
+
+def _signed_sums(amount, counts=None):
+    """``(total, outflow, inflow)`` aggregates over a signed amount column.
+
+    ``counts`` is a condition selecting the rows whose money should be added up; rows
+    outside it still exist and are still counted, they just contribute 0. That is how
+    transfers are kept out of the figures without being erased from the tallies.
+    """
+    def summed(condition):
+        if counts is not None:
+            condition = condition & counts
+        return func.coalesce(func.sum(case((condition, amount), else_=0)), 0)
+
+    return summed(true()), summed(amount < 0), summed(amount > 0)
+
+
+def get_category_totals(
+    session: Session,
+    account_id: Optional[int] = None,
+    category_id: Optional[int] = None,
+    vendor_filter: Optional[VendorFilter] = None,
+    text_filter: Optional[TextFilter] = None,
+    date_range: Optional[DateRange] = None,
+) -> List[CategoryTotal]:
+    """Per-category rows, most-spent first.
+
+    ``count`` is every transaction in the category, transfers included, while the money
+    columns leave transfers out — the same split :class:`Totals` makes. Counting and
+    summing the same set would be tidier arithmetic but a worse answer: the count is what
+    a UI drills into, and a category holding a transfer would then promise fewer rows
+    than it shows.
+
+    Uncategorised transactions are a row of their own (``id`` None, ``name`` ""), reached
+    by an outer join, so the rows always add back up to the totals.
+    """
+    base = _txn_query(
+        account_id, category_id, vendor_filter, text_filter, date_range
+    ).subquery()
+    amount = base.c.value_minor
+    total, outflow, inflow = _signed_sums(amount, base.c.transfer_group_id.is_(None))
+    rows = session.execute(
+        select(
+            base.c.category_id,
+            func.coalesce(Category.value, ""),
+            func.count(),
+            total,
+            outflow,
+            inflow,
+        )
+        .select_from(base)
+        .join(Category, Category.id == base.c.category_id, isouter=True)
+        .group_by(base.c.category_id)
+        # Outflow is negative, so ascending is biggest-spend-first.
+        .order_by(outflow, func.coalesce(Category.value, ""))
+    ).all()
+    return [
+        CategoryTotal(
+            id=r[0], name=r[1], count=r[2], total_minor=r[3], outflow_minor=r[4],
+            inflow_minor=r[5],
+        )
+        for r in rows
+    ]
+
+
+def get_bucket_totals(
+    session: Session,
+    bucket: str = "month",
+    account_id: Optional[int] = None,
+    category_id: Optional[int] = None,
+    vendor_filter: Optional[VendorFilter] = None,
+    text_filter: Optional[TextFilter] = None,
+    date_range: Optional[DateRange] = None,
+) -> List[BucketTotal]:
+    """Money grouped into day/week/month buckets, chronologically. Transfers excluded.
+
+    Only buckets that actually contain a transaction are returned — a chart that needs an
+    unbroken axis has to zero-fill the gaps itself (see :func:`stats.spending_series`).
+    """
+    patterns = BUCKET_FORMATS.get(bucket)
+    if patterns is None:
+        raise ValueError(f"Unknown bucket {bucket!r}; expected one of {list(BUCKETS)}.")
+    key_format, label_format = patterns
+
+    base = _txn_query(
+        account_id, category_id, vendor_filter, text_filter, date_range
+    ).subquery()
+    amount = base.c.value_minor
+    _total, outflow, inflow = _signed_sums(amount)
+    key = func.strftime(key_format, base.c.posted_date)
+    label = func.strftime(label_format, base.c.posted_date)
+    rows = session.execute(
+        select(key, label, func.count(), outflow, inflow)
+        .select_from(base)
+        .where(base.c.transfer_group_id.is_(None))
+        .group_by(key, label)
+        .order_by(key)
+    ).all()
+    return [
+        BucketTotal(key=r[0], label=r[1], count=r[2], outflow_minor=r[3], inflow_minor=r[4])
+        for r in rows
+    ]
 
 
 # --------------------------------------------------------------------- resolvers

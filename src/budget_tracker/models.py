@@ -116,6 +116,25 @@ class VendorRule(Base):
     vendor_name: Mapped[VendorName] = relationship()
 
 
+class CategoryRule(Base):
+    """A glob pattern that categorises the transactions of matching vendors.
+
+    ``pattern`` is matched case-insensitively (shell-style ``*`` and ``?``) against
+    ``vendor.name`` *or* the vendor's display name, so a rule can be written against
+    the bank's original text and keeps working once the vendor is renamed. Rules are
+    evaluated in ``id`` order and the first match wins.
+    """
+
+    __tablename__ = "category_rule"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    pattern: Mapped[str] = mapped_column(String, unique=True)
+    category_id: Mapped[int] = mapped_column(ForeignKey("category.id"))
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+    category: Mapped[Category] = relationship()
+
+
 class CsvFormat(Base):
     """A bank's CSV layout, stored as data so no institution is named in the code.
 

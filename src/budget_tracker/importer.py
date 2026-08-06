@@ -308,6 +308,11 @@ def import_csv(
 
     apply_rules(session)
 
+    # After the renames, since a category rule may be written against a display name.
+    from .categories import apply_category_rules
+
+    apply_category_rules(session)
+
     # New rows may be the other leg of a transfer already in the database.
     from .transfers import detect_transfers
 
