@@ -40,6 +40,13 @@ UNSET = "unset"
 # the rule existed, since detection only ever stamps newly paired legs.
 PROTECTED_SOURCES = (MANUAL, TRANSFER_SOURCE)
 
+# Separator for a printable category path, e.g. "Food > Dining".
+PATH_SEPARATOR = ">"
+
+
+class CategoryError(ValueError):
+    """A category path is malformed, or a move would create a cycle or a collision."""
+
 
 def get_or_create(session: Session, value: str) -> Category:
     """Fetch the top-level category named ``value``, creating it if new. No commit."""
@@ -52,6 +59,166 @@ def get_or_create(session: Session, value: str) -> Category:
         session.add(category)
         session.flush()
     return category
+
+
+# --------------------------------------------------------------------------- paths
+#
+# Names are unique only among siblings (``UniqueConstraint("parent_id", "value")``), so
+# "Food > Other" and "Travel > Other" can coexist. Every lookup below is therefore
+# path-aware; nothing here does a bare-name match that could silently pick one of several.
+
+
+def parse_path(text: str) -> List[str]:
+    """Split ``"Food > Dining"`` into ``["Food", "Dining"]``.
+
+    Each segment is stripped; an empty segment (leading/trailing/doubled separator) is
+    rejected rather than silently dropped, since a typo there would otherwise create a
+    category no one meant.
+    """
+    parts = [part.strip() for part in text.split(PATH_SEPARATOR)]
+    if not parts or any(not part for part in parts):
+        raise CategoryError(
+            f"Bad category path {text!r}; expected e.g. 'Food > Dining'."
+        )
+    return parts
+
+
+def format_path(session: Session, category: Category) -> str:
+    """``category``'s full path, root first, e.g. ``"Food > Dining"``."""
+    parts = [category.value]
+    node = category
+    while node.parent_id is not None:
+        node = session.get(Category, node.parent_id)
+        parts.append(node.value)
+    parts.reverse()
+    return f" {PATH_SEPARATOR} ".join(parts)
+
+
+def _sibling(session: Session, parent_id: Optional[int], value: str) -> Optional[Category]:
+    clause = (
+        Category.parent_id.is_(None) if parent_id is None else Category.parent_id == parent_id
+    )
+    return session.scalar(select(Category).where(clause, Category.value == value))
+
+
+def resolve_path(session: Session, path: str) -> Optional[Category]:
+    """Exact path lookup, e.g. ``"Food > Dining"``.
+
+    A bare name (no separator) is also accepted, but only when it is unambiguous — when
+    exactly one category anywhere in the tree carries it. That keeps existing callers and
+    typed commands working now that names repeat across branches; an ambiguous bare name
+    returns ``None`` rather than guessing which one was meant.
+    """
+    parts = parse_path(path)
+    if len(parts) == 1:
+        matches = list(session.scalars(select(Category).where(Category.value == parts[0])))
+        return matches[0] if len(matches) == 1 else None
+    parent_id: Optional[int] = None
+    category: Optional[Category] = None
+    for part in parts:
+        category = _sibling(session, parent_id, part)
+        if category is None:
+            return None
+        parent_id = category.id
+    return category
+
+
+def children(session: Session, category_id: int) -> List[Category]:
+    """Direct children of ``category_id``, alphabetically."""
+    return list(
+        session.scalars(
+            select(Category).where(Category.parent_id == category_id).order_by(Category.value)
+        )
+    )
+
+
+def descendant_ids(session: Session, category_id: int) -> List[int]:
+    """``category_id`` and every id below it, in no particular order."""
+    ids = [category_id]
+    frontier = [category_id]
+    while frontier:
+        found = list(session.scalars(select(Category.id).where(Category.parent_id.in_(frontier))))
+        ids.extend(found)
+        frontier = found
+    return ids
+
+
+def set_parent(session: Session, child: Category, parent: Optional[Category]) -> Category:
+    """Move ``child`` under ``parent`` (``None`` for the top level). No commit.
+
+    Refuses a move that would make ``child`` its own ancestor, and a move that would
+    collide with an existing sibling of the same name under the destination — the unique
+    constraint would otherwise reject it at flush with a far less helpful error.
+    """
+    parent_id = parent.id if parent is not None else None
+    if parent_id is not None and parent_id in descendant_ids(session, child.id):
+        reason = "itself" if parent_id == child.id else f"its own descendant {parent.value!r}"
+        raise CategoryError(f"Cannot move {child.value!r} under {reason}; that is a cycle.")
+    collision = _sibling(session, parent_id, child.value)
+    if collision is not None and collision.id != child.id:
+        location = format_path(session, parent) if parent is not None else "the top level"
+        raise CategoryError(
+            f"{child.value!r} already exists under {location}; cannot move it there too."
+        )
+    child.parent_id = parent_id
+    session.flush()
+    return child
+
+
+def _create(session: Session, value: str, parent: Optional[Category]) -> Category:
+    category = Category(value=value, parent_id=parent.id if parent is not None else None)
+    session.add(category)
+    session.flush()
+    return category
+
+
+def _step(session: Session, parent: Optional[Category], name: str) -> Category:
+    """One element of a path: reuse ``name`` under ``parent`` if it is already there.
+
+    Otherwise, rescue a *stray top-level* category of the same name into this slot rather
+    than forking a same-named duplicate — someone building "Food > Dining" after already
+    having a bare "Dining" almost always means the same category. A name nested somewhere
+    else in the tree is left alone: only an explicit bare-name lookup (:func:`resolve_path`,
+    or the one-element case below) reaches across branches like that, since silently
+    abducting an unrelated same-named category out of another branch while building an
+    unrelated path would be a surprising, destructive guess.
+    """
+    parent_id = parent.id if parent is not None else None
+    existing = _sibling(session, parent_id, name)
+    if existing is not None:
+        return existing
+    if parent_id is not None:
+        stray = _sibling(session, None, name)
+        if stray is not None:
+            return set_parent(session, stray, parent)
+    return _create(session, name, parent)
+
+
+def ensure_path(session: Session, path: str) -> Category:
+    """Create or complete ``path``, re-parenting its last element under the one before it.
+
+    Each element is created if missing, reusing an already-correctly-placed category, or
+    (for a non-top-level slot) rescuing a stray top-level category of the same name into
+    place — see :func:`_step`. A one-element path is a special case: rather than restrict
+    the search to stray top-level categories, it moves an existing category to the top
+    level from *anywhere* in the tree, as long as the bare name is unambiguous; ambiguous
+    or absent, it creates one fresh at the top level. Does not commit.
+    """
+    parts = parse_path(path)
+    if len(parts) == 1:
+        name = parts[0]
+        existing = _sibling(session, None, name)
+        if existing is not None:
+            return existing
+        elsewhere = resolve_path(session, name)
+        return set_parent(session, elsewhere, None) if elsewhere is not None else _create(
+            session, name, None
+        )
+
+    node: Optional[Category] = None
+    for part in parts:
+        node = _step(session, node, part)
+    return node
 
 
 def _vendor_ids(session: Session, vendor: str) -> List[int]:

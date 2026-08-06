@@ -7,7 +7,7 @@ import pytest
 from sqlalchemy import event
 from sqlalchemy.engine import Engine
 
-from budget_tracker import queries, stats, transfers
+from budget_tracker import categories, queries, stats, transfers
 from budget_tracker.db import get_engine, get_sessionmaker, init_db
 from budget_tracker.models import Account, Category, Currency, Transaction, Vendor
 
@@ -520,3 +520,166 @@ def test_spending_series_passes_filters_through(tmp_path):
         account_id = queries.resolve_account(session, "Card")
         rows = stats.spending_series(session, window, "month", account_id=account_id)
     assert [(r.key, r.outflow_minor) for r in rows] == [("2025-03", -2000)]
+
+
+# --------------------------------------------------------------- nested category rollup
+
+def test_category_rollup_and_display_order(tmp_path):
+    """The Food > Dining > {Restaurants, Fast Food}, Food > Groceries example from the brief."""
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        currency, accounts, _ = _seed(session)
+        account = accounts["Checking"]
+        dining = categories.ensure_path(session, "Food > Dining")
+        restaurants = categories.ensure_path(session, "Food > Dining > Restaurants")
+        fast_food = categories.ensure_path(session, "Food > Dining > Fast Food")
+        groceries = categories.ensure_path(session, "Food > Groceries")
+        session.flush()
+
+        _txn(session, currency, account, date(2025, 3, 1), -6000, "Fancy dinner",
+             category=restaurants)
+        _txn(session, currency, account, date(2025, 3, 2), -1500, "Burger",
+             category=fast_food)
+        _txn(session, currency, account, date(2025, 3, 3), -4000, "Big shop",
+             category=groceries)
+        _txn(session, currency, account, date(2025, 3, 4), -500, "Snack",
+             category=dining)  # Dining's own direct spend
+        session.commit()
+
+    window = _custom("2025-03-01", "2025-03-31")
+    with session_factory() as session:
+        report = stats.build_report(session, window)
+
+    rows = {r.name: r for r in report.categories}
+    assert set(rows) == {"Food", "Dining", "Restaurants", "Fast Food", "Groceries"}
+
+    # Depth-first, siblings biggest-spend-first: Food is the sole root; under it Dining
+    # (-8000 total) outspends Groceries (-4000); under Dining, Restaurants (-6000)
+    # outspends Fast Food (-1500).
+    assert [(r.name, r.depth) for r in report.categories] == [
+        ("Food", 0), ("Dining", 1), ("Restaurants", 2), ("Fast Food", 2), ("Groceries", 1),
+    ]
+
+    # A parent's money is its own direct figures plus every descendant's.
+    assert rows["Dining"].outflow_minor == -500 - 6000 - 1500
+    assert rows["Dining"].own_total_minor == -500
+    assert rows["Dining"].own_count == 1
+    assert rows["Food"].outflow_minor == rows["Dining"].outflow_minor + rows["Groceries"].outflow_minor
+    assert rows["Food"].own_total_minor == 0
+    assert rows["Food"].own_count == 0
+
+    # Only the depth-0 rows reproduce the report's own totals; summing every row would
+    # double-count a parent together with its children.
+    depth0 = [r for r in report.categories if r.depth == 0]
+    assert [r.name for r in depth0] == ["Food"]
+    assert sum(r.outflow_minor for r in depth0) == report.outflow_minor
+    assert sum(r.inflow_minor for r in depth0) == report.inflow_minor
+
+    # Share is a fraction of the whole report, not of the parent.
+    assert rows["Restaurants"].share == pytest.approx(6000 / 12000)
+    assert rows["Food"].share == pytest.approx(1.0)
+
+    assert rows["Dining"].parent_id == rows["Food"].category_id
+    assert rows["Restaurants"].parent_id == rows["Dining"].category_id
+    assert rows["Food"].parent_id is None
+
+
+def test_parent_share_of_siblings_with_no_direct_parent_spend(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        currency, accounts, _ = _seed(session)
+        account = accounts["Checking"]
+        dining = categories.ensure_path(session, "Food > Dining")
+        restaurants = categories.ensure_path(session, "Food > Dining > Restaurants")
+        fast_food = categories.ensure_path(session, "Food > Dining > Fast Food")
+        session.flush()
+        _txn(session, currency, account, date(2025, 3, 1), -3000, "A", category=restaurants)
+        _txn(session, currency, account, date(2025, 3, 2), -1000, "B", category=fast_food)
+        session.commit()
+
+    window = _custom("2025-03-01", "2025-03-31")
+    with session_factory() as session:
+        report = stats.build_report(session, window)
+    rows = {r.name: r for r in report.categories}
+
+    # Dining holds no direct spend of its own, so its children's parent_share sums to 1.0.
+    assert rows["Restaurants"].parent_share == pytest.approx(3000 / 4000)
+    assert rows["Fast Food"].parent_share == pytest.approx(1000 / 4000)
+    assert (
+        rows["Restaurants"].parent_share + rows["Fast Food"].parent_share
+        == pytest.approx(1.0)
+    )
+
+    # A depth-0 row has no parent, so its parent_share equals its share.
+    assert rows["Dining"].parent_share == rows["Dining"].share == pytest.approx(1.0)
+
+
+def test_parent_share_when_the_parent_has_its_own_direct_spend(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        currency, accounts, _ = _seed(session)
+        account = accounts["Checking"]
+        dining = categories.ensure_path(session, "Food > Dining")
+        restaurants = categories.ensure_path(session, "Food > Dining > Restaurants")
+        session.flush()
+        _txn(session, currency, account, date(2025, 3, 1), -3000, "A", category=restaurants)
+        _txn(session, currency, account, date(2025, 3, 2), -1000, "B", category=dining)
+        session.commit()
+
+    window = _custom("2025-03-01", "2025-03-31")
+    with session_factory() as session:
+        report = stats.build_report(session, window)
+    rows = {r.name: r for r in report.categories}
+
+    # Dining's rolled outflow is 4000 (3000 + 1000), but only 3000 of it is Restaurants';
+    # the rest is Dining's own, so its one child sums to less than 1.0.
+    assert rows["Restaurants"].parent_share == pytest.approx(3000 / 4000)
+    assert rows["Restaurants"].parent_share < 1.0
+
+
+def test_parent_share_zero_denominator_guard(tmp_path):
+    """A parent whose rolled-up outflow is zero (all income under it) must not divide by zero."""
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        currency, accounts, _ = _seed(session)
+        account = accounts["Checking"]
+        salary = categories.ensure_path(session, "Income > Salary")
+        session.flush()
+        _txn(session, currency, account, date(2025, 3, 1), 200000, "Paycheck",
+             category=salary)
+        session.commit()
+
+    window = _custom("2025-03-01", "2025-03-31")
+    with session_factory() as session:
+        report = stats.build_report(session, window)
+    rows = {r.name: r for r in report.categories}
+
+    assert rows["Income"].outflow_minor == 0
+    assert rows["Salary"].outflow_minor == 0
+    assert rows["Salary"].parent_share == 0.0
+    assert rows["Salary"].share == 0.0
+
+
+def test_uncategorised_takes_part_in_the_same_display_order(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        currency, accounts, _ = _seed(session)
+        account = accounts["Checking"]
+        dining = categories.ensure_path(session, "Food > Dining")
+        session.flush()
+        _txn(session, currency, account, date(2025, 3, 1), -1000, "Snack", category=dining)
+        _txn(session, currency, account, date(2025, 3, 2), -5000, "Mystery")  # uncategorised
+        session.commit()
+
+    window = _custom("2025-03-01", "2025-03-31")
+    with session_factory() as session:
+        report = stats.build_report(session, window)
+
+    # Uncategorised (-5000) outspends Food (-1000), so it heads the depth-0 order.
+    assert [(r.name, r.depth) for r in report.categories] == [
+        (stats.UNCATEGORISED, 0), ("Food", 0), ("Dining", 1),
+    ]
+    uncategorised = next(r for r in report.categories if r.name == stats.UNCATEGORISED)
+    assert uncategorised.parent_id is None
+    assert uncategorised.category_id == queries.UNCATEGORISED_ID
+    assert uncategorised.own_total_minor == uncategorised.total_minor

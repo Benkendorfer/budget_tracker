@@ -10,6 +10,7 @@ matches a single un-overridden vendor.
 
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date
 from typing import Dict, List, Optional, Tuple
@@ -93,8 +94,10 @@ class VendorRow:
 class CategoryRow:
     id: int
     name: str
-    count: int
-    total_minor: int
+    count: int  # rolled up: this category plus every descendant
+    total_minor: int  # rolled up, signed sum
+    parent_id: Optional[int] = None
+    depth: int = 0  # 0 for top level; a UI can indent on this later
 
 
 @dataclass
@@ -144,6 +147,7 @@ class CategoryTotal:
     total_minor: int  # signed sum
     outflow_minor: int  # sum of the negatives, so <= 0
     inflow_minor: int  # sum of the positives, so >= 0
+    parent_id: Optional[int] = None  # None for uncategorised, or a top-level category
 
 
 @dataclass
@@ -197,20 +201,58 @@ def get_vendors(session: Session) -> List[VendorRow]:
 
 
 def get_categories(session: Session) -> List[CategoryRow]:
-    rows = session.execute(
-        select(
-            Category.id,
-            Category.value,
-            func.count(Transaction.id),
-            func.coalesce(func.sum(Transaction.value_minor), 0),
+    """The sidebar list, each row rolled up over its own subtree.
+
+    A parent's count and total must match what filtering by it now returns (see
+    ``_txn_query``'s subtree CTE), so they are not just that category's own direct
+    transactions. Rolled up here in Python — a tree walk over a couple of dozen rows is
+    far clearer than a recursive aggregate query — rather than in SQL.
+
+    Categories with nothing anywhere in their subtree are omitted, as before.
+    """
+    direct: Dict[int, Tuple[int, int]] = {
+        r[0]: (r[1], r[2])
+        for r in session.execute(
+            select(
+                Transaction.category_id,
+                func.count(Transaction.id),
+                func.coalesce(func.sum(Transaction.value_minor), 0),
+            )
+            .where(Transaction.category_id.is_not(None))
+            .group_by(Transaction.category_id)
+        ).all()
+    }
+    all_categories = list(session.scalars(select(Category)))
+    by_parent: Dict[Optional[int], List[Category]] = defaultdict(list)
+    for cat in all_categories:
+        by_parent[cat.parent_id].append(cat)
+
+    # (count, total, depth) per category id, filled in by a DFS from each top-level root.
+    rolled: Dict[int, Tuple[int, int, int]] = {}
+
+    def roll(cat: Category, depth: int) -> Tuple[int, int]:
+        count, total = direct.get(cat.id, (0, 0))
+        for child in by_parent.get(cat.id, []):
+            c_count, c_total = roll(child, depth + 1)
+            count += c_count
+            total += c_total
+        rolled[cat.id] = (count, total, depth)
+        return count, total
+
+    for root in by_parent.get(None, []):
+        roll(root, 0)
+
+    rows = [
+        CategoryRow(
+            id=cat.id, name=cat.value, count=rolled[cat.id][0],
+            total_minor=rolled[cat.id][1], parent_id=cat.parent_id, depth=rolled[cat.id][2],
         )
-        .join(Transaction, Transaction.category_id == Category.id)
-        .group_by(Category.id)
-        .order_by(func.sum(Transaction.value_minor))
-    ).all()
-    return [
-        CategoryRow(id=r[0], name=r[1], count=r[2], total_minor=r[3]) for r in rows
+        for cat in all_categories
+        if cat.id in rolled and rolled[cat.id][0] > 0
     ]
+    # Same key the pre-rollup version sorted by: ascending total, so biggest spend first.
+    rows.sort(key=lambda r: r.total_minor)
+    return rows
 
 
 def get_rules(session: Session) -> List[RuleRow]:
@@ -313,6 +355,21 @@ def _text_condition(text_filter: TextFilter):
     return or_(*conditions)
 
 
+def _subtree_ids(category_id: int):
+    """A recursive CTE selecting ``category_id`` and every category below it.
+
+    Filtering by a category has to match its whole subtree, not just itself, and a
+    category tree is arbitrarily deep — hence ``WITH RECURSIVE`` rather than a fixed
+    number of joins.
+    """
+    root = select(Category.id.label("id")).where(Category.id == category_id)
+    cte = root.cte(name="category_subtree", recursive=True)
+    cte = cte.union_all(
+        select(Category.id).where(Category.parent_id == cte.c.id)
+    )
+    return select(cte.c.id)
+
+
 def _txn_query(
     account_id: Optional[int],
     category_id: Optional[int],
@@ -331,7 +388,7 @@ def _txn_query(
     if category_id == UNCATEGORISED_ID:
         query = query.where(Transaction.category_id.is_(None))
     elif category_id is not None:
-        query = query.where(Transaction.category_id == category_id)
+        query = query.where(Transaction.category_id.in_(_subtree_ids(category_id)))
     if vendor_filter is not None:
         kind, vendor_id = vendor_filter
         if kind == "name":
@@ -476,6 +533,7 @@ def get_category_totals(
             total,
             outflow,
             inflow,
+            Category.parent_id,
         )
         .select_from(base)
         .join(Category, Category.id == base.c.category_id, isouter=True)
@@ -486,7 +544,7 @@ def get_category_totals(
     return [
         CategoryTotal(
             id=r[0], name=r[1], count=r[2], total_minor=r[3], outflow_minor=r[4],
-            inflow_minor=r[5],
+            inflow_minor=r[5], parent_id=r[6],
         )
         for r in rows
     ]

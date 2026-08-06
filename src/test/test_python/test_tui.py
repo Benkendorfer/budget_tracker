@@ -9,9 +9,10 @@ import datetime
 
 from textual.widgets import DataTable, Input, ListView, Static
 
-from budget_tracker import formats, queries, stats, transfers, vendors
+from budget_tracker import categories, formats, queries, stats, transfers, vendors
 from budget_tracker.db import get_engine, get_sessionmaker, init_db
 from budget_tracker.importer import import_csv, read_header_and_rows
+from budget_tracker.models import Account, Currency, Transaction
 from helpers import learn_format
 from budget_tracker.tui import TRANSFER_MARK, BudgetApp
 
@@ -885,7 +886,8 @@ def test_stats_with_an_explicit_range_skips_the_picker(tmp_path, monkeypatch):
     assert empty_rows == []  # a window with nothing in it is empty, not an error
     assert window.key == "custom"
     # 3.00 + 4.00 + 3.50 over 31 days: 1050 * 30.4375 / 31 = 1030.9 minor units a month.
-    assert rows == [["Dining", "3", "-10.50", "-10.31", "100.0%"]]
+    # The trailing "" is % parent, blank at depth 0 (identical to % spend there).
+    assert rows == [["Dining", "3", "-10.50", "-10.31", "100.0%", ""]]
     assert state[2].startswith("custom 2025-07-01→2025-07-31 3 txns")
 
 
@@ -926,7 +928,8 @@ def test_custom_row_prompts_for_a_range_and_applies_it(tmp_path, monkeypatch):
     assert "2025-01-01..2025-06-30" in asked[2]  # and shows the expected format
     assert asked[3] == "command" and asked[4] is True
     assert pending is False and prompt_visible is False  # the question is done with
-    assert state[1] is True and rows == [["Dining", "3", "-10.50", "-10.31", "100.0%"]]
+    # The trailing "" is % parent, blank at depth 0.
+    assert state[1] is True and rows == [["Dining", "3", "-10.50", "-10.31", "100.0%", ""]]
 
 
 def test_a_bad_spec_notifies_and_leaves_the_panel_alone(tmp_path, monkeypatch):
@@ -1033,12 +1036,13 @@ def test_stats_panel_rescopes_when_a_filter_changes(tmp_path, monkeypatch):
     assert len(before) == 3
     # Averages depend on the length of a window anchored to today, so this case checks
     # the scope; the fixed custom range above pins the arithmetic.
+    # The trailing "" is % parent, blank at depth 0.
     assert [row[:3] + row[4:] for row in filtered_rows] == [
-        ["Dining", "2", "-40.00", "100.0%"]
+        ["Dining", "2", "-40.00", "100.0%", ""]
     ]
     assert "2 txns" in filtered_state[2] and "out -40.00" in filtered_state[2]
     assert [row[:3] + row[4:] for row in housing_rows] == [
-        ["Housing", "1", "-1,000.00", "100.0%"]
+        ["Housing", "1", "-1,000.00", "100.0%", ""]
     ]
     assert housing_state[1] is True  # still on the stats panel throughout
 
@@ -1720,3 +1724,262 @@ def test_the_drill_down_keys_are_advertised_in_the_footer(tmp_path, monkeypatch)
     assert on_stats["right"].binding.description == "Drill down"
     assert action_for(drilled, "left") == "drill_up"
     assert drilled["left"].binding.description == "Back to stats"
+
+
+# --------------------------------------------------------------- category hierarchy
+
+
+def _seed_category_hierarchy(tmp_path, monkeypatch):
+    """``Food > Dining > {Restaurants and Fast Casual Spots, Fast Food}``, ``Food > Groceries``.
+
+    Six-figure amounts and a long leaf name, so the width guard below measures
+    something real rather than passing vacuously on a handful of seeded dollars (see
+    test_stats_status_line_fits_the_main_panel for the same concern on the status line).
+    """
+    db_path = tmp_path / "deep.db"
+    engine = get_engine(db_path)
+    init_db(engine)
+    session_factory = get_sessionmaker(engine)
+    with session_factory() as session:
+        currency = Currency(value="USD", symbol="$", decimal_places=2)
+        session.add(currency)
+        session.flush()
+        account = Account(name="Checking", currency_id=currency.id)
+        session.add(account)
+        session.flush()
+        restaurants = categories.ensure_path(
+            session, "Food > Dining > Restaurants and Fast Casual Spots"
+        )
+        fast_food = categories.ensure_path(session, "Food > Dining > Fast Food")
+        groceries = categories.ensure_path(session, "Food > Groceries")
+        session.flush()
+
+        def txn(day, amount, description, category):
+            session.add(
+                Transaction(
+                    account_id=account.id,
+                    currency_id=currency.id,
+                    posted_date=day,
+                    description=description,
+                    raw_description=description,
+                    value_minor=amount,
+                    category_id=category.id,
+                    category_source="manual",
+                    import_hash=f"deep-{description}-{day}-{amount}",
+                )
+            )
+
+        txn(datetime.date(2025, 3, 1), -12_345_678, "Big meal", restaurants)
+        txn(datetime.date(2025, 3, 2), -2_345_678, "Fast food", fast_food)
+        txn(datetime.date(2025, 3, 3), -3_456_789, "Groceries", groceries)
+        session.commit()
+    monkeypatch.setenv("BUDGET_DB", str(db_path))
+    return session_factory
+
+
+def test_stats_table_indents_by_depth_and_shows_percent_parent(tmp_path, monkeypatch):
+    _seed_category_hierarchy(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command("stats 2025-01-01..2025-12-31")
+            await pilot.pause()
+            return _stats_rows(app)
+
+    rows = asyncio.run(run())
+    names = [row[0] for row in rows]
+    # Depth-first, each parent immediately followed by its subtree, two spaces of
+    # indentation per level.
+    assert names[0] == "Food"
+    assert names[1] == "  Dining"
+    assert names[2].startswith("    Restaurants")  # truncated, but still 3 levels deep
+    assert names[3] == "    Fast Food"
+    assert names[4] == "  Groceries"
+    # % parent is blank at depth 0 (it would just repeat % spend there), and populated
+    # — and different from % spend — everywhere below it.
+    assert rows[0][4] == "100.0%" and rows[0][5] == ""  # Food
+    assert rows[1][4] == "81.0%" and rows[1][5] == "81.0%"  # Dining: Food holds nothing directly
+    assert rows[2][4] == "68.0%" and rows[2][5] == "84.0%"  # Restaurants, of Dining's total
+    assert rows[3][4] == "12.9%" and rows[3][5] == "16.0%"  # Fast Food, of Dining's total
+    assert rows[4][4] == "19.0%" and rows[4][5] == "19.0%"  # Groceries: Food holds nothing directly
+
+
+def test_stats_table_fits_the_main_panel_with_a_deep_hierarchy(tmp_path, monkeypatch):
+    """The % parent column and the deepest indentation must not push the table off-panel.
+
+    Measured against the table's own actual size, not the ~92-column estimate in the
+    add_column comment, and against a three-level hierarchy with six-figure totals — a
+    seeded ``-40.00`` a couple of levels deep would pass this even if the columns
+    genuinely did not fit.
+    """
+    _seed_category_hierarchy(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command("stats 2025-01-01..2025-12-31")
+            await pilot.pause()
+            table = app.query_one("#stats_table", DataTable)
+            widths = {str(column.label): column.width for column in table.columns.values()}
+            panel_width = table.size.width
+            return widths, panel_width, _stats_rows(app)
+
+    widths, panel_width, rows = asyncio.run(run())
+    # Six columns plus two cells of padding each have to fit inside the width Textual
+    # actually gave the table, not just the comment's estimate.
+    padding = 2 * len(widths)
+    assert sum(widths.values()) + padding <= panel_width
+    # A column too narrow for its own header clips it silently (this caught % parent
+    # needing width 8, one more than % spend, since "% parent" is eight characters).
+    for label, width in widths.items():
+        assert len(label) <= width, f"{label!r} does not fit in width {width}"
+    # The indented, truncated leaf name still respects the Category column's budget.
+    assert all(len(row[0]) <= widths["Category"] for row in rows)
+    # Every row below the top rendered a % parent value; only the root leaves it blank.
+    assert rows[0][-1] == ""
+    assert all(row[-1].endswith("%") for row in rows[1:])
+
+
+def test_categories_sidebar_indents_by_depth(tmp_path, monkeypatch):
+    """A parent's rolled-up count must read as nested, not as a flat, mysteriously
+    large category next to its own children."""
+    _seed_category_hierarchy(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            return [
+                str(item.children[0].content)
+                for item in app.query_one("#categories", ListView).children
+            ]
+
+    sidebar = asyncio.run(run())
+    food = next(label for label in sidebar if label.startswith("Food ("))
+    dining = next(label for label in sidebar if "Dining (" in label)
+    groceries = next(label for label in sidebar if "Groceries (" in label)
+    fast_food = next(label for label in sidebar if "Fast Food (" in label)
+    assert food.startswith("Food (")  # depth 0: no indentation
+    assert dining.startswith("  Dining (")  # depth 1
+    assert groceries.startswith("  Groceries (")  # depth 1
+    assert fast_food.startswith("    Fast Food (")  # depth 2
+
+
+def test_category_filter_matches_the_whole_subtree(tmp_path, monkeypatch):
+    """Filtering by a parent category has to pull in every descendant's transactions.
+
+    _txn_query's recursive CTE is supposed to guarantee this already; this pins it at
+    the level the app actually exercises it, rather than trusting the claim.
+    """
+    _seed_category_hierarchy(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            food = next(c for c in app._categories if c.name == "Food")
+            app.category_filter = food.id
+            app.reload()
+            await pilot.pause()
+            return sorted(t.description for t in app._txns)
+
+    descriptions = asyncio.run(run())
+    # Food itself holds nothing directly; all three transactions live under its
+    # descendants (Dining, Restaurants, Fast Food, Groceries).
+    assert descriptions == ["Big meal", "Fast food", "Groceries"]
+
+
+def test_category_command_builds_a_nested_path(tmp_path, monkeypatch):
+    """``Dining`` already exists (top-level, from the CSV's bank-supplied category) and
+    has transactions; ``ensure_path`` rescues it into place under the new ``Food``
+    rather than forking a duplicate (see categories._step)."""
+    _setup(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._run_command("category Food > Dining > Restaurants")
+            await pilot.pause()
+            sidebar = [
+                str(item.children[0].content)
+                for item in app.query_one("#categories", ListView).children
+            ]
+            depths = {c.name: c.depth for c in app._categories}
+            return [n.message for n in app._notifications], sidebar, depths
+
+    messages, sidebar, depths = asyncio.run(run())
+    assert any("Food > Dining > Restaurants" in m for m in messages)
+    assert depths["Food"] == 0
+    assert depths["Dining"] == 1  # rescued under Food, still carrying its 3 transactions
+    # Restaurants has no transactions of its own yet, so get_categories (rolled up)
+    # correctly omits it — this just proves the sidebar still renders, indented.
+    assert any(label.startswith("Food (") for label in sidebar)
+    assert any(label.startswith("  Dining (") for label in sidebar)
+
+
+def test_category_command_one_element_moves_to_top_level(tmp_path, monkeypatch):
+    # The fixture CSV's rows import with the bank's own top-level "Dining" category;
+    # nesting it under "Food" rescues that existing (and populated) category into place
+    # rather than creating an unrelated new one (see categories.ensure_path).
+    session_factory = _setup(tmp_path, monkeypatch)
+    with session_factory() as session:
+        categories.ensure_path(session, "Food > Dining")
+        session.commit()
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            before = next(c.depth for c in app._categories if c.name == "Dining")
+            app._run_command("category Dining")
+            await pilot.pause()
+            after = next(c.depth for c in app._categories if c.name == "Dining")
+            return before, after
+
+    before, after = asyncio.run(run())
+    assert before == 1  # nested under Food
+    assert after == 0  # moved to the top level
+
+
+def test_category_command_bare_shows_the_tree(tmp_path, monkeypatch):
+    _seed_category_hierarchy(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._run_command("category")
+            await pilot.pause()
+            list_messages = [n.message for n in app._notifications]
+
+            app._run_command("category list")
+            await pilot.pause()
+            return list_messages, [n.message for n in app._notifications]
+
+    bare_messages, list_messages = asyncio.run(run())
+    assert any("Food" in m and "Dining" in m for m in bare_messages)
+    assert any("Food" in m and "Dining" in m for m in list_messages)
+
+
+def test_category_command_reports_a_cycle_without_crashing(tmp_path, monkeypatch):
+    session_factory = _setup(tmp_path, monkeypatch)
+    with session_factory() as session:
+        categories.ensure_path(session, "Food > Dining")
+        session.commit()
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            # Food already has Dining as a child; asking to move Food under Dining
+            # (still under Food) makes Food its own descendant's descendant — a cycle.
+            app._run_command("category Food > Dining > Food")
+            await pilot.pause()
+            return (
+                [n.message for n in app._notifications],
+                app._panel,
+                next(c.depth for c in app._categories if c.name == "Food"),
+            )
+
+    messages, panel, food_depth = asyncio.run(run())
+    assert any("cycle" in m for m in messages)
+    assert panel == "txns"  # the app is still up, on the panel it started on
+    assert food_depth == 0  # the rejected move left Food where it was

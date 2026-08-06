@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 from typing import List, Optional
 
+from . import categories as categories_module
 from . import formats, queries
 from . import transfers as transfers_module
 from .db import DEFAULT_DB_PATH, get_engine, get_sessionmaker, init_db
@@ -46,6 +47,24 @@ def _resolve_format(session, path: Path):
         return formats.detect(session, fieldnames)
     except formats.UnknownFormat:
         return _setup_format(session, path, fieldnames, rows)
+
+
+def _resolve_category(session, name: str) -> Optional[int]:
+    """``--category``'s lookup: a full path (``"Food > Dining"``) or a bare name.
+
+    Routed through :func:`categories.resolve_path` rather than
+    :func:`queries.resolve_category`, which matches on a bare name with no parent
+    filter and would arbitrarily pick a match once a name can repeat across branches.
+    """
+    try:
+        category = categories_module.resolve_path(session, name)
+    except categories_module.CategoryError as error:
+        print(error)
+        return None
+    if category is None:
+        print(f"No category named {name!r}.")
+        return None
+    return category.id
 
 
 def _cmd_import(args: argparse.Namespace) -> int:
@@ -105,9 +124,8 @@ def _cmd_list(args: argparse.Namespace) -> int:
                 return 1
         category_id = None
         if args.category:
-            category_id = queries.resolve_category(session, args.category)
+            category_id = _resolve_category(session, args.category)
             if category_id is None:
-                print(f"No category named {args.category!r}.")
                 return 1
         vendor_filter = None
         if args.vendor:
@@ -241,6 +259,45 @@ def _cmd_categorize(args: argparse.Namespace) -> int:
             f"as {args.category!r}."
         )
         return 0
+
+
+def _cmd_category(args: argparse.Namespace) -> int:
+    """Build/inspect the category hierarchy itself — not which category a vendor gets.
+
+    Distinct from ``categorize``/``category-rule``, which assign an existing category
+    to transactions.
+    """
+    engine = get_engine()
+    init_db(engine)
+    session_factory = get_sessionmaker(engine)
+
+    # argparse's subparser action defaults the dest to None, which wins over the
+    # parser-level default, so a bare `budget category` arrives with nothing set.
+    command = args.category_command or "list"
+
+    with session_factory() as session:
+        if command == "add":
+            try:
+                category = categories_module.ensure_path(session, args.path)
+            except categories_module.CategoryError as error:
+                print(error)
+                return 1
+            path = categories_module.format_path(session, category)
+            session.commit()
+            print(f"{path!r} ready.")
+            return 0
+
+        rows = queries.get_categories(session)  # "list"
+
+    if not rows:
+        print(
+            "No categories yet. Add one with: "
+            "budget category add 'Food > Dining > Restaurants'"
+        )
+        return 0
+    for row in rows:
+        print(f"  {'  ' * row.depth}{row.name} ({row.count})")
+    return 0
 
 
 def _cmd_category_rule(args: argparse.Namespace) -> int:
@@ -552,7 +609,10 @@ def build_parser() -> argparse.ArgumentParser:
     list_parser.add_argument(
         "--vendor", help="Filter by vendor (raw name or override display name)."
     )
-    list_parser.add_argument("--category", help="Filter by category name.")
+    list_parser.add_argument(
+        "--category",
+        help="Filter by category name, or a full path (e.g. 'Food > Dining').",
+    )
     list_parser.add_argument(
         "--search", help="Case-insensitive substring to look for."
     )
@@ -610,6 +670,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="Undo a manual category instead of setting one.",
     )
     categorize_parser.set_defaults(func=_cmd_categorize)
+
+    category_parser = subparsers.add_parser(
+        "category",
+        help="Build the category hierarchy itself (parent > child nesting).",
+    )
+    category_parser.set_defaults(func=_cmd_category, category_command="list")
+    category_subparsers = category_parser.add_subparsers(dest="category_command")
+
+    category_add = category_subparsers.add_parser(
+        "add",
+        help="Create/move a category into place, creating any missing levels.",
+    )
+    category_add.add_argument(
+        "path",
+        help=(
+            "Category path, e.g. 'Food > Dining > Restaurants'. A single name moves "
+            "that category to the top level."
+        ),
+    )
+
+    category_subparsers.add_parser("list", help="Show the category tree, indented (default).")
 
     category_rule_parser = subparsers.add_parser(
         "category-rule", help="Manage pattern-based categorisation rules."

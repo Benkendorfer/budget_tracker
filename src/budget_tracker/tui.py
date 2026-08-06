@@ -195,8 +195,8 @@ class BudgetApp(App):
                 yield Static("", id="status")
         yield Input(
             placeholder=(
-                "command: import | filter | categorize | stats | rules | all | "
-                "refresh | help | quit"
+                "command: import | filter | categorize | category | stats | rules | "
+                "all | refresh | help | quit"
             ),
             id="command",
         )
@@ -266,8 +266,10 @@ class BudgetApp(App):
         stats_table = self.query_one("#stats_table", DataTable)
         stats_table.cursor_type = "row"
         stats_table.zebra_stripes = True
-        # 26 + 5 + 12 + 12 + 7 plus two cells of padding each: 74 of the ~92 the main
-        # panel has beside the 36-wide sidebar, so Share is never pushed off-screen.
+        # 26 + 5 + 12 + 12 + 7 + 8 plus two cells of padding each: 82 of the ~92 the main
+        # panel has beside the 36-wide sidebar, so neither share column is pushed
+        # off-screen (see test_stats_table_fits_the_main_panel). % parent needs width 8,
+        # not 7 like % spend, or its own 8-character header ("% parent") clips.
         stats_table.add_column("Category", width=26)
         stats_table.add_column("Txns", width=5)
         stats_table.add_column("Total", width=12)
@@ -275,6 +277,9 @@ class BudgetApp(App):
         # Named for what it is a share *of*: income rows sit in the same table, and a
         # "Share" beside a positive total invites reading it as a share of that.
         stats_table.add_column("% spend", width=7)
+        # This row's outflow as a fraction of its *parent's* rolled-up outflow — blank at
+        # depth 0, where it would just repeat "% spend" (see stats.CategoryStat.parent_share).
+        stats_table.add_column("% parent", width=8)
         self.query_one("#stats", Vertical).display = False
         self.query_one("#prompt", Static).display = False
 
@@ -309,7 +314,10 @@ class BudgetApp(App):
         self._fill_list("#vendors", [f"{v.name} ({v.count})" for v in self._vendors])
         self._fill_list(
             "#categories",
-            [f"{c.name} ({c.count})  {_fmt_amount(c.total_minor)}" for c in self._categories],
+            [
+                f"{'  ' * c.depth}{c.name} ({c.count})  {_fmt_amount(c.total_minor)}"
+                for c in self._categories
+            ],
         )
         self._fill_txns(txns)
         self._fill_rules()
@@ -392,14 +400,20 @@ class BudgetApp(App):
         if self._report is None:
             return
         for stat in self._report.categories:
+            # Blank at depth 0: parent_share is identical to share there by construction
+            # (see stats.CategoryStat.parent_share), so printing it twice is noise.
+            parent_pct = (
+                "" if stat.depth == 0 else f"{abs(stat.parent_share) * 100:.1f}%"
+            )
             table.add_row(
-                _truncate(stat.name, 26),
+                _truncate("  " * stat.depth + stat.name, 26),
                 Text(str(stat.count), justify="right"),
                 _amount_cell(stat.total_minor),
                 _amount_cell(stat.avg_month_minor),
                 # Shares are a fraction of a negative outflow, so a category that spent
                 # nothing comes out as -0.0; abs() keeps that off the screen.
                 Text(f"{abs(stat.share) * 100:.1f}%", justify="right"),
+                Text(parent_pct, justify="right"),
             )
 
     def _fill_periods(self) -> None:
@@ -802,6 +816,8 @@ class BudgetApp(App):
             self._show_rules()
         elif name in {"categorize", "categorise", "cat"}:
             self._do_categorize(arg)
+        elif name == "category":
+            self._do_category(arg)
         elif name == "transfers":
             self._do_transfers(arg)
         elif name == "merge":
@@ -824,6 +840,10 @@ class BudgetApp(App):
                 "categorize rule <pattern> = <category> — categorise every matching\n"
                 "  vendor, now and on future imports\n"
                 "categorize rules — list the rules you have defined (escape returns)\n"
+                "category Food > Dining > Restaurants — build/move a category into\n"
+                "  that spot, creating any missing levels\n"
+                "category Dining — move an existing category to the top level\n"
+                "category | category list — show the category tree, indented\n"
                 "transfers [reset] — pair up movements between your own accounts\n"
                 "merge <account> = <account> — fold one account into another\n"
                 "filter <text> — search description, vendor, and raw name\n"
@@ -1101,6 +1121,35 @@ class BudgetApp(App):
         self.notify(
             f"{pattern!r} → {value!r} ({changed} transactions categorised)", markup=False
         )
+
+    def _do_category(self, arg: str) -> None:
+        """``category <path>`` builds/moves a category; bare or ``list`` shows the tree.
+
+        Distinct from ``categorize``: this manages the category hierarchy itself
+        (creating, nesting, re-parenting), not which category a vendor's transactions
+        get. A one-element path is a move to the top level (:func:`categories.ensure_path`).
+        """
+        arg = arg.strip()
+        if not arg or arg.lower() == "list":
+            self._notify_category_tree()
+            return
+        with self.session_factory() as session:
+            try:
+                category = categories.ensure_path(session, arg)
+                path = categories.format_path(session, category)
+            except categories.CategoryError as error:
+                self.notify(str(error), severity="warning", markup=False)
+                return
+            session.commit()
+        self.reload()
+        self.notify(f"{path!r} ready.", markup=False)
+
+    def _notify_category_tree(self) -> None:
+        if not self._categories:
+            self.notify("No categories yet. Add one with: category Food > Dining")
+            return
+        lines = [f"{'  ' * c.depth}{c.name} ({c.count})" for c in self._categories]
+        self.notify("\n".join(lines), title="Categories", markup=False, timeout=8)
 
     # ------------------------------------------------------------- drill-down
     def _drill_into_category(self, row: int) -> None:

@@ -117,3 +117,59 @@ def test_category_rule_apply_re_runs_every_rule(tmp_path, monkeypatch, capsys):
     assert cli.main(["category-rule", "apply"]) == 0
     assert "Applied 1 rules; 1 transactions updated" in capsys.readouterr().out
     assert _categories_of(session_factory) == ["Coffee", "Dining", "Dining"]
+
+
+# ------------------------------------------------------ category hierarchy (nesting)
+
+
+def test_category_add_builds_a_nested_path(tmp_path, monkeypatch, capsys):
+    _setup(tmp_path, monkeypatch)
+
+    assert cli.main(["category", "add", "Food > Dining > Restaurants"]) == 0
+    assert "'Food > Dining > Restaurants' ready." in capsys.readouterr().out
+
+
+def test_category_list_shows_the_tree_indented(tmp_path, monkeypatch, capsys):
+    session_factory = _setup(tmp_path, monkeypatch)
+    with session_factory() as session:
+        # "Dining" already exists (the bank's own top-level category, with the CSV's
+        # three transactions); nesting it rescues it into place rather than forking.
+        categories.ensure_path(session, "Food > Dining")
+        session.commit()
+
+    assert cli.main(["category"]) == 0  # bare command defaults to "list"
+    out = capsys.readouterr().out
+    assert "Food (3)" in out
+    assert "  Dining (3)" in out  # indented one level under Food
+
+
+def test_category_add_reports_a_cycle_without_crashing(tmp_path, monkeypatch, capsys):
+    session_factory = _setup(tmp_path, monkeypatch)
+    with session_factory() as session:
+        categories.ensure_path(session, "Food > Dining")
+        session.commit()
+
+    # Food already has Dining as a child; moving Food under Dining (still under Food)
+    # makes Food its own descendant's descendant.
+    assert cli.main(["category", "add", "Food > Dining > Food"]) == 1
+    assert "cycle" in capsys.readouterr().out
+
+
+def test_list_dash_dash_category_resolves_a_full_path(tmp_path, monkeypatch, capsys):
+    """``--category`` is routed through categories.resolve_path, so a nested category
+    is reachable by its full path, not just a bare top-level name."""
+    session_factory = _setup(tmp_path, monkeypatch)
+    with session_factory() as session:
+        categories.ensure_path(session, "Food > Dining")
+        session.commit()
+
+    assert cli.main(["list", "--category", "Food > Dining"]) == 0
+    out = capsys.readouterr().out
+    assert "3 txns" in out
+
+
+def test_list_dash_dash_category_reports_an_unknown_name(tmp_path, monkeypatch, capsys):
+    _setup(tmp_path, monkeypatch)
+
+    assert cli.main(["list", "--category", "Nope"]) == 1
+    assert "No category named 'Nope'" in capsys.readouterr().out

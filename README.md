@@ -12,6 +12,7 @@
     - [Renaming and grouping vendors](#renaming-and-grouping-vendors)
     - [Vendor rename rules](#vendor-rename-rules)
     - [Categorising transactions](#categorising-transactions)
+    - [Nesting categories](#nesting-categories)
     - [Statistics](#statistics)
     - [Transfers between your own accounts](#transfers-between-your-own-accounts)
     - [Importing data](#importing-data)
@@ -71,6 +72,9 @@ the bottom:
 | `categorize <vendor> =` | Undo a manual category |
 | `categorize rule <pattern> = <category>` | Categorise every matching vendor, now and in future imports |
 | `categorize rules` | Open the rules panel (`categorize` on its own does the same) |
+| `category Food > Dining > Restaurants` | Build/move a category into that spot, creating any missing levels (see below) |
+| `category Dining` | Move an existing category to the top level |
+| `category` / `category list` | Show the category tree, indented |
 | `filter <text>` | Search description, vendor name, and raw vendor name |
 | `filter <field>:<text>` | Search one of `description`, `vendor`, `raw` |
 | `filter` | Clear the text filter |
@@ -111,6 +115,7 @@ budget import --account "Checking" ~/Downloads/checking.csv
 budget list
 budget list --account "Card 8207" --limit 100
 budget list --category Dining
+budget list --category "Food > Dining"   # a full path, once categories are nested
 budget list --vendor Coffee          # accepts a raw name or an override name
 budget list --search cava            # substring, across all three text fields
 budget list --search Kindle --search-in vendor
@@ -127,6 +132,12 @@ budget category-rule add "*COFFEE*" "Dining"
 budget category-rule list
 budget category-rule remove "*COFFEE*"
 budget category-rule apply
+
+# Build the category hierarchy itself — nest, create missing levels, or move a
+# category to the top level (see "Nesting categories" below).
+budget category add "Food > Dining > Restaurants"
+budget category add "Dining"          # a single name moves it to the top level
+budget category list                  # the tree, indented (default with no subcommand)
 
 # Pair up money moved between your own accounts.
 budget transfers --days 5
@@ -274,12 +285,55 @@ uncategorised — the vendor is not remembered, only its transactions were chang
 a rule for anything recurring, and keep manual categories for one-offs and for the rows
 where a rule gets it wrong.
 
+### Nesting categories
+
+Categories can be arranged into a tree — `Food`, with `Dining` under it, with
+`Restaurants` and `Fast Food` under that — so spending rolls up: filtering or reporting
+on `Food` includes everything in `Dining` and its own children too. This is separate from
+`categorize`/`category-rule` above, which assign an *existing* category to a vendor's
+transactions; `category` builds the tree those categories live in.
+
+```bash
+budget category add "Food > Dining > Restaurants"   # creates any missing levels
+budget category add "Dining"                        # a single name moves it to the top
+budget category list                                # the tree, indented
+```
+
+In the app the same three are `category Food > Dining > Restaurants`, `category Dining`,
+and a bare `category` (or `category list`). A path segment that already exists is reused
+rather than duplicated, and — as a convenience for the common case of nesting a category
+that already has transactions — a top-level category matching the last segment's name is
+rescued into place instead of forking a second one with the same name. Moving a category
+under its own descendant is refused (`category Dining > Food` when `Food` already contains
+`Dining` reports the cycle rather than crashing).
+
+Filtering by a category — from the sidebar, `filter`, `budget list --category`, or a
+statistics drill-down — already matches its whole subtree, so clicking `Food` shows
+`Dining`'s transactions too. The sidebar and the `category` command indent by depth so a
+parent's rolled-up count reads as nested, not as a flat category with a mysteriously large
+number next to its own children.
+
+A category name only has to be unique among its own siblings, so `Food > Other` and
+`Travel > Other` can coexist. `budget list --category` and the `category` command both
+accept either a bare name or a full path (`"Food > Dining"`, using `>` as the separator).
+
 ### Statistics
 
 `stats` opens a list of time windows — 1 month, 3 months, 6 months, 1 year, 2 years, or a
 custom range — and shows what you spent per category over the one you pick, with an
 average per month beside each total. `stats 6m` or `stats 2025-01-01..2025-06-30` skips
 the list. `escape` returns to the transactions.
+
+Nested categories are indented and listed depth-first — a parent immediately followed by
+its own subtree, biggest spender first at each level — and every row's totals are rolled
+up to include its descendants, so `Food`'s row already includes everything spent under
+`Dining`. **`% spend`** is always a share of the whole window's spending; **`% parent`** is
+a share of the *parent's rolled-up* total instead, so you can see how a subcategory splits
+within its parent rather than within the whole budget. It is left blank at the top level,
+where it would just repeat `% spend`. Because a parent's rolled-up total also includes
+whatever it holds directly (not just its children), a parent's own children's `% parent`
+values sum to 100% only when the parent has no transactions of its own — otherwise they
+sum to a bit less, the remainder being the parent's own share of itself.
 
 Windows end **today**, not at your most recent transaction, so a window that looks thin is
 telling you the imports are stale rather than quietly hiding the gap. The status line
