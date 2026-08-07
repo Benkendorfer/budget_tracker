@@ -131,14 +131,20 @@ def _normalize_amount(raw: str) -> Decimal:
 
 
 def _parse_amount_minor(debit: str, credit: str, decimal_places: int) -> int:
-    """Signed minor units: debit (charge) negative, credit (payment) positive."""
+    """Signed minor units: debit (charge) negative, credit (payment) positive.
+
+    The *column* decides the direction, not the value's own sign. Most providers write a
+    bare magnitude in each column, but some write the debit already negated; negating
+    that again turned an outflow into income, which looks plausible on screen rather than
+    obviously broken. Taking the magnitude reads both conventions the same way.
+    """
     scale = 10 ** decimal_places
     debit = (debit or "").strip()
     credit = (credit or "").strip()
     if debit:
-        return -int((_normalize_amount(debit) * scale).to_integral_value())
+        return -abs(int((_normalize_amount(debit) * scale).to_integral_value()))
     if credit:
-        return int((_normalize_amount(credit) * scale).to_integral_value())
+        return abs(int((_normalize_amount(credit) * scale).to_integral_value()))
     return 0
 
 
@@ -163,6 +169,19 @@ def _row_hash(*parts) -> str:
     """
     raw = "|".join(str(part) for part in parts)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _is_blank(row: Dict[str, str]) -> bool:
+    """True when every field in the row is empty.
+
+    A row with more fields than the header puts the surplus under csv's ``restkey`` as a
+    *list*, not a string, so this cannot assume the values are all strings.
+    """
+    for value in row.values():
+        values = value if isinstance(value, list) else [value]
+        if any((item or "").strip() for item in values):
+            return False
+    return True
 
 
 def _parse_date(value: str, date_formats: Sequence[str]) -> date:
@@ -281,6 +300,11 @@ def import_csv(
         return (row.get(column) or "").strip() if column else ""
 
     for row in rows:
+        # A spreadsheet round-trip leaves rows of bare commas behind, and csv reads one
+        # as a dict of empty strings rather than as nothing. Importing it would fail on
+        # the empty date, blaming the date format for a row that holds no data at all.
+        if _is_blank(row):
+            continue
         description = cell(row, fmt.description_column)
         bank_category = cell(row, fmt.category_column)
 

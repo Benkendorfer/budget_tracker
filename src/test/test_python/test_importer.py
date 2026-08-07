@@ -132,6 +132,15 @@ CURRENCY_CARD_CSV = """Transaction Date,Posted Date,Card No.,Description,Amount
 2026-07-03,2026-07-04,1234,PAYMENT RECEIVED,"-$1,000.00"
 """
 
+# Compact dates, a debit column that is already negative, a blank row left behind by a
+# spreadsheet, and the trailing empty columns such an edit pads every line with.
+COMPACT_LEDGER_CSV = """Posting Date,Description,Debit,Credit,,
+,,,,,
+20260722,TRANSFER IN,,200,,
+20260727,TRANSFER OUT,-100,,,
+20260804,FEE,25,,,
+"""
+
 # Two legs of one transfer, in separate files as separate accounts would export them.
 XFER_OUT_CSV = """Transaction Date,Posted Date,Card No.,Description,Amount
 2026-07-01,2026-07-02,CHK,TRANSFER TO CARD,-100.00
@@ -231,6 +240,44 @@ def test_import_handles_currency_formatted_amounts(tmp_path):
         "1234", "2026-07-01", "2026-07-02", "COFFEE SHOP", "$617.66", 0
     )
     assert expected in hashes  # the literal "$" is in the hash, not the parsed amount
+
+
+def test_import_skips_blank_rows_and_reads_a_signed_debit_column(tmp_path):
+    """Three things a real broker export brought at once.
+
+    A row of bare commas survives a spreadsheet round-trip and csv reads it as a dict of
+    empty strings, so it used to reach the date parser and fail there — blaming the date
+    format for a row holding no data. Dates come as eight bare digits. And the debit
+    column is *already* negative, which the old code negated again, turning a 100.00
+    outflow into 100.00 of income: plausible on screen rather than obviously broken.
+    """
+    session_factory = _session_factory(tmp_path)
+    path = _write(tmp_path, "ledger.csv", COMPACT_LEDGER_CSV)
+    fieldnames, rows = read_header_and_rows(path)
+    inference = formats.infer("ledger", fieldnames, rows)
+    # Nothing to ask: a debit/credit pair settles polarity, and %Y%m%d now infers.
+    assert inference.values["date_formats"] == ["%Y%m%d"]
+    assert formats.remaining_questions(inference.values, rows, fieldnames) == []
+
+    with session_factory() as session:
+        formats.save_format(
+            session,
+            formats.from_dict({
+                **inference.values,
+                "signature": list(fieldnames),
+                "dedup_columns": ["Posting Date", "Description", "Debit", "Credit"],
+            }),
+        )
+        session.commit()
+        result = import_csv(session, path, account_name="Brokerage")
+
+    assert result.inserted == 3  # the blank row is not a transaction
+    with session_factory() as session:
+        amounts = {t.description: t.amount_minor for t in queries.get_transactions(session)}
+    assert amounts == {"TRANSFER IN": 20000, "TRANSFER OUT": -10000, "FEE": -2500}
+    # The column decides the direction: a debit is an outflow whether the provider
+    # writes "-100" or "25".
+    assert sum(amounts.values()) == 7500
 
 
 # ------------------------------------------------------------------------ delete_import

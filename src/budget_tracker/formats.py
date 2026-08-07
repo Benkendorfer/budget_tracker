@@ -234,6 +234,9 @@ _ID_PATTERNS = (r".*transaction\s*id.*", r"id", r".*reference.*(no|number|id)?.*
 _DATE_CANDIDATES = (
     "%Y-%m-%d",
     "%Y/%m/%d",
+    # Compact ISO, common in broker exports. Unambiguous: no other candidate here parses
+    # eight bare digits, so it cannot shadow one of the separator-bearing formats.
+    "%Y%m%d",
     "%m/%d/%Y",
     "%d/%m/%Y",
     "%m-%d-%Y",
