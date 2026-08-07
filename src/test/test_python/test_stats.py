@@ -1,6 +1,6 @@
 """Tests for time windows and the statistics report."""
 
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 
 import pytest
@@ -1180,3 +1180,64 @@ def test_filters_replace_swaps_one_field_and_leaves_the_rest_untouched():
     assert swapped.date_range == new_range
     # frozen: the original is untouched by replace()
     assert original.date_range is None
+
+
+def test_conversion_does_not_query_per_transaction_group(tmp_path):
+    """A guard on the query count, because the cost was invisible in the results.
+
+    Every rate lookup used to cost six queries -- three sources, direct and inverse --
+    and an aggregate asks once per (currency, day) group. On a real database that was
+    6,356 queries for one get_totals and over 18,000 for a single keypress, all of it
+    reading a table of a few hundred rows. The figures were right the whole time, which
+    is exactly why nothing caught it.
+    """
+    from sqlalchemy import event
+    from sqlalchemy.engine import Engine
+
+    from budget_tracker import rates
+
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        currency, accounts, _ = _seed(session, account_names=("US", "CH"))
+        chf = Currency(value="CHF", symbol="CHF", decimal_places=2)
+        session.add(chf)
+        session.flush()
+        accounts["CH"].currency_id = chf.id
+        # Many distinct days, so a per-group lookup would be obvious in the count.
+        for offset in range(40):
+            day = date(2026, 1, 1) + timedelta(days=offset)
+            _txn(session, currency, accounts["US"], day, -100, f"us{offset}")
+            txn = _txn(session, chf, accounts["CH"], day, -200, f"ch{offset}")
+            txn.currency_id = chf.id
+            rates.record_rate(session, day, "USD", "CHF", Decimal("0.9"), rates.ECB)
+        session.commit()
+
+    counted = []
+    listener = lambda *args, **kwargs: counted.append(1)  # noqa: E731
+    event.listen(Engine, "before_cursor_execute", listener)
+    try:
+        with session_factory() as session:
+            totals = queries.get_totals(session)
+    finally:
+        event.remove(Engine, "before_cursor_execute", listener)
+
+    assert totals.unconverted_count == 0
+    # 80 transactions over 40 days in two currencies. A per-group lookup would be in the
+    # hundreds; the whole rate table is read once instead.
+    assert len(counted) < 20, f"{len(counted)} queries for one get_totals"
+
+
+def test_a_rate_recorded_in_this_session_is_seen_by_the_next_lookup(tmp_path):
+    """The rate table is held for the life of a session, so writing one has to drop it.
+    An import records the rates it witnessed and then converts using them."""
+    from decimal import Decimal as D
+
+    from budget_tracker import rates
+
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        assert rates.rate_on(session, date(2026, 3, 2), "USD", "CHF") is None
+        rates.record_rate(session, date(2026, 3, 1), "USD", "CHF", D("0.8"), rates.ECB)
+        assert rates.rate_on(session, date(2026, 3, 2), "USD", "CHF") == D("0.8")
+        rates.record_rate(session, date(2026, 3, 2), "USD", "CHF", D("0.9"), rates.MANUAL)
+        assert rates.rate_on(session, date(2026, 3, 2), "USD", "CHF") == D("0.9")

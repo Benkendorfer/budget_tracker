@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import urllib.request
 from dataclasses import dataclass, field
+from bisect import bisect_right
 from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_EVEN, localcontext
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -64,6 +65,7 @@ def record_rate(
     else:
         row.rate = rate_text
     session.flush()
+    _forget_rate_book(session)
     return row
 
 
@@ -85,20 +87,59 @@ def record_observed(
 
 # --------------------------------------------------------------------------- lookup
 
+# Where the whole rate table is parked for the life of one session. Sessions here are
+# short (``with self.session_factory() as session:``), so this is scoped exactly right:
+# it cannot go stale across a commit, and it dies with the session.
+_BOOK_KEY = "_rate_book"
+
+
+def _load_rate_book(session: Session) -> Dict[Tuple[str, str, str], Tuple[List[date], List[str]]]:
+    """Every rate, indexed by ``(source, base, quote)`` and sorted by day.
+
+    One query for the lot. Looking each rate up individually costs six queries -- three
+    sources, direct and inverse -- and an aggregate asks once per (currency, day) group,
+    so a couple of years of two currencies came to **6,356 queries for a single
+    get_totals** and eighteen thousand for one keypress. The whole table is a few
+    hundred rows and is read far more often than it is written, so holding it is both
+    cheaper and simpler than making the per-lookup query smarter.
+    """
+    book: Dict[Tuple[str, str, str], Tuple[List[date], List[str]]] = {}
+    for row in session.scalars(select(ExchangeRate).order_by(ExchangeRate.day)):
+        days, values = book.setdefault((row.source, row.base, row.quote), ([], []))
+        days.append(row.day)
+        values.append(row.rate)
+    return book
+
+
+def _rate_book(session: Session):
+    book = session.info.get(_BOOK_KEY)
+    if book is None:
+        book = _load_rate_book(session)
+        session.info[_BOOK_KEY] = book
+    return book
+
+
+def _forget_rate_book(session: Session) -> None:
+    """Drop the cached table so a rate written in this session is seen by the next read."""
+    session.info.pop(_BOOK_KEY, None)
+
+
 def _most_recent_on_or_before(
     session: Session, day: date, base: str, quote: str, source: str
-) -> Optional[ExchangeRate]:
-    return session.scalar(
-        select(ExchangeRate)
-        .where(
-            ExchangeRate.source == source,
-            ExchangeRate.base == base,
-            ExchangeRate.quote == quote,
-            ExchangeRate.day <= day,
-        )
-        .order_by(ExchangeRate.day.desc())
-        .limit(1)
-    )
+) -> Optional[Tuple[date, str]]:
+    """``(day, rate)`` of the newest rate on or before ``day``, or None.
+
+    Resolved against the in-memory book by binary search rather than by a query per
+    lookup. The ordering and the on-or-before rule are exactly what the SQL did.
+    """
+    entry = _rate_book(session).get((source, base, quote))
+    if entry is None:
+        return None
+    days, values = entry
+    index = bisect_right(days, day)
+    if index == 0:
+        return None
+    return days[index - 1], values[index - 1]
 
 
 def _best_for_source(
@@ -115,15 +156,15 @@ def _best_for_source(
     if direct is None and inverse is None:
         return None
     # A tie on date prefers the direct row: no division, so no precision to lose.
-    if direct is not None and (inverse is None or direct.day >= inverse.day):
-        return direct.day, Decimal(direct.rate)
+    if direct is not None and (inverse is None or direct[0] >= inverse[0]):
+        return direct[0], Decimal(direct[1])
     # Division precision: 28 significant digits (Python decimal's default context) is
     # far more than any currency pair needs — rates run to at most six or seven
     # significant digits — but it keeps this inversion from being the place precision
     # is lost, leaving that entirely to convert()'s final, deliberate rounding step.
     with localcontext() as ctx:
         ctx.prec = 28
-        return inverse.day, Decimal(1) / Decimal(inverse.rate)
+        return inverse[0], Decimal(1) / Decimal(inverse[1])
 
 
 def rate_on(session: Session, day: date, base: str, quote: str) -> Optional[Decimal]:
@@ -161,11 +202,27 @@ def rate_on(session: Session, day: date, base: str, quote: str) -> Optional[Deci
     return best_rate
 
 
+_PLACES_KEY = "_decimal_places"
+
+
 def _decimal_places(session: Session, code: str) -> int:
-    places = session.scalar(select(Currency.decimal_places).where(Currency.value == code))
-    if places is None:
-        raise ValueError(f"Unknown currency {code!r}: no currency row to read decimal_places from.")
-    return places
+    """How many minor units a currency has, cached for the life of the session.
+
+    A handful of rows, asked once per conversion -- nearly five thousand times for a
+    single keypress before this. Currencies are effectively immutable once created, so
+    caching them for a short-lived session costs nothing in freshness.
+    """
+    cache = session.info.setdefault(_PLACES_KEY, {})
+    if code not in cache:
+        places = session.scalar(
+            select(Currency.decimal_places).where(Currency.value == code)
+        )
+        if places is None:
+            raise ValueError(
+                f"Unknown currency {code!r}: no currency row to read decimal_places from."
+            )
+        cache[code] = places
+    return cache[code]
 
 
 def convert(
