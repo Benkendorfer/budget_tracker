@@ -965,3 +965,218 @@ def test_build_report_and_spending_series_surface_the_unconverted_count(tmp_path
     # The bucket itself still shows the transaction was there, just without its money.
     assert [s.count for s in series] == [2]
     assert [s.outflow_minor for s in series] == [-2000]
+
+
+# ---------------------------------------------------------------- the Filters object
+
+def _seed_for_filters(session):
+    """Two accounts and a category, with one transaction matching every filter field
+    at once and one that matches none of them -- so a wrong filter changes the result.
+    """
+    currency, accounts, cats = _seed(
+        session, account_names=("Checking", "Card"), category_names=("Dining",)
+    )
+    vendor = Vendor(name="Coffee Shop")
+    session.add(vendor)
+    session.flush()
+    hit = _txn(session, currency, accounts["Checking"], date(2025, 3, 15), -2500,
+               "Coffee shop", category=cats["Dining"])
+    hit.vendor_id = vendor.id
+    _txn(session, currency, accounts["Card"], date(2025, 3, 16), -7500, "Hardware")
+    session.commit()
+    return accounts, cats, vendor
+
+
+def test_get_transactions_filters_object_matches_individual_arguments(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        accounts, cats, vendor = _seed_for_filters(session)
+        account_id = accounts["Checking"].id
+        category_id = cats["Dining"].id
+        vendor_filter = ("raw", vendor.id)
+        text_filter = queries.TextFilter("coffee")
+        date_range = (date(2025, 3, 1), date(2025, 3, 31))
+        session.commit()
+
+    with session_factory() as session:
+        by_args = queries.get_transactions(
+            session, account_id, category_id, vendor_filter,
+            text_filter=text_filter, date_range=date_range,
+        )
+    with session_factory() as session:
+        by_filters = queries.get_transactions(
+            session,
+            filters=queries.Filters(
+                account_id=account_id, category_id=category_id,
+                vendor_filter=vendor_filter, text_filter=text_filter,
+                date_range=date_range,
+            ),
+        )
+
+    assert len(by_args) == 1
+    assert by_args == by_filters
+
+
+def test_get_totals_filters_object_matches_individual_arguments(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        accounts, cats, vendor = _seed_for_filters(session)
+        account_id = accounts["Checking"].id
+
+    with session_factory() as session:
+        by_args = queries.get_totals(session, account_id)
+    with session_factory() as session:
+        by_filters = queries.get_totals(
+            session, filters=queries.Filters(account_id=account_id)
+        )
+
+    assert by_args.count == 1
+    assert by_args == by_filters
+
+
+def test_get_category_totals_filters_object_matches_individual_arguments(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        accounts, cats, vendor = _seed_for_filters(session)
+        text_filter = queries.TextFilter("coffee")
+
+    with session_factory() as session:
+        by_args = queries.get_category_totals(session, text_filter=text_filter)
+    with session_factory() as session:
+        by_filters = queries.get_category_totals(
+            session, filters=queries.Filters(text_filter=text_filter)
+        )
+
+    assert len(by_args) == 1
+    assert by_args == by_filters
+
+
+def test_get_bucket_totals_filters_object_matches_individual_arguments(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        accounts, cats, vendor = _seed_for_filters(session)
+        date_range = (date(2025, 3, 1), date(2025, 3, 31))
+
+    with session_factory() as session:
+        by_args = queries.get_bucket_totals(session, "day", date_range=date_range)
+    with session_factory() as session:
+        by_filters = queries.get_bucket_totals(
+            session, "day", filters=queries.Filters(date_range=date_range)
+        )
+
+    assert len(by_args) == 2
+    assert by_args == by_filters
+
+
+def test_build_report_filters_object_matches_individual_arguments(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        accounts, cats, vendor = _seed_for_filters(session)
+        account_id = accounts["Checking"].id
+        category_id = cats["Dining"].id
+
+    window = _custom("2025-03-01", "2025-03-31")
+    with session_factory() as session:
+        by_args = stats.build_report(
+            session, window, account_id=account_id, category_id=category_id
+        )
+    with session_factory() as session:
+        by_filters = stats.build_report(
+            session, window,
+            filters=queries.Filters(account_id=account_id, category_id=category_id),
+        )
+
+    assert by_args.count == 1
+    assert by_args == by_filters
+
+
+def test_spending_series_filters_object_matches_individual_arguments(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        accounts, cats, vendor = _seed_for_filters(session)
+        account_id = accounts["Checking"].id
+
+    window = _custom("2025-03-01", "2025-03-31")
+    with session_factory() as session:
+        by_args = stats.spending_series(session, window, "day", account_id=account_id)
+    with session_factory() as session:
+        by_filters = stats.spending_series(
+            session, window, "day", filters=queries.Filters(account_id=account_id)
+        )
+
+    assert by_args == by_filters
+    assert sum(b.count for b in by_args) == 1
+
+
+def test_no_filters_at_all_is_unchanged(tmp_path):
+    """Neither the individual arguments nor ``filters`` given at all -- the default --
+    still means "everything", and is identical to passing an explicitly empty Filters.
+    """
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        _seed_for_filters(session)
+
+    window = _custom("2025-03-01", "2025-03-31")
+    with session_factory() as session:
+        default = stats.build_report(session, window)
+        explicit_empty = stats.build_report(session, window, filters=queries.Filters())
+
+    assert default.count == 2
+    assert default == explicit_empty
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda session, filters: queries.get_transactions(
+            session, account_id=1, filters=filters
+        ),
+        lambda session, filters: queries.get_totals(session, account_id=1, filters=filters),
+        lambda session, filters: queries.get_category_totals(
+            session, account_id=1, filters=filters
+        ),
+        lambda session, filters: queries.get_bucket_totals(
+            session, account_id=1, filters=filters
+        ),
+    ],
+)
+def test_passing_both_filters_and_individual_arguments_is_rejected(tmp_path, call):
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        with pytest.raises(ValueError, match="account_id"):
+            call(session, queries.Filters(category_id=2))
+
+
+def test_build_report_rejects_both_filters_and_individual_arguments(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    window = _custom("2025-03-01", "2025-03-31")
+    with session_factory() as session:
+        with pytest.raises(ValueError, match="account_id"):
+            stats.build_report(
+                session, window, account_id=1, filters=queries.Filters(category_id=2)
+            )
+
+
+def test_spending_series_rejects_both_filters_and_individual_arguments(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    window = _custom("2025-03-01", "2025-03-31")
+    with session_factory() as session:
+        with pytest.raises(ValueError, match="account_id"):
+            stats.spending_series(
+                session, window, "month", account_id=1, filters=queries.Filters(category_id=2)
+            )
+
+
+def test_filters_replace_swaps_one_field_and_leaves_the_rest_untouched():
+    original = queries.Filters(
+        account_id=1, category_id=2, text_filter=queries.TextFilter("x")
+    )
+    new_range = (date(2025, 1, 1), date(2025, 1, 31))
+    swapped = original.replace(date_range=new_range)
+
+    assert swapped.account_id == 1
+    assert swapped.category_id == 2
+    assert swapped.text_filter == queries.TextFilter("x")
+    assert swapped.date_range == new_range
+    # frozen: the original is untouched by replace()
+    assert original.date_range is None

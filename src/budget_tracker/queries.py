@@ -11,7 +11,7 @@ matches a single un-overridden vendor.
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -79,6 +79,72 @@ class TextFilter:
             raise ValueError(
                 f"Unknown search field {self.field!r}; expected one of {list(TEXT_FIELDS)}."
             )
+
+
+@dataclass(frozen=True)
+class Filters:
+    """The five filters that are always passed together and always mean the same thing:
+    which transactions a query, report, or series should be scoped to.
+
+    Every field defaults to ``None`` (no restriction), matching what leaving the
+    corresponding keyword argument off already meant. Bundling them stops a sixth filter
+    (``home_currency`` was almost one) from having to be threaded through eight
+    signatures individually -- see ``resolve_filters`` for how a function accepts either
+    this or its old individual arguments without the two being able to disagree.
+    """
+
+    account_id: Optional[int] = None
+    category_id: Optional[int] = None
+    vendor_filter: Optional[VendorFilter] = None
+    text_filter: Optional[TextFilter] = None
+    date_range: Optional[DateRange] = None
+
+    def replace(self, **changes) -> "Filters":
+        """The same filters with one or more fields swapped out.
+
+        For a drill-down that keeps everything but the date range (or a click that keeps
+        everything but adds a category), e.g. ``filters.replace(date_range=new_range)``.
+        """
+        return replace(self, **changes)
+
+
+def resolve_filters(
+    filters: Optional[Filters],
+    account_id: Optional[int],
+    category_id: Optional[int],
+    vendor_filter: Optional[VendorFilter],
+    text_filter: Optional[TextFilter],
+    date_range: Optional[DateRange],
+) -> Filters:
+    """Reconcile a function's old individual filter arguments with its new optional
+    ``Filters`` bundle, so every call site -- old or new -- ends up with exactly one.
+
+    Passing both is rejected rather than given a silent precedence: there is no reading
+    of "pass both" that is not a caller mistake, and picking one quietly would just move
+    the bug somewhere harder to find.
+    """
+    individual = Filters(
+        account_id=account_id,
+        category_id=category_id,
+        vendor_filter=vendor_filter,
+        text_filter=text_filter,
+        date_range=date_range,
+    )
+    if filters is None:
+        return individual
+    if individual != Filters():
+        conflicting = [
+            name
+            for name in (
+                "account_id", "category_id", "vendor_filter", "text_filter", "date_range",
+            )
+            if getattr(individual, name) is not None
+        ]
+        raise ValueError(
+            f"Pass either `filters` or the individual filter argument(s) {conflicting}, "
+            "not both."
+        )
+    return filters
 
 
 @dataclass(frozen=True)
@@ -428,27 +494,23 @@ def _subtree_ids(category_id: int):
     return select(cte.c.id)
 
 
-def _txn_query(
-    account_id: Optional[int],
-    category_id: Optional[int],
-    vendor_filter: Optional[VendorFilter],
-    text_filter: "Optional[TextFilter]" = None,
-    date_range: "Optional[DateRange]" = None,
-):
+def _txn_query(filters: Filters):
     query = select(Transaction)
-    if date_range is not None:
-        start, end = date_range
+    if filters.date_range is not None:
+        start, end = filters.date_range
         query = query.where(
             Transaction.posted_date >= start, Transaction.posted_date <= end
         )
-    if account_id is not None:
-        query = query.where(Transaction.account_id == account_id)
-    if category_id == UNCATEGORISED_ID:
+    if filters.account_id is not None:
+        query = query.where(Transaction.account_id == filters.account_id)
+    if filters.category_id == UNCATEGORISED_ID:
         query = query.where(Transaction.category_id.is_(None))
-    elif category_id is not None:
-        query = query.where(Transaction.category_id.in_(_subtree_ids(category_id)))
-    if vendor_filter is not None:
-        kind, vendor_id = vendor_filter
+    elif filters.category_id is not None:
+        query = query.where(
+            Transaction.category_id.in_(_subtree_ids(filters.category_id))
+        )
+    if filters.vendor_filter is not None:
+        kind, vendor_id = filters.vendor_filter
         if kind == "name":
             query = query.where(
                 Transaction.vendor_id.in_(
@@ -457,8 +519,8 @@ def _txn_query(
             )
         else:
             query = query.where(Transaction.vendor_id == vendor_id)
-    if text_filter is not None and text_filter.text.strip():
-        query = query.where(_text_condition(text_filter))
+    if filters.text_filter is not None and filters.text_filter.text.strip():
+        query = query.where(_text_condition(filters.text_filter))
     return query
 
 
@@ -470,9 +532,13 @@ def get_transactions(
     limit: int = 2000,
     text_filter: Optional[TextFilter] = None,
     date_range: Optional[DateRange] = None,
+    filters: Optional[Filters] = None,
 ) -> List[TxnRow]:
+    resolved = resolve_filters(
+        filters, account_id, category_id, vendor_filter, text_filter, date_range
+    )
     query = (
-        _txn_query(account_id, category_id, vendor_filter, text_filter, date_range)
+        _txn_query(resolved)
         # Every row below reads through all four of these relationships. Left lazy, each
         # distinct related object costs its own SELECT — ~900 of them on a real database,
         # for a query that should take one apiece. ``vendor_name`` is nested because
@@ -531,10 +597,12 @@ def get_totals(
     text_filter: Optional[TextFilter] = None,
     date_range: Optional[DateRange] = None,
     home_currency: str = HOME_CURRENCY,
+    filters: Optional[Filters] = None,
 ) -> Totals:
-    base = _txn_query(
-        account_id, category_id, vendor_filter, text_filter, date_range
-    ).subquery()
+    resolved = resolve_filters(
+        filters, account_id, category_id, vendor_filter, text_filter, date_range
+    )
+    base = _txn_query(resolved).subquery()
     amount = base.c.value_minor
     count = session.scalar(select(func.count()).select_from(base)) or 0
     transfer_count = (
@@ -632,6 +700,7 @@ def get_category_totals(
     text_filter: Optional[TextFilter] = None,
     date_range: Optional[DateRange] = None,
     home_currency: str = HOME_CURRENCY,
+    filters: Optional[Filters] = None,
 ) -> List[CategoryTotal]:
     """Per-category rows, most-spent first.
 
@@ -644,9 +713,10 @@ def get_category_totals(
     Uncategorised transactions are a row of their own (``id`` None, ``name`` ""), reached
     by an outer join, so the rows always add back up to the totals.
     """
-    base = _txn_query(
-        account_id, category_id, vendor_filter, text_filter, date_range
-    ).subquery()
+    resolved = resolve_filters(
+        filters, account_id, category_id, vendor_filter, text_filter, date_range
+    )
+    base = _txn_query(resolved).subquery()
     amount = base.c.value_minor
     real = base.c.transfer_group_id.is_(None)
 
@@ -740,6 +810,7 @@ def get_bucket_totals(
     text_filter: Optional[TextFilter] = None,
     date_range: Optional[DateRange] = None,
     home_currency: str = HOME_CURRENCY,
+    filters: Optional[Filters] = None,
 ) -> List[BucketTotal]:
     """Money grouped into day/week/month buckets, chronologically. Transfers excluded.
 
@@ -751,9 +822,10 @@ def get_bucket_totals(
         raise ValueError(f"Unknown bucket {bucket!r}; expected one of {list(BUCKETS)}.")
     key_format, label_format = patterns
 
-    base = _txn_query(
-        account_id, category_id, vendor_filter, text_filter, date_range
-    ).subquery()
+    resolved = resolve_filters(
+        filters, account_id, category_id, vendor_filter, text_filter, date_range
+    )
+    base = _txn_query(resolved).subquery()
     amount = base.c.value_minor
     real = base.c.transfer_group_id.is_(None)
 

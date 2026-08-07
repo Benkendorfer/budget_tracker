@@ -25,8 +25,10 @@ from .queries import (
     HOME_CURRENCY,
     BucketTotal,
     CategoryTotal,
+    Filters,
     TextFilter,
     VendorFilter,
+    resolve_filters,
 )
 
 UNCATEGORISED = "Uncategorised"
@@ -374,26 +376,26 @@ def build_report(
     vendor_filter: Optional[VendorFilter] = None,
     text_filter: Optional[TextFilter] = None,
     home_currency: str = HOME_CURRENCY,
+    filters: Optional[Filters] = None,
 ) -> Report:
     """Totals and per-category rows for ``window``, honoring the active filters.
 
     The same filters and date range go to both queries, so the category rows always sum
-    back to the report's own outflow and inflow.
+    back to the report's own outflow and inflow. ``window`` is always the date range that
+    ends up in effect -- there is no individual ``date_range`` argument here to conflict
+    with it, so a ``date_range`` set on a passed-in ``filters`` is simply overridden, the
+    same as it always implicitly was.
     """
-    date_range = (window.start, window.end)
-    filters = dict(
-        account_id=account_id,
-        category_id=category_id,
-        vendor_filter=vendor_filter,
-        text_filter=text_filter,
-        date_range=date_range,
-        home_currency=home_currency,
-    )
-    totals = queries.get_totals(session, **filters)
-    rows = queries.get_category_totals(session, **filters)
+    resolved = resolve_filters(
+        filters, account_id, category_id, vendor_filter, text_filter, date_range=None
+    ).replace(date_range=(window.start, window.end))
+    totals = queries.get_totals(session, filters=resolved, home_currency=home_currency)
+    rows = queries.get_category_totals(session, filters=resolved, home_currency=home_currency)
 
     root_category_id = (
-        category_id if category_id not in (None, queries.UNCATEGORISED_ID) else None
+        resolved.category_id
+        if resolved.category_id not in (None, queries.UNCATEGORISED_ID)
+        else None
     )
     categories = _roll_up_categories(session, rows, window, root_category_id)
     # Re-derived from the same depth-0 rows `share` is computed against, rather than
@@ -440,20 +442,21 @@ def spending_series(
     vendor_filter: Optional[VendorFilter] = None,
     text_filter: Optional[TextFilter] = None,
     home_currency: str = HOME_CURRENCY,
+    filters: Optional[Filters] = None,
 ) -> List[BucketTotal]:
     """The window's money bucketed for a bar chart, with empty buckets zero-filled.
 
     A bar chart that silently omits a quiet month reads as if that month never happened,
-    so every bucket in the window gets a row.
+    so every bucket in the window gets a row. As in :func:`build_report`, ``window`` is
+    always the effective date range.
     """
+    resolved = resolve_filters(
+        filters, account_id, category_id, vendor_filter, text_filter, date_range=None
+    ).replace(date_range=(window.start, window.end))
     totals = queries.get_bucket_totals(
         session,
         bucket=bucket,
-        account_id=account_id,
-        category_id=category_id,
-        vendor_filter=vendor_filter,
-        text_filter=text_filter,
-        date_range=(window.start, window.end),
+        filters=resolved,
         home_currency=home_currency,
     )
     key_format, label_format = BUCKET_FORMATS[bucket]  # get_bucket_totals validated it
