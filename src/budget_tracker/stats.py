@@ -81,7 +81,7 @@ def resolve(key: str, today: Optional[date] = None) -> Window:
     )
 
 
-def _normalise(text: str) -> str:
+def _normalize(text: str) -> str:
     """Lowercase and drop a trailing plural, so "3 month" and "3 months" both match."""
     text = " ".join(text.lower().split())
     return text[:-1] if text.endswith("s") else text
@@ -108,9 +108,9 @@ def parse(text: str, today: Optional[date] = None) -> Window:
             key="custom", label=f"{start} → {end}", start=start, end=end
         )
 
-    wanted = _normalise(text)
+    wanted = _normalize(text)
     for key, label, _months in PRESETS:
-        if wanted in (_normalise(key), _normalise(label)):
+        if wanted in (_normalize(key), _normalize(label)):
             return resolve(key, today)
 
     options = ", ".join(f"{key} ({label})" for key, label, _ in PRESETS)
@@ -363,7 +363,7 @@ def build_report(
     vendor_filter: Optional[VendorFilter] = None,
     text_filter: Optional[TextFilter] = None,
 ) -> Report:
-    """Totals and per-category rows for ``window``, honouring the active filters.
+    """Totals and per-category rows for ``window``, honoring the active filters.
 
     The same filters and date range go to both queries, so the category rows always sum
     back to the report's own outflow and inflow.

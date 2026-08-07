@@ -3,7 +3,7 @@
 Definitions live in the ``csv_format`` table, which lives in the gitignored database, so
 the source tree never records which institutions you bank with.
 
-The first time an unrecognised CSV is imported, :func:`infer` proposes a mapping from
+The first time an unrecognized CSV is imported, :func:`infer` proposes a mapping from
 the header and a sample of rows. Anything it cannot work out becomes a
 :class:`Question` for the caller to put to the user; nothing is guessed silently.
 """
@@ -357,7 +357,7 @@ def _date_question(values, rows):
         return Question(
             field="date_formats",
             prompt=(
-                f"Could not recognise the dates in {column!r}{example}. "
+                f"Could not recognize the dates in {column!r}{example}. "
                 "Enter a strptime format, e.g. %d.%m.%Y"
             ),
         )

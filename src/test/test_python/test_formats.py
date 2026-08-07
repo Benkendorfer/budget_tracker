@@ -156,7 +156,7 @@ def test_dedup_falls_back_to_mapped_columns_in_a_fixed_order(tmp_path):
     ]
 
 
-def test_asks_when_the_description_column_is_unrecognisable():
+def test_asks_when_the_description_column_is_unrecognizable():
     inference = formats.infer("odd", ["Posted Date", "Amount", "Blurb"], [])
     fields = [q.field for q in inference.questions]
     assert "description_column" in fields
@@ -526,7 +526,7 @@ def test_init_db_adds_invert_amount_to_a_preexisting_csv_format_table(tmp_path):
     assert "invert_amount" in columns
 
     # The pre-existing row is intact and defaults to no inversion, matching the
-    # behaviour every format had before this column existed.
+    # behavior every format had before this column existed.
     session_factory = get_sessionmaker(engine)
     with session_factory() as session:
         assert formats.get_format(session, "old").invert_amount is False

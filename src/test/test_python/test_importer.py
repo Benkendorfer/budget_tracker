@@ -43,7 +43,7 @@ def test_decimal_places_zero_currency():
 #
 # A real provider's export writes amounts like "$9.99" and "-$75.00" rather than bare
 # decimals, which used to crash Decimal() with decimal.InvalidOperation. These pin the
-# normalisation that both parse paths now share.
+# normalization that both parse paths now share.
 
 def test_signed_minor_plain_negative():
     assert _parse_signed_minor("-75.00", 2) == -7500
@@ -80,7 +80,7 @@ def test_signed_minor_every_shape_seen_in_the_wild():
 
 
 def test_debit_credit_amounts_also_tolerate_currency_symbols():
-    """The debit/credit path shares the same normaliser as the signed path — fixing
+    """The debit/credit path shares the same normalizer as the signed path — fixing
     one and not the other would leave half the crash in place."""
     assert _parse_amount_minor("$1,234.56", "", 2) == -123456
     assert _parse_amount_minor("", "$1,234.56", 2) == 123456
@@ -223,8 +223,8 @@ def test_invert_amount_changes_value_not_hash(tmp_path):
 def test_import_handles_currency_formatted_amounts(tmp_path):
     """The crash this fixes, end to end: a real export writes "$617.66" and
     "-$1,000.00", not bare decimals. Also pins that import_hash is built from the raw
-    cell text ("$617.66", comma and all) rather than the normalised amount — if
-    normalisation ever leaked into the hash, every existing import would stop
+    cell text ("$617.66", comma and all) rather than the normalized amount — if
+    normalization ever leaked into the hash, every existing import would stop
     de-duplicating.
     """
     session_factory = _session_factory(tmp_path)

@@ -11,7 +11,7 @@ from budget_tracker.importer import read_header_and_rows
 def learn_format(session, path, name="test_layout"):
     """Infer and save the format for ``path``, as interactive setup would.
 
-    Genuinely ambiguous fixtures (an unrecognisable column name, say) still need a real
+    Genuinely ambiguous fixtures (an unrecognizable column name, say) still need a real
     answer and are not handled here. But a question with a default or a fixed set of
     choices — the ambiguous-date and invert-amount questions among them — is resolved
     the way accepting the suggestion in the walkthrough would, so fixtures written

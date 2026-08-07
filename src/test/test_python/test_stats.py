@@ -409,7 +409,7 @@ def test_bucket_totals_by_week_and_day(tmp_path):
     assert [d.label for d in days] == ["03-02", "03-04", "03-09"]
 
 
-def test_bucket_totals_exclude_transfers_and_honour_the_range(tmp_path):
+def test_bucket_totals_exclude_transfers_and_honor_the_range(tmp_path):
     session_factory = _session_factory(tmp_path)
     with session_factory() as session:
         currency, accounts, _ = _seed(session, account_names=("Checking", "Savings"))

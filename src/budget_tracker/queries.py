@@ -497,7 +497,7 @@ def get_totals(
 
     # Both legs of a transfer are real rows, but they move money between your own
     # accounts, so counting them would inflate spending and income alike. Filtering
-    # (rather than relying on the legs cancelling out) also keeps the figures right
+    # (rather than relying on the legs canceling out) also keeps the figures right
     # when a filter selects only one leg.
     real = base.c.transfer_group_id.is_(None)
     total = lambda condition: (  # noqa: E731 - reads better than three near-copies
