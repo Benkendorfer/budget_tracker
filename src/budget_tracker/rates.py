@@ -212,7 +212,17 @@ class FrankfurterError(RuntimeError):
 
 
 BASE_URL = "https://api.frankfurter.dev/v1"
-_DEFAULT_TIMEOUT = 10  # seconds; just bounds a hang, the API itself is small and fast
+
+# Generous on purpose. Measured against the live API, response time is erratic and has
+# little to do with how much is being asked for: six months of two currencies came back
+# in 0.7s while one month of the same two took 22s. A tight bound turns that ordinary
+# variance into a failed fetch, and the payload is small enough that waiting is cheap.
+_DEFAULT_TIMEOUT = 40  # seconds
+
+# One retry, because the slow responses above are transient rather than a broken request:
+# the same URL that times out usually answers immediately on a second attempt. More than
+# one adds minutes of waiting to a genuine outage without improving the odds.
+_ATTEMPTS = 2
 
 
 def _default_fetch(url: str) -> Dict[str, object]:
@@ -225,11 +235,18 @@ def _default_fetch(url: str) -> Dict[str, object]:
     why one is set here.
     """
     request = urllib.request.Request(url, headers={"User-Agent": "budget-tracker/1.0"})
-    try:
-        with urllib.request.urlopen(request, timeout=_DEFAULT_TIMEOUT) as response:
-            payload = response.read()
-    except (URLError, OSError) as exc:
-        raise FrankfurterError(f"Could not reach Frankfurter at {url}: {exc}") from exc
+    last: Optional[Exception] = None
+    for attempt in range(_ATTEMPTS):
+        try:
+            with urllib.request.urlopen(request, timeout=_DEFAULT_TIMEOUT) as response:
+                payload = response.read()
+            break
+        except (URLError, OSError) as exc:
+            last = exc
+    else:
+        raise FrankfurterError(
+            f"Could not reach Frankfurter at {url} after {_ATTEMPTS} attempts: {last}"
+        ) from last
     try:
         return json.loads(payload)
     except json.JSONDecodeError as exc:
