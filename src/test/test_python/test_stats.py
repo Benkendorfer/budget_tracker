@@ -750,3 +750,16 @@ def test_uncategorised_takes_part_in_the_same_display_order(tmp_path):
     assert uncategorised.parent_id is None
     assert uncategorised.category_id == queries.UNCATEGORISED_ID
     assert uncategorised.own_total_minor == uncategorised.total_minor
+
+
+def test_get_currencies_reports_symbols_and_decimal_places(tmp_path):
+    """Anything formatting minor units needs these, and decimal_places is not always 2."""
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        session.add(Currency(value="USD", symbol="$", decimal_places=2))
+        session.add(Currency(value="JPY", symbol="¥", decimal_places=0))
+        session.commit()
+    with session_factory() as session:
+        rows = {c.code: c for c in queries.get_currencies(session)}
+    assert rows["USD"].symbol == "$" and rows["USD"].decimal_places == 2
+    assert rows["JPY"].decimal_places == 0

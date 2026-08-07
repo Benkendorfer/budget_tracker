@@ -75,6 +75,19 @@ class TextFilter:
             )
 
 
+@dataclass(frozen=True)
+class CurrencyRow:
+    """A currency's display facts, read once so callers need no live session.
+
+    ``decimal_places`` is not always 2 — JPY has none — so anything turning minor units
+    into text has to ask rather than assume.
+    """
+
+    code: str
+    symbol: Optional[str]
+    decimal_places: int
+
+
 @dataclass
 class AccountRow:
     id: int
@@ -183,6 +196,15 @@ class ImportDeletePreview:
     source_file: str
     transaction_count: int
     transfers_broken: int
+
+
+def get_currencies(session: Session) -> List[CurrencyRow]:
+    """Every currency the database knows, by ISO code."""
+    rows = session.execute(
+        select(Currency.value, Currency.symbol, Currency.decimal_places)
+        .order_by(Currency.value)
+    ).all()
+    return [CurrencyRow(code=r[0], symbol=r[1], decimal_places=r[2]) for r in rows]
 
 
 def get_accounts(session: Session) -> List[AccountRow]:
