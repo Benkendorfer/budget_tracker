@@ -13,6 +13,7 @@ from budget_tracker.db import get_engine, get_sessionmaker, init_db
 from budget_tracker.importer import (
     UnknownImport,
     _parse_amount_minor,
+    _parse_signed_minor,
     _row_hash,
     delete_import,
     import_csv,
@@ -38,6 +39,73 @@ def test_decimal_places_zero_currency():
     assert _parse_amount_minor("500", "", 0) == -500
 
 
+# ------------------------------------------------------------- currency-symbol amounts
+#
+# A real provider's export writes amounts like "$9.99" and "-$75.00" rather than bare
+# decimals, which used to crash Decimal() with decimal.InvalidOperation. These pin the
+# normalisation that both parse paths now share.
+
+def test_signed_minor_plain_negative():
+    assert _parse_signed_minor("-75.00", 2) == -7500
+
+
+def test_signed_minor_symbol_before_sign():
+    assert _parse_signed_minor("$-75.00", 2) == -7500
+
+
+def test_signed_minor_symbol_after_sign():
+    assert _parse_signed_minor("-$75.00", 2) == -7500
+
+
+def test_signed_minor_thousands_separator():
+    assert _parse_signed_minor("$1,234.56", 2) == 123456
+
+
+def test_signed_minor_separator_and_sign_together():
+    assert _parse_signed_minor("-$9,999.99", 2) == -999999
+
+
+def test_signed_minor_every_shape_seen_in_the_wild():
+    cases = {
+        "$9.99": 999,
+        "$999.99": 99999,
+        "$9,999.99": 999999,
+        "$99,999.99": 9999999,
+        "-$9.99": -999,
+        "-$99.99": -9999,
+        "-$9,999.99": -999999,
+    }
+    for raw, expected in cases.items():
+        assert _parse_signed_minor(raw, 2) == expected, raw
+
+
+def test_debit_credit_amounts_also_tolerate_currency_symbols():
+    """The debit/credit path shares the same normaliser as the signed path — fixing
+    one and not the other would leave half the crash in place."""
+    assert _parse_amount_minor("$1,234.56", "", 2) == -123456
+    assert _parse_amount_minor("", "$1,234.56", 2) == 123456
+
+
+def test_unparseable_amount_raises_naming_the_raw_text():
+    with pytest.raises(ValueError) as excinfo:
+        _parse_signed_minor("N/A", 2)
+    assert "N/A" in str(excinfo.value)
+
+
+def test_european_grouping_is_not_silently_accepted():
+    # "1.234,56" is ambiguous without knowing the file's locale (thousands separator or
+    # decimal point?), so it is deliberately not supported. It must raise rather than
+    # be coerced into a plausible-looking wrong number.
+    with pytest.raises(ValueError):
+        _parse_signed_minor("1.234,56", 2)
+
+
+def test_parenthesised_negative_is_not_supported():
+    # No format seen here uses this shape; raising rather than guessing at it.
+    with pytest.raises(ValueError):
+        _parse_signed_minor("(75.00)", 2)
+
+
 def test_hash_is_stable():
     args = ("8207", "2025-07-23", "2025-07-24", "CERN Snacking", "3.28", "", 0)
     assert _row_hash(*args) == _row_hash(*args)
@@ -53,6 +121,15 @@ def test_hash_varies_with_occurrence():
 CARD_CSV = """Transaction Date,Posted Date,Card No.,Description,Amount
 2026-07-01,2026-07-02,1234,COFFEE SHOP,617.66
 2026-07-03,2026-07-04,1234,PAYMENT RECEIVED,-1000.00
+"""
+
+# Same layout, but amounts as the real crash shapes: a currency symbol and a thousands
+# separator, sign before the symbol on one row. The amount with an embedded comma has
+# to be quoted, same as a real export would quote it, or the CSV reader would split it
+# into an extra column.
+CURRENCY_CARD_CSV = """Transaction Date,Posted Date,Card No.,Description,Amount
+2026-07-01,2026-07-02,1234,COFFEE SHOP,$617.66
+2026-07-03,2026-07-04,1234,PAYMENT RECEIVED,"-$1,000.00"
 """
 
 # Two legs of one transfer, in separate files as separate accounts would export them.
@@ -127,6 +204,33 @@ def test_invert_amount_changes_value_not_hash(tmp_path):
     normal_minors = sorted(v for _, v in normal)
     inverted_minors = sorted(v for _, v in inverted)
     assert inverted_minors == sorted(-v for v in normal_minors)
+
+
+def test_import_handles_currency_formatted_amounts(tmp_path):
+    """The crash this fixes, end to end: a real export writes "$617.66" and
+    "-$1,000.00", not bare decimals. Also pins that import_hash is built from the raw
+    cell text ("$617.66", comma and all) rather than the normalised amount — if
+    normalisation ever leaked into the hash, every existing import would stop
+    de-duplicating.
+    """
+    session_factory = _session_factory(tmp_path)
+    path = _write(tmp_path, "card.csv", CURRENCY_CARD_CSV)
+    with session_factory() as session:
+        _learn(session, path, "card")
+        result = import_csv(session, path)
+    assert result.inserted == 2
+    assert result.skipped_duplicates == 0
+
+    with session_factory() as session:
+        txns = {t.description: t for t in queries.get_transactions(session)}
+        hashes = {t.import_hash for t in session.scalars(select(Transaction))}
+    assert txns["COFFEE SHOP"].amount_minor == 61766
+    assert txns["PAYMENT RECEIVED"].amount_minor == -100000
+
+    expected = _row_hash(
+        "1234", "2026-07-01", "2026-07-02", "COFFEE SHOP", "$617.66", 0
+    )
+    assert expected in hashes  # the literal "$" is in the hash, not the parsed amount
 
 
 # ------------------------------------------------------------------------ delete_import

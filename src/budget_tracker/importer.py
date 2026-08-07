@@ -13,9 +13,10 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+import re
 from dataclasses import dataclass
 from datetime import date, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Dict, Optional, Sequence, Tuple
 
@@ -31,6 +32,14 @@ from .models import Account, Category, Currency, Import, Transaction, Vendor
 
 DEFAULT_CURRENCY_CODE = "USD"
 _SYMBOLS = {"USD": "$", "EUR": "€", "GBP": "£", "CHF": "CHF"}
+
+# Symbols amount cells may carry, longest first so "CHF" isn't shadowed by a shorter
+# match. Reuses the set already known to the module rather than inventing a second list.
+_CURRENCY_SYMBOLS = tuple(sorted(set(_SYMBOLS.values()), key=len, reverse=True))
+
+# What is left once sign and symbol are peeled off: plain digits, or comma-grouped
+# thousands ("9,999.99" / "99,999.99"), with an optional decimal part either way.
+_AMOUNT_RE = re.compile(r"^\d{1,3}(,\d{3})*(\.\d+)?$|^\d+(\.\d+)?$")
 
 
 @dataclass
@@ -82,15 +91,54 @@ def _get_or_create_category(session: Session, value: str) -> Category:
     return get_or_create(session, value)
 
 
+def _normalize_amount(raw: str) -> Decimal:
+    """Parse one CSV amount cell into a :class:`Decimal`, tolerating the shapes a real
+    export mixes into a single column: a currency symbol, and comma thousands
+    separators, in addition to plain "-75.00".
+
+    The symbol and the sign can appear in either order ("-$75.00" and "$-75.00" both
+    occur in the wild), so each is peeled from the front independently rather than
+    assumed to nest one way. What is left must be a plain or comma-grouped number or
+    this raises — silently returning 0 for text we don't understand would put a wrong
+    figure in the user's ledger, which is worse than refusing to import.
+
+    European "1.234,56" grouping is deliberately not attempted: without knowing the
+    file's locale, a "." could be a thousands separator or a decimal point, and
+    guessing wrong would corrupt the amount rather than merely reject it. Parenthesised
+    negatives ("(75.00)") are likewise not handled — no format seen here uses them, and
+    adding speculative shapes is how this kind of ambiguity creeps in.
+    """
+    text = raw.strip()
+    negative = False
+    # Sign and symbol can each appear once, in either order, at the front of the cell.
+    for _ in range(2):
+        if text[:1] == "-":
+            negative = True
+            text = text[1:].lstrip()
+            continue
+        for symbol in _CURRENCY_SYMBOLS:
+            if text.startswith(symbol):
+                text = text[len(symbol):].lstrip()
+                break
+        else:
+            break
+    if not _AMOUNT_RE.match(text):
+        raise ValueError(f"Could not parse amount {raw!r}.")
+    try:
+        return Decimal(("-" if negative else "") + text.replace(",", ""))
+    except InvalidOperation as error:
+        raise ValueError(f"Could not parse amount {raw!r}.") from error
+
+
 def _parse_amount_minor(debit: str, credit: str, decimal_places: int) -> int:
     """Signed minor units: debit (charge) negative, credit (payment) positive."""
     scale = 10 ** decimal_places
     debit = (debit or "").strip()
     credit = (credit or "").strip()
     if debit:
-        return -int((Decimal(debit) * scale).to_integral_value())
+        return -int((_normalize_amount(debit) * scale).to_integral_value())
     if credit:
-        return int((Decimal(credit) * scale).to_integral_value())
+        return int((_normalize_amount(credit) * scale).to_integral_value())
     return 0
 
 
@@ -100,7 +148,7 @@ def _parse_signed_minor(amount: str, decimal_places: int) -> int:
     if not amount:
         return 0
     scale = 10 ** decimal_places
-    return int((Decimal(amount) * scale).to_integral_value())
+    return int((_normalize_amount(amount) * scale).to_integral_value())
 
 
 def _row_hash(*parts) -> str:
