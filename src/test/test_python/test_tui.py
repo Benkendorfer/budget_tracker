@@ -13,7 +13,7 @@ from rich.console import Console
 from sqlalchemy import text as sql_text
 from textual.widgets import DataTable, Input, ListView, Static
 
-from budget_tracker import categories, formats, queries, stats, transfers, vendors
+from budget_tracker import categories, charts, formats, queries, stats, transfers, vendors
 from budget_tracker.db import DuplicateCategoryNamesError, get_engine, get_sessionmaker, init_db
 from budget_tracker.importer import import_csv, read_header_and_rows
 from budget_tracker.models import Account, Currency, Transaction
@@ -4011,6 +4011,294 @@ def test_transfers_left_out_of_the_bars_are_counted_in_the_status(tmp_path, monk
     assert f"{TRANSFER_MARK} 2" in status
 
 
+# ------------------------------------------------------- arrow-key chart navigation
+
+
+def test_right_arrow_on_a_chart_bar_drills_down_like_enter(tmp_path, monkeypatch):
+    _setup_chart(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command(f"chart {CHART_WINDOW} month")
+            await pilot.pause()
+            table = app.query_one("#chart", DataTable)
+            table.focus()
+            table.move_cursor(row=0)  # January
+            await pilot.press("right")
+            await pilot.pause()
+            return (
+                app._panel,
+                app.date_filter,
+                sorted(t.description for t in app._txns),
+            )
+
+    panel, date_filter, descriptions = asyncio.run(run())
+    assert panel == "txns"
+    assert date_filter == (datetime.date(2026, 1, 1), datetime.date(2026, 1, 31))
+    assert descriptions == ["SHOP A", "SHOP B"]
+
+
+def test_left_arrow_returns_to_the_chart_with_the_full_series(tmp_path, monkeypatch):
+    _setup_chart(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command(f"chart {CHART_WINDOW} month")
+            await pilot.pause()
+            before = _chart_rows(app)
+            table = app.query_one("#chart", DataTable)
+            table.focus()
+            table.move_cursor(row=2)  # March
+            await pilot.press("right")
+            await pilot.pause()
+            drilled = (app._panel, app.date_filter)
+
+            await pilot.press("left")
+            await pilot.pause()
+            back_panel = app._panel
+            after = _chart_rows(app)
+            cursor_row = app.query_one("#chart", DataTable).cursor_row
+            return before, drilled, back_panel, after, app.date_filter, cursor_row
+
+    before, drilled, back_panel, after, date_filter, cursor_row = asyncio.run(run())
+    assert drilled[0] == "txns" and drilled[1] is not None
+    assert back_panel == "chart"
+    # The date filter the drill-down set is gone, or the chart would be scoped to March.
+    assert date_filter is None
+    assert after == before
+    assert cursor_row == 2  # back on the March row that was drilled from
+
+
+def test_a_partial_edge_bucket_drills_into_only_the_days_in_the_window(
+    tmp_path, monkeypatch
+):
+    """The window's own edges, not the calendar month's. Without clamping,
+    bucket_date_range would reconstruct January as the whole month and March as the
+    whole month, pulling in SHOP A (before the window) and SHOP D (after it) — rows the
+    bars themselves never counted, so the drilled-down list would stop summing to them.
+    """
+    _setup_chart(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command("chart 2026-01-18..2026-03-05 month net")
+            await pilot.pause()
+            table = app.query_one("#chart", DataTable)
+            table.focus()
+
+            table.move_cursor(row=0)  # January, clamped to 01-18..01-31
+            await pilot.press("right")
+            await pilot.pause()
+            january = sorted(t.description for t in app._txns), app.date_filter
+            await pilot.press("left")
+            await pilot.pause()
+
+            table.move_cursor(row=2)  # March, clamped to 03-01..03-05
+            await pilot.press("right")
+            await pilot.pause()
+            march = sorted(t.description for t in app._txns), app.date_filter
+
+            return january, march
+
+    january, march = asyncio.run(run())
+    # SHOP A (2026-01-15) is outside the window; only SHOP B (01-20) counts.
+    assert january == (["SHOP B"], (datetime.date(2026, 1, 18), datetime.date(2026, 1, 31)))
+    # SHOP D (2026-03-06) is outside the window; only the 03-05 paycheck counts.
+    assert march == (["PAYCHECK"], (datetime.date(2026, 3, 1), datetime.date(2026, 3, 5)))
+
+
+def test_left_arrow_after_a_chart_drill_restores_filters_set_before_it(
+    tmp_path, monkeypatch
+):
+    """A chart drill-down only ever narrows the date; a category filter set before it
+    must survive the round trip untouched."""
+    _setup_chart(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            food = next(c for c in app._categories if c.name == "Food")
+            app.category_filter = food.id
+            app.reload()
+            await pilot.pause()
+
+            app._run_command(f"chart {CHART_WINDOW} month")
+            await pilot.pause()
+            table = app.query_one("#chart", DataTable)
+            table.focus()
+            table.move_cursor(row=0)
+            await pilot.press("right")
+            await pilot.pause()
+            drilled_category_filter = app.category_filter
+
+            await pilot.press("left")
+            await pilot.pause()
+            return food.id, drilled_category_filter, app.category_filter, app._panel
+
+    food_id, drilled_category_filter, restored_category_filter, panel = asyncio.run(run())
+    assert drilled_category_filter == food_id
+    assert restored_category_filter == food_id
+    assert panel == "chart"
+
+
+def test_a_new_filter_clears_the_stale_chart_drill_flag(tmp_path, monkeypatch):
+    _setup_chart(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command(f"chart {CHART_WINDOW} month")
+            await pilot.pause()
+            table = app.query_one("#chart", DataTable)
+            table.focus()
+            table.move_cursor(row=0)
+            await pilot.press("right")
+            await pilot.pause()
+            drilled = app._drilled_from_chart
+
+            app._run_command("filter shop")
+            await pilot.pause()
+            after_filter = app._drilled_from_chart
+            panel = app._panel
+
+            await pilot.press("left")
+            await pilot.pause()
+            return drilled, after_filter, panel, app._panel
+
+    drilled, after_filter, panel_before_left, panel_after_left = asyncio.run(run())
+    assert drilled is True
+    assert after_filter is False
+    assert panel_before_left == "txns"
+    assert panel_after_left == "txns"  # left arrow did not send us anywhere
+
+
+def test_escape_clears_the_stale_chart_drill_down_flag(tmp_path, monkeypatch):
+    _setup_chart(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command(f"chart {CHART_WINDOW} month")
+            await pilot.pause()
+            table = app.query_one("#chart", DataTable)
+            table.focus()
+            table.move_cursor(row=0)
+            await pilot.press("right")
+            await pilot.pause()
+
+            await pilot.press("escape")
+            await pilot.pause()
+            return app._drilled_from_chart
+
+    assert asyncio.run(run()) is False
+
+
+def test_the_chart_total_row_cannot_be_drilled(tmp_path, monkeypatch):
+    """Mirrors the statistics panel's guard: the closing TOTAL row is not a bar."""
+    _setup_chart(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command(f"chart {CHART_WINDOW} month")
+            await pilot.pause()
+            table = app.query_one("#chart", DataTable)
+            table.focus()
+            table.move_cursor(row=table.row_count - 1)  # the TOTAL row
+            await pilot.press("right")
+            await pilot.pause()
+            return app._panel, app.date_filter
+
+    panel, date_filter = asyncio.run(run())
+    assert panel == "chart"
+    assert date_filter is None
+
+
+def test_drilling_from_stats_and_from_the_chart_do_not_confuse_each_others_back_link(
+    tmp_path, monkeypatch
+):
+    """Leaving one drilled-down view for the other panel invalidates the back-link it
+    leaves behind, so a stale left arrow never sends you somewhere unrelated."""
+    _setup_chart(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command(f"stats {CHART_WINDOW}")
+            await pilot.pause()
+            app.query_one("#stats_table", DataTable).focus()
+            await pilot.press("right")
+            await pilot.pause()
+            drilled_from_stats = app._drilled_from_stats
+
+            # Opening the chart leaves the stats drill behind.
+            app._run_command(f"chart {CHART_WINDOW} month")
+            await pilot.pause()
+            after_chart_open = (app._drilled_from_stats, app._drilled_from_chart)
+
+            app.query_one("#chart", DataTable).focus()
+            await pilot.press("right")
+            await pilot.pause()
+            drilled_from_chart = app._drilled_from_chart
+
+            # And the reverse: opening stats leaves the chart drill behind in turn.
+            app._run_command(f"stats {CHART_WINDOW}")
+            await pilot.pause()
+            after_stats_open = (app._drilled_from_stats, app._drilled_from_chart)
+
+            return (
+                drilled_from_stats,
+                after_chart_open,
+                drilled_from_chart,
+                after_stats_open,
+            )
+
+    (
+        drilled_from_stats,
+        after_chart_open,
+        drilled_from_chart,
+        after_stats_open,
+    ) = asyncio.run(run())
+    assert drilled_from_stats is True
+    assert after_chart_open == (False, False)
+    assert drilled_from_chart is True
+    assert after_stats_open == (False, False)
+
+
+def test_the_chart_drill_down_keys_are_advertised_in_the_footer(tmp_path, monkeypatch):
+    """The chart's twin of test_the_drill_down_keys_are_advertised_in_the_footer."""
+    _setup_chart(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command(f"chart {CHART_WINDOW} month")
+            await pilot.pause()
+            app.query_one("#chart", DataTable).focus()
+            await pilot.pause()
+            on_chart = dict(app.active_bindings)
+
+            table = app.query_one("#chart", DataTable)
+            table.move_cursor(row=0)
+            await pilot.press("right")
+            await pilot.pause()
+            drilled = dict(app.active_bindings)
+
+            return on_chart, drilled
+
+    def action_for(bindings, key):
+        binding = bindings.get(key)
+        return binding.binding.action if binding else None
+
+    on_chart, drilled = asyncio.run(run())
+    assert action_for(on_chart, "right") == "drill_down"
+    assert on_chart["right"].binding.description == "Drill down"
+    assert action_for(drilled, "left") == "drill_up"
+
+
 # ---------------------------------------------------------- browsing the import inbox
 
 
@@ -4189,3 +4477,198 @@ def test_an_empty_folder_says_so_rather_than_looking_broken(tmp_path, monkeypatc
     messages, rows = asyncio.run(run())
     assert any("Nothing to import in empty" in m for m in messages)
     assert rows[0][0] == "▸ .."  # still navigable back out
+
+
+# ------------------------------------------------------------------------- pie
+
+
+def test_bare_pie_opens_the_picker_and_the_picker_opens_the_pie(tmp_path, monkeypatch):
+    """The period picker is shared with stats/chart, so it has to remember who asked."""
+    _setup_chart(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command("pie")
+            await pilot.pause()
+            picker = app._panel
+            app.query_one("#periods", DataTable).move_cursor(row=0)  # 1 month
+            await pilot.press("enter")
+            await pilot.pause()
+            return picker, app._panel
+
+    picker, landed = asyncio.run(run())
+    assert picker == "periods"
+    assert landed == "pie"
+
+
+def test_pie_with_a_period_skips_the_picker(tmp_path, monkeypatch):
+    _setup_chart(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command(f"pie {CHART_WINDOW}")
+            await pilot.pause()
+            return app._panel, app.window.start, app.window.end
+
+    panel, start, end = asyncio.run(run())
+    assert panel == "pie"
+    assert (start, end) == (datetime.date(2026, 1, 1), datetime.date(2026, 3, 31))
+
+
+def test_pie_only_shows_depth_zero_categories_with_net_spend(tmp_path, monkeypatch):
+    """Food (depth 0, real net spend) gets a wedge; Dining/Groceries (its descendants,
+    already rolled into Food) do not, and neither does Income (depth 0 but net
+    positive) — the exact filter stats.Report.categories warns about."""
+    _seed_category_hierarchy_with_income_sibling(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command("pie 2025-01-01..2025-12-31")
+            await pilot.pause()
+            return [s.name for s in app._pie.slices]
+
+    names = asyncio.run(run())
+    assert names == ["Food"]
+
+
+def test_a_window_with_no_net_spending_shows_a_message_instead_of_a_blank_pie(
+    tmp_path, monkeypatch
+):
+    _setup_chart(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command("pie 2020-01-01..2020-03-31")  # nothing seeded that early
+            await pilot.pause()
+            return app._pie.slices, str(app.query_one("#pie", Static).content)
+
+    slices, content = asyncio.run(run())
+    assert slices == []
+    assert "No net spending" in content
+
+
+def test_escape_leaves_the_pie_for_the_transactions(tmp_path, monkeypatch):
+    _setup_chart(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command(f"pie {CHART_WINDOW}")
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause()
+            return app._panel, app.query_one("#pie", Static).display
+
+    panel, pie_visible = asyncio.run(run())
+    assert panel == "txns"
+    assert pie_visible is False
+
+
+def test_selecting_a_category_rescopes_the_open_pie(tmp_path, monkeypatch):
+    """Like the chart, the pie is scoped by whatever filters are active — filtering to
+    one category leaves a single, whole-circle wedge behind."""
+    _setup_chart(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command(f"pie {CHART_WINDOW}")
+            await pilot.pause()
+            everything = [s.name for s in app._pie.slices]
+
+            food = next(c for c in app._categories if c.name == "Food")
+            app.category_filter = food.id
+            app.reload()
+            await pilot.pause()
+            return everything, app._pie.slices
+
+    everything, food_slices = asyncio.run(run())
+    assert set(everything) == {"Food", "Travel"}
+    assert [s.name for s in food_slices] == ["Food"]
+    assert food_slices[0].share == 1.0
+
+
+def test_pie_status_line_fits_the_main_panel(tmp_path, monkeypatch):
+    """Same 92-column budget as every other status line, against a custom range (the
+    longest label) and a real year of spending in the hundreds of thousands."""
+    _seed_category_hierarchy(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command("pie 2025-01-01..2025-12-31")
+            await pilot.pause()
+            return str(app.query_one("#status", Static).content)
+
+    status = asyncio.run(run())
+    assert len(status) <= 92, f"{len(status)} columns: {status!r}"
+    assert "category" in status and "net spend" in status
+
+
+def test_pie_panel_looks_like_a_circle_and_fits_the_main_panel(tmp_path, monkeypatch):
+    """Renders the real compositor rather than assuming the geometry reads as round —
+    checks every legend column lands inside the panel, with several categories, a long
+    name, and a six-figure amount, the shape most likely to clip."""
+    session_factory = _setup_chart(tmp_path, monkeypatch)
+    with session_factory() as session:
+        currency = session.query(Currency).one()
+        account = session.query(Account).one()
+        big = categories.ensure_path(
+            session, "Restaurants and Fast Casual Spots Somewhere Nearby"
+        )
+        session.add(
+            Transaction(
+                account_id=account.id,
+                currency_id=currency.id,
+                category_id=big.id,
+                posted_date=datetime.date(2026, 1, 10),
+                description="BIG SPEND",
+                raw_description="BIG SPEND",
+                value_minor=-123_456_789,
+                import_hash="big-spend",
+            )
+        )
+        session.commit()
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command(f"pie {CHART_WINDOW}")
+            await pilot.pause()
+            buffer = io.StringIO()
+            Console(file=buffer, width=130).print(app.screen._compositor)
+            return buffer.getvalue(), [s.name for s in app._pie.slices]
+
+    rendered, names = asyncio.run(run())
+    assert all(len(line.rstrip()) <= 130 for line in rendered.splitlines())
+    assert set(names) == {"Food", "Travel", "Restaurants and Fast Casual Spots Somewhere Nearby"}
+    # The pie itself drew something...
+    assert charts.BLOCK in rendered
+    # ...and the legend beside it names the categories, their shares, and their
+    # amounts, none of it clipped off the edge of the panel.
+    assert "Food" in rendered and "Travel" in rendered
+    assert "Restaurants and Fas" in rendered  # the long name, truncated to fit the column
+    assert "1,234,567.89" in rendered  # a six-figure amount, formatted not raw
+
+
+def test_a_new_filter_does_not_disturb_an_open_pie_until_reload(tmp_path, monkeypatch):
+    """Sanity check that the pie panel survives reload() being called for reasons that
+    have nothing to do with it (e.g. importing more data) without erroring."""
+    _setup_chart(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command(f"pie {CHART_WINDOW}")
+            await pilot.pause()
+            app.reload()
+            await pilot.pause()
+            return app._panel, [s.name for s in app._pie.slices]
+
+    panel, names = asyncio.run(run())
+    assert panel == "pie"
+    assert set(names) == {"Food", "Travel"}

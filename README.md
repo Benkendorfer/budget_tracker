@@ -15,6 +15,7 @@
     - [Nesting categories](#nesting-categories)
     - [Statistics](#statistics)
     - [Charts](#charts)
+    - [Pie chart](#pie-chart)
     - [Transfers between your own accounts](#transfers-between-your-own-accounts)
     - [Importing data](#importing-data)
     - [Where the data lives](#where-the-data-lives)
@@ -87,6 +88,8 @@ the bottom:
 | `stats <window>` | Skip the picker: `stats 6m`, `stats 1 year`, `stats 2025-01-01..2025-06-30` |
 | `chart` | Pick a time window, then see money over time as bars (see below) |
 | `chart <window> [day\|week\|month] [net\|spending\|income]` | Skip the picker, and set the bar width and what the bars measure: `chart 1y month spending` |
+| `pie` | Pick a time window, then see spending by category as a pie (see below) |
+| `pie <window>` | Skip the picker: `pie 6m`, `pie 1 year`, `pie 2025-01-01..2025-06-30` |
 | `transfers` | Pair up movements between your own accounts (`transfers reset` undoes it) |
 | `transfers same-account` | Also pair legs within the same account (see below); off by default |
 | `rules` | Open the rules panel — both kinds of rule (`rule` on its own does the same); `escape` returns |
@@ -96,12 +99,12 @@ the bottom:
 | `quit` | Exit |
 
 Keyboard shortcuts: `ctrl+l` clears filters, `ctrl+r` refreshes, `escape` returns to the
-transactions from the rules panel, and `ctrl+c` quits. On a statistics row, the right
-arrow drills into that category's transactions (same as `enter`); the left arrow goes
-back to the breakdown it came from, once you have drilled into one; `space` folds or
-unfolds a category's subtree; and `f` folds or unfolds every group at once — see
-"Statistics" below. On the chart, `b` cycles the bar width between day, week, and
-month, and `m` cycles what the bars measure between net, spending, and income — see
+transactions from the rules panel, and `ctrl+c` quits. On a statistics row **or a chart
+bar**, the right arrow drills into its transactions (same as `enter`); the left arrow
+goes back to the breakdown or chart it came from, once you have drilled into one;
+`space` folds or unfolds a category's subtree; and `f` folds or unfolds every group at
+once — see "Statistics" below. On the chart, `b` cycles the bar width between day, week,
+and month, and `m` cycles what the bars measure between net, spending, and income — see
 "Charts". The footer shows the arrows only while they do something.
 
 `ctrl+n` prefills a `rename` command for whichever vendor you are pointing at, and
@@ -508,6 +511,25 @@ that does not say what it is showing is a trap:
 Transfers are excluded from the bars, as they are from every other figure, and the status
 line counts them (`⇄ 110`) so the money is never missing without explanation.
 
+Press `enter`, or the right arrow, on a bar to see the transactions behind it — the same
+drill-down the statistics panel offers, but scoped to that bucket's own days rather than
+a category. The window's own edges, not the calendar bucket's: a month bucket at either
+end of a window that starts or ends mid-month only pulls in the days actually drawn, so
+the rows you land on add up to the figure you just clicked. The left arrow goes back to
+the chart, the same way it goes back to the statistics breakdown.
+
+### Pie chart
+
+`pie` opens the same period picker as `stats` and `chart`; `pie 6m` or
+`pie 2025-01-01..2025-06-30` skips it. `escape` returns to the transactions.
+
+It draws one wedge per top-level category, sized to its share of the window's net
+spending — the same `share` the statistics table's `% spend` column shows, so the two
+never disagree. A subcategory does not get its own wedge: its money is already rolled
+into its parent's (see "Statistics" above), and a category that is all refund with no
+real net spend — or a window with no spending at all — gets no wedge rather than an
+empty sliver. The legend beside the pie lists each category, its share, and its amount.
+
 ### Transfers between your own accounts
 
 Paying your card from your checking account produces two transactions: money leaving one
@@ -692,7 +714,7 @@ derived name. `--format` forces a known layout if detection ever picks wrong.
 
 Dropping statements into `data/to_import/` lets you import them without typing paths —
 `budget import` prompts you to choose one, and the app's `import` command browses them.
-`import all` in the app imports every recognised file in one go and reports the ones that
+`import all` in the app imports every recognized file in one go and reports the ones that
 need setup rather than stopping.
 
 ### Where the data lives

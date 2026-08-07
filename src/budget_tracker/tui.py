@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
+from rich.table import Table
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -95,6 +96,14 @@ CHART_COLUMNS = {
     "income": (("In", "inflow"), ("Net", "net")),
 }
 
+# Cycled by slice index. charts.build_pie() only knows which cell belongs to which
+# slice — this is the styling half of that split, and the only place a colour is chosen.
+PIE_COLORS = (
+    "red", "green", "yellow", "blue", "magenta", "cyan",
+    "bright_red", "bright_green", "bright_yellow", "bright_blue",
+    "bright_magenta", "bright_cyan",
+)
+
 
 def _amount_cell(minor: int, is_transfer: bool = False) -> Text:
     if is_transfer:
@@ -174,13 +183,14 @@ class BudgetApp(App):
     #txns, #rules, #imports, #setup, #periods { border: round $accent; height: 1fr; }
     #stats { height: 1fr; }
     #stats_table, #chart { border: round $accent; height: 1fr; }
+    #pie { border: round $accent; height: 1fr; padding: 1; }
     #prompt { height: auto; padding: 1 1 0 1; color: $accent; }
     #status { height: 1; padding: 0 1; color: $text-muted; background: $panel; }
     #command { border: tall $accent; }
     .heading { padding: 0 1; text-style: bold; color: $accent; }
     """
 
-    PANELS = ("txns", "rules", "imports", "setup", "periods", "stats", "chart")
+    PANELS = ("txns", "rules", "imports", "setup", "periods", "stats", "chart", "pie")
     # Panels whose widget is not itself focusable name the child that takes focus.
     PANEL_FOCUS = {"stats": "#stats_table"}
 
@@ -289,9 +299,12 @@ class BudgetApp(App):
         # Transfers are left out of the bars, as they are out of every other figure; the
         # count is carried so the status line can say so rather than quietly losing them.
         self._chart_transfers = 0
+        # The pie's last-built wedges, drawn from the same report the statistics panel
+        # uses (see reload()'s guard) — there is no separate query for it.
+        self._pie: Optional[charts.Pie] = None
         self._range_pending = False  # awaiting a typed date range for the picker
-        # Which panel the period picker is choosing for: "stats" or "chart". Both open
-        # the same picker, and it has to know where the answer goes.
+        # Which panel the period picker is choosing for: "stats", "chart", or "pie". All
+        # three open the same picker, and it has to know where the answer goes.
         self._picker_target = "stats"
         # Awaiting a typed "yes" to confirm a pending `unimport`; holds what it would
         # destroy, read up front so the confirmation names real numbers.
@@ -303,17 +316,19 @@ class BudgetApp(App):
         # Same idea for `category merge`; holds (source, target) as typed.
         self._pending_category_merge: Optional[tuple] = None
         self._prompt_panel: Optional[str] = None  # which panel the #prompt belongs to
-        # True only while the transactions panel is showing exactly what a statistics
-        # drill-down put there — the left arrow's "back" is only meaningful then.
+        # None unless the transactions panel is showing exactly what a drill-down put
+        # there — "stats" or "chart", naming which panel to send the left arrow back to.
         # Anything that changes the view out from under it (a new filter, ctrl+l,
         # escape, opening another panel) has to clear it, or a stale flag could send a
         # later, unrelated left-arrow press somewhere the user did not ask for.
-        self._drilled_from_stats = False
+        self._drill_origin: Optional[str] = None
         # What the drill-down overwrote, so going back restores it rather than
-        # unconditionally blanking a filter the user had set on purpose.
+        # unconditionally blanking a filter the user had set on purpose. A chart
+        # drill-down only ever touches the date, so the category filter it "restores" is
+        # simply whatever was already there.
         self._pre_drill_category_filter: Optional[int] = None
         self._pre_drill_date_filter: Optional[queries.DateRange] = None
-        self._drill_source_row: Optional[int] = None  # stats_table row to land back on
+        self._drill_source_row: Optional[int] = None  # table row to land back on
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -335,15 +350,26 @@ class BudgetApp(App):
                 with Vertical(id="stats"):
                     yield DataTable(id="stats_table")
                 yield DataTable(id="chart")
+                yield Static("", id="pie")
                 yield Static("", id="status")
         yield Input(
             placeholder=(
                 "command: import | unimport | filter | categorize | category | format | "
-                "stats | chart | rules | all | refresh | help | quit"
+                "stats | chart | pie | rules | all | refresh | help | quit"
             ),
             id="command",
         )
         yield Footer()
+
+    @property
+    def _drilled_from_stats(self) -> bool:
+        """True only right after a statistics drill-down — see ``_drill_origin``."""
+        return self._drill_origin == "stats"
+
+    @property
+    def _drilled_from_chart(self) -> bool:
+        """True only right after a chart drill-down — see ``_drill_origin``."""
+        return self._drill_origin == "chart"
 
     def check_action(self, action: str, parameters: tuple) -> Optional[bool]:
         """Gate the priority left/right bindings so they only act where they mean something.
@@ -354,9 +380,9 @@ class BudgetApp(App):
         hint outside the panel it applies to.
         """
         if action == "drill_down":
-            return self._panel == "stats"
+            return self._panel in ("stats", "chart")
         if action == "drill_up":
-            return self._drilled_from_stats
+            return self._drill_origin is not None
         if action in ("toggle_stats_fold", "toggle_all_stats_folds"):
             return (
                 self._panel == "stats"
@@ -447,6 +473,7 @@ class BudgetApp(App):
 
         self.query_one("#stats", Vertical).display = False
         chart.display = False
+        self.query_one("#pie", Static).display = False
         self.query_one("#prompt", Static).display = False
 
         self.reload()
@@ -498,6 +525,13 @@ class BudgetApp(App):
         if self._panel == "chart" and self.window is not None:
             self._build_chart()
             self._fill_chart()
+        # And the pie: it draws from the same report the statistics panel does, so a
+        # filter change has to rebuild that too, or the wedges would keep showing the
+        # scope that was active when the panel was opened.
+        if self._panel == "pie" and self.window is not None:
+            self._build_report()
+            self._build_pie()
+            self._fill_pie()
         self._refresh_status()
 
     def _fill_list(self, selector: str, labels: List[str]) -> None:
@@ -878,6 +912,73 @@ class BudgetApp(App):
             parts.append("text")
         return f"[{', '.join(parts)}] " if parts else ""
 
+    # ------------------------------------------------------------------- pie
+    def _build_pie(self) -> None:
+        """Turn the already-built report into wedges — no query of its own.
+
+        The pie and the statistics table read the same report (see reload()'s guard and
+        _show_pie()), so this is pure reshaping: charts.build_pie() already does the
+        depth-0, nonzero-share filtering (see its own docstring for why).
+        """
+        self._pie = (
+            charts.build_pie(self._report.categories) if self._report is not None else None
+        )
+
+    def _fill_pie(self) -> None:
+        """Render the wedges and their legend into the pie Static."""
+        static = self.query_one("#pie", Static)
+        pie = self._pie
+        if pie is None or not pie.slices:
+            static.update(Text("No net spending in this window.", style="dim"))
+            return
+
+        art = Text()
+        for row in range(pie.height):
+            for col in range(pie.width):
+                index = pie.mask[row][col]
+                if index is None:
+                    art.append(" ")
+                else:
+                    art.append(charts.BLOCK, style=PIE_COLORS[index % len(PIE_COLORS)])
+            art.append("\n")
+
+        legend = Table.grid(padding=(0, 1))
+        legend.add_column()  # swatch
+        legend.add_column()  # category name
+        legend.add_column(justify="right")  # share
+        legend.add_column(justify="right")  # amount
+        for index, one_slice in enumerate(pie.slices):
+            color = PIE_COLORS[index % len(PIE_COLORS)]
+            legend.add_row(
+                Text(charts.BLOCK * 2, style=color),
+                Text(_truncate(one_slice.name, 20)),
+                Text(f"{one_slice.share * 100:.1f}%", justify="right"),
+                Text(_fmt_amount(one_slice.amount_minor), style="red", justify="right"),
+            )
+
+        grid = Table.grid(padding=(0, 2))
+        grid.add_column()
+        grid.add_column()
+        grid.add_row(art, legend)
+        static.update(grid)
+
+    def _pie_status(self) -> str:
+        """One line, the same shape as _stats_status()/_chart_status()."""
+        report = self._report
+        window = report.window
+        label = "custom" if window.key == "custom" else window.label
+        pie = self._pie
+        count = len(pie.slices) if pie is not None else 0
+        excluded = (
+            f"{TRANSFER_MARK} {report.transfer_count} " if report.transfer_count else ""
+        )
+        return (
+            f"{label} {window.start}→{window.end} "
+            f"{count} categor{'y' if count == 1 else 'ies'} "
+            f"{excluded}"
+            f"net spend {_fmt_amount(-report.net_spend_minor)}"
+        )
+
     def _fill_periods(self) -> None:
         table = self.query_one("#periods", DataTable)
         table.clear()
@@ -922,6 +1023,9 @@ class BudgetApp(App):
             return
         if self._panel == "chart" and self._chart is not None:
             status.update(self._chart_status())
+            return
+        if self._panel == "pie" and self._report is not None:
+            status.update(self._pie_status())
             return
         if self._panel == "periods":
             status.update(
@@ -994,8 +1098,8 @@ class BudgetApp(App):
     # ---------------------------------------------------------------- events
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         # A sidebar filter is a new view; the flag it might invalidate is checked in
-        # _set_drilled_from_stats() (no-op if it was already clear).
-        self._set_drilled_from_stats(False)
+        # _set_drilled_from() (no-op if it was already clear).
+        self._set_drilled_from(None)
         index = event.list_view.index or 0
         list_id = event.list_view.id
         if list_id == "accounts":
@@ -1014,6 +1118,9 @@ class BudgetApp(App):
         """Enter on a row in the imports panel imports that file."""
         if event.data_table.id == "stats_table":
             self._drill_into_category(event.cursor_row)
+            return
+        if event.data_table.id == "chart":
+            self._drill_into_bar(event.cursor_row)
             return
         if event.data_table.id == "setup":
             if self._setup is not None and self._setup.question is not None:
@@ -1232,10 +1339,21 @@ class BudgetApp(App):
         self._prompt_panel = None
         self._set_panel("periods")
 
+    def _do_pie(self, arg: str) -> None:
+        """``pie`` opens the period picker; ``pie <period>`` skips it."""
+        if not arg:
+            self._show_periods("pie")
+            return
+        window = self._parse_window(arg)
+        if window is not None:
+            self._show_pie(window)
+
     def _open_period(self, window: stats.Window) -> None:
         """Send a period the picker just produced to whichever panel asked for it."""
         if self._picker_target == "chart":
             self._show_chart(window)
+        elif self._picker_target == "pie":
+            self._show_pie(window)
         else:
             self._show_stats(window)
 
@@ -1272,6 +1390,15 @@ class BudgetApp(App):
         self._build_chart()
         self._fill_chart()
         self._set_panel("chart")
+
+    def _show_pie(self, window: stats.Window) -> None:
+        self.window = window
+        self._range_pending = False
+        self._prompt_panel = None
+        self._build_report()
+        self._build_pie()
+        self._fill_pie()
+        self._set_panel("pie")
 
     def _ask_range(self) -> None:
         """Ask for an explicit range, answered in the command bar below the picker."""
@@ -1392,6 +1519,8 @@ class BudgetApp(App):
             self._do_stats(arg)
         elif name in {"chart", "graph"}:
             self._do_chart(arg)
+        elif name == "pie":
+            self._do_pie(arg)
         elif name == "help":
             self.notify(
                 "import — browse data/to_import; enter imports the selected file,\n"
@@ -1448,6 +1577,12 @@ class BudgetApp(App):
                 "  net draws either side of a centre line: money out to the left,\n"
                 "  money in to the right, so an even month sits on the line\n"
                 "  click a category in the sidebar to chart just that category\n"
+                "  enter, or the right arrow, on a bar lists that bucket's\n"
+                "  transactions; the left arrow goes back to the chart\n"
+                "pie — pick a period, then see spending by category as a pie\n"
+                "pie <period> — skip the picker (e.g. pie 6m, pie 1 year)\n"
+                "  only categories with real net spend get a wedge — a category\n"
+                "  that is all refund, or a window with no spending, draws none\n"
                 "all — clear filters   refresh — reload   quit — exit\n"
                 "Click an account/vendor/category to filter.\n"
                 "ctrl+n / ctrl+t — prefill rename / categorize for the selected\n"
@@ -1600,30 +1735,35 @@ class BudgetApp(App):
         self.reload()
         self.notify(f"{raw!r} → {display!r}")
 
-    def _set_drilled_from_stats(self, value: bool) -> None:
-        """Flip the "back to stats" flag, and nudge the footer to match.
+    def _set_drilled_from(self, origin: Optional[str]) -> None:
+        """Flip the "back to stats/chart" flag, and nudge the footer to match.
 
-        The footer only recomputes on its own when focus changes; a filter typed into
-        the command bar clears this flag without moving focus, so the hint would go
-        stale without an explicit refresh.
+        ``origin`` is ``"stats"``, ``"chart"``, or ``None`` to clear it. The footer only
+        recomputes on its own when focus changes; a filter typed into the command bar
+        clears this flag without moving focus, so the hint would go stale without an
+        explicit refresh.
         """
-        if value == self._drilled_from_stats:
+        if origin == self._drill_origin:
             return
-        self._drilled_from_stats = value
+        self._drill_origin = origin
         self.screen.refresh_bindings()
 
     def _set_panel(self, panel: str) -> None:
         """Show one of the main-view panels; escape always returns to transactions."""
         # Leaving the drilled-down view for any other panel invalidates "back to
-        # stats". _drill_into_category() and _go_back_to_stats() both set the flag to
-        # its real value themselves, after calling this, so this cannot undo either.
-        self._set_drilled_from_stats(False)
+        # stats"/"back to chart". _drill_into_category()/_drill_into_bar() and
+        # _go_back_from_drill() all set the flag to its real value themselves, after
+        # calling this, so this cannot undo any of them.
+        self._set_drilled_from(None)
         self._panel = panel
         for name in self.PANELS:
             self.query_one(f"#{name}").display = name == panel
         # The prompt belongs to whichever panel last raised a question.
         self.query_one("#prompt", Static).display = panel == self._prompt_panel
-        if panel == "txns":
+        if panel in ("txns", "pie"):
+            # "pie" has nothing to put a cursor on — a Static, not a DataTable — so it
+            # leaves the command bar focused rather than trying (and failing) to focus
+            # something that cannot take it.
             self.query_one("#command", Input).focus()
         else:
             self.query_one(self.PANEL_FOCUS.get(panel, f"#{panel}")).focus()
@@ -1685,7 +1825,7 @@ class BudgetApp(App):
 
     def _do_filter(self, arg: str) -> None:
         """`filter text` searches everything; `filter vendor:text` narrows the field."""
-        self._set_drilled_from_stats(False)  # a new search is a new view, not the drill-down's
+        self._set_drilled_from(None)  # a new search is a new view, not the drill-down's
         arg = arg.strip()
         if not arg:
             self.text_filter = None
@@ -2072,28 +2212,68 @@ class BudgetApp(App):
         # Panel first: reload() only rebuilds the report while the stats panel is up, and
         # rebuilding it under the new filter would rewrite the rows we just read.
         self._set_panel("txns")
-        self._set_drilled_from_stats(True)
+        self._set_drilled_from("stats")
         self.reload()
 
-    def _go_back_to_stats(self) -> None:
+    def _drill_into_bar(self, row: int) -> None:
+        """Enter, or the right arrow, on a chart row lists the transactions behind that bar.
+
+        The bar's own bucket becomes the date filter — clamped to the window's edges via
+        charts.bucket_date_range(), since the first and last buckets are usually partial
+        — intersected with whatever account/category/vendor/text filters already scope
+        the chart. Without the clamp, a bucket at either edge of the window would pull in
+        transactions the chart never drew, and the drilled-down rows would not sum back
+        to the bar just clicked.
+
+        Unlike a statistics drill-down this never touches the category filter — a bar is
+        a slice of time, not of category — so _pre_drill_category_filter just records the
+        filter already in place, and going back "restores" it as a no-op.
+        """
+        if self._chart is None or self.window is None or self._bucket is None:
+            return
+        if not 0 <= row < len(self._chart.bars):
+            return
+        bar = self._chart.bars[row]
+        self._pre_drill_category_filter = self.category_filter
+        self._pre_drill_date_filter = self.date_filter
+        self._drill_source_row = row
+        self.date_filter = charts.bucket_date_range(bar.key, self._bucket, self.window)
+        # Panel first: reload() only rebuilds the chart while the chart panel is up, and
+        # rebuilding it under the new date filter would rewrite the bars we just read.
+        self._set_panel("txns")
+        self._set_drilled_from("chart")
+        self.reload()
+
+    def _go_back_from_drill(self) -> None:
         """Left arrow, undoing exactly the drill-down that produced this view.
 
-        Mirrors _drill_into_category(): restores the filters it overwrote (which may be
-        None, or may be a filter the user had set before drilling in), rebuilds the
-        report under them, and returns the stats cursor to the row that was drilled
-        from.
+        Mirrors _drill_into_category()/_drill_into_bar(): restores the filters either one
+        overwrote (which may be None, or may be a filter the user had set before drilling
+        in), rebuilds whichever panel the drill-down came from, and returns its cursor to
+        the row that was drilled from.
         """
+        origin = self._drill_origin
         row = self._drill_source_row
         self.category_filter = self._pre_drill_category_filter
         self.date_filter = self._pre_drill_date_filter
         self._pre_drill_category_filter = None
         self._pre_drill_date_filter = None
         self._drill_source_row = None
-        self._set_drilled_from_stats(False)
-        # reload() while the panel is still "txns" resyncs the transactions/totals to
-        # the restored filters without rebuilding the report (see its own guard), so the
-        # report is rebuilt explicitly here, the same way _show_stats() does.
+        self._set_drilled_from(None)
+        # reload() while the panel is still "txns" resyncs the transactions/totals to the
+        # restored filters without rebuilding the report or chart (see their own guards),
+        # so whichever one is being returned to is rebuilt explicitly below, the same way
+        # _show_stats()/_show_chart() does.
         self.reload()
+        if origin == "chart":
+            self._build_chart()
+            self._fill_chart()
+            self._set_panel("chart")
+            if row is not None:
+                table = self.query_one("#chart", DataTable)
+                if 0 <= row < table.row_count:
+                    table.move_cursor(row=row)
+            return
         self._build_report()
         self._fill_stats()
         self._set_panel("stats")
@@ -2164,13 +2344,17 @@ class BudgetApp(App):
         self._prefill_command(f"{verb} {vendor.name} = ")
 
     def action_drill_down(self) -> None:
-        """The right arrow's twin of enter on a statistics row."""
+        """The right arrow's twin of enter on a statistics row or a chart bar."""
+        if self._panel == "chart":
+            table = self.query_one("#chart", DataTable)
+            self._drill_into_bar(table.cursor_row)
+            return
         table = self.query_one("#stats_table", DataTable)
         self._drill_into_category(table.cursor_row)
 
     def action_drill_up(self) -> None:
-        """The left arrow's "back" out of a statistics drill-down."""
-        self._go_back_to_stats()
+        """The left arrow's "back" out of a statistics or chart drill-down."""
+        self._go_back_from_drill()
 
     def action_toggle_stats_fold(self) -> None:
         """Space on a statistics row: fold/unfold its subtree. See check_action()."""
@@ -2216,7 +2400,7 @@ class BudgetApp(App):
     def action_show_transactions(self) -> None:
         # Escape is the general-purpose "leave this view" key, so it drops the
         # drill-down's back-link even when the panel is already "txns".
-        self._set_drilled_from_stats(False)
+        self._set_drilled_from(None)
         if self._setup is not None:
             self.notify(f"Setup for {self._setup.path.name} cancelled.")
             self._cancel_setup()
@@ -2244,7 +2428,7 @@ class BudgetApp(App):
         self.reload()
 
     def action_clear_filters(self) -> None:
-        self._set_drilled_from_stats(False)
+        self._set_drilled_from(None)
         self.account_filter = None
         self.vendor_filter = None
         self.category_filter = None

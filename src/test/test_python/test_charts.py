@@ -9,10 +9,11 @@ from datetime import date
 
 import pytest
 
-from budget_tracker import charts, stats
+from budget_tracker import charts, queries, stats
 from budget_tracker.db import get_engine, get_sessionmaker, init_db
 from budget_tracker.models import Account, Category, Currency, Transaction
 from budget_tracker.queries import BucketTotal
+from budget_tracker.stats import CategoryStat
 
 
 def _bucket(key, outflow, inflow=0, count=1, label=None):
@@ -375,3 +376,194 @@ def test_a_category_filter_narrows_the_chart(tmp_path):
     assert everything.total_minor == 7000
     assert just_food.total_minor == 2000
     assert len(just_food.bars) == 1
+
+
+# ------------------------------------------------------------- bucket → date range
+
+
+def test_bucket_date_range_covers_the_whole_bucket_when_the_window_does():
+    """A window that starts and ends on month boundaries has no partial buckets."""
+    window = stats.parse("2026-01-01..2026-03-31")
+    assert charts.bucket_date_range("2026-01", "month", window) == (
+        date(2026, 1, 1),
+        date(2026, 1, 31),
+    )
+    assert charts.bucket_date_range("2026-02", "month", window) == (
+        date(2026, 2, 1),
+        date(2026, 2, 28),
+    )
+    assert charts.bucket_date_range("2026-03", "month", window) == (
+        date(2026, 3, 1),
+        date(2026, 3, 31),
+    )
+
+
+def test_bucket_date_range_clamps_a_partial_edge_bucket():
+    """The window's own edges, not the calendar month's — a year-long window ending
+    today routinely starts and ends mid-month."""
+    window = stats.parse("2025-08-08..2026-08-07")
+    # The first bucket: only the tail end of August is in the window.
+    assert charts.bucket_date_range("2025-08", "month", window) == (
+        date(2025, 8, 8),
+        date(2025, 8, 31),
+    )
+    # A bucket entirely inside the window is unclamped.
+    assert charts.bucket_date_range("2025-12", "month", window) == (
+        date(2025, 12, 1),
+        date(2025, 12, 31),
+    )
+    # The last bucket: only the first week of August 2026 is in the window.
+    assert charts.bucket_date_range("2026-08", "month", window) == (
+        date(2026, 8, 1),
+        date(2026, 8, 7),
+    )
+
+
+def test_bucket_date_range_clamps_a_partial_day_or_week_bucket_too():
+    window = stats.parse("2026-01-05..2026-01-20")
+    assert charts.bucket_date_range("2026-01-05", "day", window) == (
+        date(2026, 1, 5),
+        date(2026, 1, 5),
+    )
+    # January 2026: Monday-starting weeks put 2026-01-19..25 as week 3; only the 19th and
+    # 20th are inside this window.
+    week_key = date(2026, 1, 19).strftime("%Y-W%W")
+    assert charts.bucket_date_range(week_key, "week", window) == (
+        date(2026, 1, 19),
+        date(2026, 1, 20),
+    )
+
+
+def test_bucket_date_range_rejects_a_key_that_is_not_in_the_window():
+    window = stats.parse("2026-01-01..2026-03-31")
+    with pytest.raises(ValueError, match="does not occur"):
+        charts.bucket_date_range("2026-07", "month", window)
+
+
+def test_drilling_into_a_bucket_sums_back_to_its_own_bar(tmp_path):
+    """The rows-add-up property, end to end: for both a whole bucket and a partial edge
+    one, the transactions inside the drilled date range sum to that bar's own figures —
+    the entire point of clamping to the window rather than the calendar bucket."""
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        currency, account = _seed(session)
+        # Straddles the boundary a real "1 year ending today" window would land on.
+        _txn(session, currency, account, date(2025, 8, 5), -500, "before window")
+        _txn(session, currency, account, date(2025, 8, 8), -1000, "first day in")
+        _txn(session, currency, account, date(2025, 8, 20), -2000, "rest of August")
+        _txn(session, currency, account, date(2025, 12, 15), -4000, "whole December")
+        _txn(session, currency, account, date(2026, 8, 1), -3000, "start of last month")
+        _txn(session, currency, account, date(2026, 8, 7), -1500, "last day in")
+        _txn(session, currency, account, date(2026, 8, 8), -9999, "after window")
+        session.commit()
+
+    window = stats.parse("2025-08-08..2026-08-07")
+    with session_factory() as session:
+        series = stats.spending_series(session, window, "month")
+    chart = charts.build(series, measure="spend")
+
+    with session_factory() as session:
+        for bar in chart.bars:
+            start, end = charts.bucket_date_range(bar.key, "month", window)
+            drilled = queries.get_totals(session, date_range=(start, end))
+            assert -drilled.outflow_minor == bar.outflow_minor, bar.key
+
+    partial_first = next(b for b in chart.bars if b.key == "2025-08")
+    assert partial_first.outflow_minor == 3000  # 1000 + 2000, the 500 before is excluded
+    partial_last = next(b for b in chart.bars if b.key == "2026-08")
+    assert partial_last.outflow_minor == 4500  # 3000 + 1500, the 9999 after is excluded
+    whole = next(b for b in chart.bars if b.key == "2025-12")
+    assert whole.outflow_minor == 4000
+
+
+# --------------------------------------------------------------------------- pie
+
+
+def _cat(name, share, total_minor, depth=0, category_id=1, parent_id=None):
+    """A CategoryStat with just enough filled in for the pie geometry tests."""
+    return CategoryStat(
+        name=name,
+        count=1,
+        total_minor=total_minor,
+        outflow_minor=min(0, total_minor),
+        inflow_minor=max(0, total_minor),
+        avg_month_minor=total_minor,
+        share=share,
+        parent_share=share,
+        category_id=category_id,
+        parent_id=parent_id,
+        depth=depth,
+    )
+
+
+def test_pie_only_uses_depth_zero_rows_with_real_net_spend():
+    categories = [
+        _cat("Food", 0.5, -5000, depth=0, category_id=1),
+        _cat("Dining", 0.3, -3000, depth=1, category_id=2, parent_id=1),  # excluded: not depth 0
+        _cat("Income", 0.0, 10000, depth=0, category_id=3),  # excluded: net positive, share 0
+        _cat("Travel", 0.5, -5000, depth=0, category_id=4),
+    ]
+    pie = charts.build_pie(categories, width=9, height=9)
+    names = {s.name for s in pie.slices}
+    assert names == {"Food", "Travel"}
+
+
+def test_an_empty_category_list_is_an_empty_pie():
+    pie = charts.build_pie([], width=9, height=9)
+    assert pie.slices == []
+    assert all(cell is None for row in pie.mask for cell in row)
+
+
+def test_a_window_with_no_net_spend_is_an_empty_pie():
+    """All income, or literally nothing — either way there is no wedge to draw."""
+    categories = [_cat("Paycheck", 0.0, 300000, depth=0, category_id=1)]
+    pie = charts.build_pie(categories, width=9, height=9)
+    assert pie.slices == []
+    assert all(cell is None for row in pie.mask for cell in row)
+
+
+def test_a_single_category_fills_the_whole_pie():
+    categories = [_cat("Everything", 1.0, -10000, depth=0, category_id=1)]
+    pie = charts.build_pie(categories, width=9, height=9)
+    assert len(pie.slices) == 1
+    inside = [cell for row in pie.mask for cell in row if cell is not None]
+    assert inside and all(index == 0 for index in inside)
+    # Some cell is actually inside the circle — an "empty" pie would pass the above
+    # check vacuously.
+    assert len(inside) > 0
+
+
+def test_pie_wedges_are_assigned_clockwise_from_the_top():
+    """Four cardinal points on a 9x9 grid (centre cell at index 4), against three
+    slices of 25/25/50 — chosen so each landmark falls cleanly on one side of a
+    boundary rather than exactly on it."""
+    categories = [
+        _cat("A", 0.25, -2500, depth=0, category_id=1),
+        _cat("B", 0.25, -2500, depth=0, category_id=2),
+        _cat("C", 0.50, -5000, depth=0, category_id=3),
+    ]
+    pie = charts.build_pie(categories, width=9, height=9)
+    top = pie.mask[0][4]
+    right = pie.mask[4][8]
+    bottom = pie.mask[8][4]
+    left = pie.mask[4][0]
+    corner = pie.mask[0][0]
+    assert (top, right, bottom, left) == (0, 1, 2, 2)
+    assert corner is None  # outside the circle entirely
+
+
+def test_pie_rejects_a_non_positive_box():
+    with pytest.raises(ValueError, match="at least 1"):
+        charts.build_pie([_cat("A", 1.0, -100)], width=0, height=9)
+    with pytest.raises(ValueError, match="at least 1"):
+        charts.build_pie([_cat("A", 1.0, -100)], width=9, height=0)
+
+
+def test_pie_slice_shares_and_amounts_come_straight_from_the_category_stat():
+    categories = [_cat("Food", 0.6, -12345, depth=0, category_id=7)]
+    pie = charts.build_pie(categories, width=9, height=9)
+    (food,) = pie.slices
+    assert food.name == "Food"
+    assert food.category_id == 7
+    assert food.share == 0.6
+    assert food.amount_minor == 12345  # a positive magnitude, not the signed total
