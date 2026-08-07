@@ -109,12 +109,19 @@ def test_infers_a_signed_layout_with_an_id_column(tmp_path):
 
 def test_signed_layout_asks_about_polarity(tmp_path):
     """A single signed column carries no signal of which sign is an outflow, so it is
-    always asked, with a real sample value so the choice is answerable at a glance."""
+    always asked, with real description/amount pairs so the choice is answerable at a
+    glance instead of resting on one arbitrary sample.
+
+    The prompt text itself is not the reference doc's business to pin down word for
+    word, but the two sample rows it must draw on (one of each sign, since the fixture
+    has both) are.
+    """
     path = _write(tmp_path, "signed.csv", SIGNED_CSV)
     fieldnames, rows = read_header_and_rows(path)
     inference = formats.infer("signed", fieldnames, rows)
     question = next(q for q in inference.questions if q.field == "invert_amount")
-    assert "-200.00000" in question.prompt  # the file's own first sample amount
+    assert "WIRE OUT" in question.prompt and "-200.00000" in question.prompt
+    assert "Interest Paid" in question.prompt and "0.03000" in question.prompt
     assert list(question.choices) == ["yes", "no"]
     assert question.default == "no"
 

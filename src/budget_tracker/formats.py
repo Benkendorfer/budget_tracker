@@ -408,21 +408,57 @@ def remaining_questions(values, rows, fieldnames):
     return questions
 
 
+def _sample_pairs(rows, description_column, amount_column, limit=3):
+    """Up to ``limit`` (description, amount) pairs, preferring a mix of signs.
+
+    A lone sample like "-75.00" is a coin flip: nothing says whether the file was
+    showing a purchase or a payment. Pairing it with its own description, and
+    including a sample of the opposite sign when the file has one, makes the direction
+    legible without the reader having to trust an arbitrary first row.
+    """
+    pairs = []
+    for row in rows:
+        amount = (row.get(amount_column) or "").strip() if amount_column else ""
+        if not amount:
+            continue
+        description = (row.get(description_column) or "").strip() if description_column else ""
+        pairs.append((description, amount))
+
+    first_by_sign: Dict[bool, int] = {}
+    for index, (_, amount) in enumerate(pairs):
+        negative = amount.lstrip().startswith("-")
+        first_by_sign.setdefault(negative, index)
+    chosen = sorted(first_by_sign.values())
+    for index in range(len(pairs)):
+        if len(chosen) >= limit:
+            break
+        if index not in chosen:
+            chosen.append(index)
+    return [pairs[i] for i in sorted(chosen)[:limit]]
+
+
 def _invert_amount_question(values, rows) -> Optional[Question]:
     """A debit/credit pair already says which side is an outflow; a single signed
     column does not, and providers disagree on which sign means money leaving the
-    account. Ask, with a real sample so the answer is obvious at a glance.
+    account. Ask, with real description/amount pairs so the answer is obvious at a
+    glance instead of resting on whichever sign the first row happened to have.
     """
     if values.get("amount_style") != SIGNED or "invert_amount" in values:
         return None
     column = values.get("amount_column")
-    samples = _samples(rows, column) if column else []
-    example = samples[0] if samples else "617.66"
+    examples = _sample_pairs(rows, values.get("description_column"), column)
+    if examples:
+        shown = "; ".join(
+            f"{description or '(no description)'} {amount}"
+            for description, amount in examples
+        )
+    else:
+        shown = "617.66"
     return Question(
         field="invert_amount",
         prompt=(
-            f"In this file a purchase appears as {example}. Does a positive amount "
-            "mean money leaving the account?"
+            f"In this file: {shown}. Does a positive amount mean money leaving the "
+            "account?"
         ),
         choices=("yes", "no"),
         default="no",
