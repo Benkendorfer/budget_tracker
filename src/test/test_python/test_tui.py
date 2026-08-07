@@ -6,8 +6,10 @@ suite does not need pytest-asyncio.
 
 import asyncio
 import datetime
+import io
 
 import pytest
+from rich.console import Console
 from sqlalchemy import text as sql_text
 from textual.widgets import DataTable, Input, ListView, Static
 
@@ -594,6 +596,123 @@ def test_transfer_rows_are_marked_in_the_table(tmp_path, monkeypatch):
     ordinary = next(v for k, v in rows.items() if "COFFEE" in k)
     assert "⇄" not in str(ordinary[1])
     assert "dim" not in str(ordinary[4].style)
+
+
+def _seed_same_account_transfer_candidates(tmp_path, monkeypatch):
+    """Two legs in one account, same amount and opposite sign, a day apart.
+
+    Only pairable with ``allow_same_account`` — the default rule requires different
+    accounts, so this fixture stays unpaired until ``transfers same-account`` runs.
+    """
+    db_path = tmp_path / "same_account.db"
+    engine = get_engine(db_path)
+    init_db(engine)
+    session_factory = get_sessionmaker(engine)
+    with session_factory() as session:
+        currency = Currency(value="USD", symbol="$", decimal_places=2)
+        session.add(currency)
+        session.flush()
+        account = Account(name="Checking", currency_id=currency.id)
+        session.add(account)
+        session.flush()
+        session.add(
+            Transaction(
+                account_id=account.id,
+                currency_id=currency.id,
+                posted_date=datetime.date(2025, 6, 1),
+                description="Move out",
+                raw_description="Move out",
+                value_minor=-50000,
+                category_source="unset",
+                import_hash="sa-out",
+            )
+        )
+        session.add(
+            Transaction(
+                account_id=account.id,
+                currency_id=currency.id,
+                posted_date=datetime.date(2025, 6, 2),
+                description="Move in",
+                raw_description="Move in",
+                value_minor=50000,
+                category_source="unset",
+                import_hash="sa-in",
+            )
+        )
+        session.commit()
+    monkeypatch.setenv("BUDGET_DB", str(db_path))
+    return session_factory
+
+
+def test_transfers_default_does_not_pair_same_account_legs(tmp_path, monkeypatch):
+    _seed_same_account_transfer_candidates(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._run_command("transfers")
+            await pilot.pause()
+            messages = [n.message for n in app._notifications]
+            return messages, app._totals.transfer_count
+
+    messages, transfer_count = asyncio.run(run())
+    assert any("Found 0 new transfer pair(s)" in m for m in messages)
+    assert transfer_count == 0
+
+
+def test_transfers_same_account_command_pairs_them(tmp_path, monkeypatch):
+    _seed_same_account_transfer_candidates(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._run_command("transfers same-account")
+            await pilot.pause()
+            messages = [n.message for n in app._notifications]
+            return messages, app._totals.transfer_count
+
+    messages, transfer_count = asyncio.run(run())
+    assert any(
+        "Found 1 new transfer pair(s) (same-account allowed)" in m for m in messages
+    )
+    assert transfer_count == 2
+
+
+def test_transfers_reset_undoes_a_same_account_pairing(tmp_path, monkeypatch):
+    _seed_same_account_transfer_candidates(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._run_command("transfers same-account")
+            await pilot.pause()
+            paired_count = app._totals.transfer_count
+
+            app._run_command("transfers reset")
+            await pilot.pause()
+            messages = [n.message for n in app._notifications]
+            return paired_count, messages, app._totals.transfer_count
+
+    paired_count, messages, reset_count = asyncio.run(run())
+    assert paired_count == 2
+    assert any("Un-paired 2 transaction(s)." in m for m in messages)
+    assert reset_count == 0
+
+
+def test_transfers_unknown_option_warns_and_changes_nothing(tmp_path, monkeypatch):
+    _seed_same_account_transfer_candidates(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._run_command("transfers bogus")
+            await pilot.pause()
+            messages = [n.message for n in app._notifications]
+            return messages, app._totals.transfer_count
+
+    messages, transfer_count = asyncio.run(run())
+    assert any("Unknown transfers option" in m and "bogus" in m for m in messages)
+    assert transfer_count == 0
 
 
 def test_transaction_table_shows_the_account_after_the_amount(tmp_path, monkeypatch):
@@ -1877,6 +1996,30 @@ def test_stats_table_indents_by_depth_and_shows_percent_parent(tmp_path, monkeyp
     assert rows[4][4] == "19.0%" and rows[4][5] == "19.0%"  # Groceries: Food holds nothing directly
 
 
+def test_footer_shows_every_shortcut_at_a_normal_width(tmp_path, monkeypatch):
+    """Textual's Footer truncates mid-word instead of dropping whole entries, so one
+    verbose label silently hides every binding after it — which is how "Fold/unfold"
+    became "F" and the fold-all key never appeared at all. The last binding is the
+    canary: if it is whole, nothing earlier was cut.
+    """
+    _setup_recent(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command("stats 1m")
+            await pilot.pause()
+            buffer = io.StringIO()
+            Console(file=buffer, width=130).print(app.screen._compositor)
+            return buffer.getvalue()
+
+    rendered = asyncio.run(run())
+    footer = next(line for line in rendered.splitlines() if "palette" in line)
+    # Every shortcut the statistics panel offers, the last one included.
+    for label in ("Refresh", "Clear", "Rename", "Categorise", "Transactions", "Fold all"):
+        assert label in footer, f"{label!r} missing or truncated: {footer.strip()!r}"
+
+
 def test_stats_table_fits_the_main_panel_with_a_deep_hierarchy(tmp_path, monkeypatch):
     """The % parent column and the deepest indentation must not push the table off-panel.
 
@@ -2918,3 +3061,257 @@ def test_stats_table_fold_indicator_fits_the_main_panel_on_a_deep_row(
     for label, width in widths.items():
         assert len(label) <= width, f"{label!r} does not fit in width {width}"
     assert all(len(row[0]) <= widths["Category"] for row in rows)
+
+
+# ----------------------------------------------------- statistics fold/unfold all ("f")
+
+
+def test_f_folds_and_unfolds_every_group_at_once(tmp_path, monkeypatch):
+    _seed_category_hierarchy(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command("stats 2025-01-01..2025-12-31")
+            await pilot.pause()
+            table = app.query_one("#stats_table", DataTable)
+            table.focus()
+            expanded = _stats_rows(app)
+
+            await pilot.press("f")
+            await pilot.pause()
+            collapsed = _stats_rows(app)
+
+            await pilot.press("f")  # press again: back to fully expanded
+            await pilot.pause()
+            reexpanded = _stats_rows(app)
+
+            return expanded, collapsed, reexpanded
+
+    expanded, collapsed, reexpanded = asyncio.run(run())
+    names_expanded = [row[0] for row in expanded]
+    assert names_expanded == [
+        "Food",
+        "  Dining",
+        "    Restaurants and Fast …",
+        "    Fast Food",
+        "  Groceries",
+        "TOTAL",
+    ]
+    # Food is the only top-level group, and folding it hides its entire subtree —
+    # Dining included — even though Dining itself is also independently foldable.
+    assert [row[0] for row in collapsed] == [f"{FOLD_INDICATOR} Food", "TOTAL"]
+    assert [row[0] for row in reexpanded] == names_expanded
+
+
+def test_f_always_collapses_when_any_group_is_expanded(tmp_path, monkeypatch):
+    """A mix of folded and unfolded groups is not "some folded, some not" after ``f`` —
+    the key always does something visible, so a partial state collapses fully rather
+    than being read as "some already folded" and unfolding the rest."""
+    _seed_category_hierarchy(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command("stats 2025-01-01..2025-12-31")
+            await pilot.pause()
+            table = app.query_one("#stats_table", DataTable)
+            table.focus()
+            table.move_cursor(row=1)  # Dining
+            await pilot.press("space")  # fold just Dining by hand
+            await pilot.pause()
+            partially_folded = _stats_rows(app)
+
+            await pilot.press("f")  # Food is still expanded, so this collapses all
+            await pilot.pause()
+            fully_collapsed = _stats_rows(app)
+
+            await pilot.press("f")  # and this expands all, Dining included
+            await pilot.pause()
+            fully_expanded = _stats_rows(app)
+
+            return partially_folded, fully_collapsed, fully_expanded
+
+    partially_folded, fully_collapsed, fully_expanded = asyncio.run(run())
+    assert [row[0] for row in partially_folded] == [
+        "Food",
+        f"  {FOLD_INDICATOR} Dining",
+        "  Groceries",
+        "TOTAL",
+    ]
+    assert [row[0] for row in fully_collapsed] == [f"{FOLD_INDICATOR} Food", "TOTAL"]
+    assert [row[0] for row in fully_expanded] == [
+        "Food",
+        "  Dining",
+        "    Restaurants and Fast …",
+        "    Fast Food",
+        "  Groceries",
+        "TOTAL",
+    ]
+
+
+def test_f_does_not_change_any_numbers(tmp_path, monkeypatch):
+    _seed_category_hierarchy(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command("stats 2025-01-01..2025-12-31")
+            await pilot.pause()
+            before = _stats_rows(app)
+            table = app.query_one("#stats_table", DataTable)
+            table.focus()
+            await pilot.press("f")
+            await pilot.pause()
+            after = _stats_rows(app)
+            return before, after
+
+    before, after = asyncio.run(run())
+    # Food's row (rolled up, including everything folded away) is unchanged; only its
+    # name grows the fold indicator.
+    assert before[0][0] == "Food"
+    assert after[0][0] == f"{FOLD_INDICATOR} Food"
+    assert before[0][1:] == after[0][1:]
+    # TOTAL, unaffected by folding, is byte-for-byte identical.
+    assert before[-1] == after[-1]
+
+
+def test_f_does_nothing_outside_the_stats_table(tmp_path, monkeypatch):
+    _setup_recent(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            txns = app.query_one("#txns", DataTable)
+            txns.focus()
+            before_txns = _rows_of(app, "txns")
+            await pilot.press("f")
+            await pilot.pause()
+            after_txns = _rows_of(app, "txns")
+            txns_panel = app._panel
+
+            app._run_command("rules")
+            await pilot.pause()
+            rules = app.query_one("#rules", DataTable)
+            rules.focus()
+            before_rules = _rows_of(app, "rules")
+            await pilot.press("f")
+            await pilot.pause()
+            after_rules = _rows_of(app, "rules")
+            rules_panel = app._panel
+
+            return (
+                before_txns,
+                after_txns,
+                txns_panel,
+                before_rules,
+                after_rules,
+                rules_panel,
+            )
+
+    (
+        before_txns,
+        after_txns,
+        txns_panel,
+        before_rules,
+        after_rules,
+        rules_panel,
+    ) = asyncio.run(run())
+    assert before_txns == after_txns
+    assert txns_panel == "txns"
+    assert before_rules == after_rules
+    assert rules_panel == "rules"
+
+
+def test_f_still_types_a_literal_f_in_the_command_bar(tmp_path, monkeypatch):
+    """The fold-all binding is deliberately not priority=True: a plain 'f' typed into a
+    command must reach the Input, not get swallowed as a fold-all keypress."""
+    _setup_recent(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            text = "filter food"
+            await pilot.press(*text)
+            return app.query_one("#command", Input).value
+
+    assert asyncio.run(run()) == "filter food"
+
+
+def _seed_category_hierarchy_with_income_sibling(tmp_path, monkeypatch):
+    """``_seed_category_hierarchy``'s Food tree, plus a leaf ``Income`` category beside
+    it — so folding every group leaves one visible, non-foldable row (Income) whose
+    table index still has to map back to the right category (see
+    test_drill_down_after_fold_all_maps_to_the_row_actually_visible).
+    """
+    db_path = tmp_path / "deep_with_income.db"
+    engine = get_engine(db_path)
+    init_db(engine)
+    session_factory = get_sessionmaker(engine)
+    with session_factory() as session:
+        currency = Currency(value="USD", symbol="$", decimal_places=2)
+        session.add(currency)
+        session.flush()
+        account = Account(name="Checking", currency_id=currency.id)
+        session.add(account)
+        session.flush()
+        restaurants = categories.ensure_path(
+            session, "Food > Dining > Restaurants and Fast Casual Spots"
+        )
+        fast_food = categories.ensure_path(session, "Food > Dining > Fast Food")
+        groceries = categories.ensure_path(session, "Food > Groceries")
+        income = categories.ensure_path(session, "Income")
+        session.flush()
+
+        def txn(day, amount, description, category):
+            session.add(
+                Transaction(
+                    account_id=account.id,
+                    currency_id=currency.id,
+                    posted_date=day,
+                    description=description,
+                    raw_description=description,
+                    value_minor=amount,
+                    category_id=category.id,
+                    category_source="manual",
+                    import_hash=f"income-{description}-{day}-{amount}",
+                )
+            )
+
+        txn(datetime.date(2025, 3, 1), -12_345_678, "Big meal", restaurants)
+        txn(datetime.date(2025, 3, 2), -2_345_678, "Fast food", fast_food)
+        txn(datetime.date(2025, 3, 3), -3_456_789, "Groceries", groceries)
+        txn(datetime.date(2025, 3, 4), 500_000, "Paycheck", income)
+        session.commit()
+    monkeypatch.setenv("BUDGET_DB", str(db_path))
+    return session_factory
+
+
+def test_drill_down_after_fold_all_maps_to_the_row_actually_visible(
+    tmp_path, monkeypatch
+):
+    """The same trap the per-row fold has: once ``f`` hides Food's whole subtree, the
+    next visible row (Income) is table row 1, and a drill-down there must open Income,
+    not whatever used to sit at row 1 before everything collapsed.
+    """
+    _seed_category_hierarchy_with_income_sibling(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command("stats 2025-01-01..2025-12-31")
+            await pilot.pause()
+            table = app.query_one("#stats_table", DataTable)
+            table.focus()
+            await pilot.press("f")
+            await pilot.pause()
+            rows = _stats_rows(app)
+            assert rows[1][0] == "Income"  # visible, right after collapsed Food
+
+            table.move_cursor(row=1)
+            await pilot.press("enter")
+            await pilot.pause()
+            return [t.description for t in app._txns]
+
+    descriptions = asyncio.run(run())
+    assert descriptions == ["Paycheck"]

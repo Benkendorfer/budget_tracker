@@ -165,12 +165,17 @@ class BudgetApp(App):
     # Panels whose widget is not itself focusable name the child that takes focus.
     PANEL_FOCUS = {"stats": "#stats_table"}
 
+    # Footer labels are terse on purpose. Textual's Footer truncates mid-word rather than
+    # dropping whole entries, so a verbose label does not cost itself — it costs every
+    # binding after it, silently. At 130 columns the descriptive originals ran to ~160
+    # and cut "Fold/unfold" to "F", hiding the last two bindings entirely. The key names
+    # carry most of the meaning anyway, and `help` spells all of them out in full.
     BINDINGS = [
         ("ctrl+r", "refresh", "Refresh"),
-        ("ctrl+l", "clear_filters", "Clear filters"),
-        ("ctrl+n", "rename_vendor", "Rename vendor"),
-        ("ctrl+t", "categorize_vendor", "Categorise vendor"),
-        ("escape", "show_transactions", "Back to transactions"),
+        ("ctrl+l", "clear_filters", "Clear"),
+        ("ctrl+n", "rename_vendor", "Rename"),
+        ("ctrl+t", "categorize_vendor", "Categorise"),
+        ("escape", "show_transactions", "Transactions"),
         # DataTable binds left/right itself (cursor movement between cells), which would
         # otherwise eat these before an ordinary App binding ever saw them. priority=True
         # checks the App first; check_action() below opts out — returning False, not just
@@ -183,7 +188,11 @@ class BudgetApp(App):
         # it, breaking ordinary typing. DataTable does not bind space itself, so a
         # plain (non-priority) binding reaches this once it has bubbled past whatever
         # is focused — see check_action() below for the "only on #stats_table" gate.
-        Binding("space", "toggle_stats_fold", "Fold/unfold", show=True),
+        Binding("space", "toggle_stats_fold", "Fold", show=True),
+        # Same reasoning as space: a plain letter binding, not priority, so a command
+        # like "filter foo" still gets its 'f' typed into #command rather than toggling
+        # every fold in the stats table out from under the user.
+        Binding("f", "toggle_all_stats_folds", "Fold all", show=True),
         ("ctrl+c", "quit", "Quit"),
     ]
 
@@ -306,7 +315,7 @@ class BudgetApp(App):
             return self._panel == "stats"
         if action == "drill_up":
             return self._drilled_from_stats
-        if action == "toggle_stats_fold":
+        if action in ("toggle_stats_fold", "toggle_all_stats_folds"):
             return (
                 self._panel == "stats"
                 and self.focused is not None
@@ -581,6 +590,28 @@ class BudgetApp(App):
         table = self.query_one("#stats_table", DataTable)
         if 0 <= row < table.row_count:
             table.move_cursor(row=row)
+
+    def _toggle_fold_all(self) -> None:
+        """``f``: fold every group if any is expanded, else unfold them all.
+
+        "Any expanded" rather than "all collapsed" so the key always visibly does
+        something — a mix of folded and unfolded groups collapses fully on the first
+        press instead of silently unfolding the already-collapsed ones.
+        """
+        if not self._foldable_ids:
+            return
+        table = self.query_one("#stats_table", DataTable)
+        row = table.cursor_row
+        if self._foldable_ids - self._collapsed:
+            self._collapsed |= self._foldable_ids
+        else:
+            self._collapsed -= self._foldable_ids
+        self._fill_stats()
+        # Collapsing/expanding everything moves rows around far more than a single
+        # toggle does, so there is no single "same row" to return to — just keep the
+        # cursor in range rather than landing on an arbitrary category.
+        if table.row_count:
+            table.move_cursor(row=min(row, table.row_count - 1))
 
     def _add_stats_total_row(self, table: DataTable) -> None:
         """A closing total, summing the depth-0 rows above it.
@@ -1076,7 +1107,11 @@ class BudgetApp(App):
                 "category merge <source> = <target> — fold one category into another:\n"
                 "  repoints its transactions, rules, and children, then deletes it\n"
                 "  (asks for confirmation, naming what will move)\n"
-                "transfers [reset] — pair up movements between your own accounts\n"
+                "transfers — pair up movements between your own accounts\n"
+                "transfers same-account — also pair legs within the same account;\n"
+                "  off by default, since it makes an accidental false pairing more\n"
+                "  likely (for providers whose sub-accounts you track as one account)\n"
+                "transfers reset — un-pair everything transfers detected\n"
                 "merge <account> = <account> — fold one account into another\n"
                 "filter <text> — search description, vendor, and raw name\n"
                 "filter vendor:<text> — search one field (description/vendor/raw)\n"
@@ -1087,6 +1122,7 @@ class BudgetApp(App):
                 "  enter, or the right arrow, on a category row lists that window's\n"
                 "  transactions; the left arrow goes back to the breakdown\n"
                 "  space, on a category row with children, folds/unfolds its subtree\n"
+                "  f folds/unfolds every group at once\n"
                 "all — clear filters   refresh — reload   quit — exit\n"
                 "Click an account/vendor/category to filter.\n"
                 "ctrl+n / ctrl+t — prefill rename / categorize for the selected\n"
@@ -1336,11 +1372,27 @@ class BudgetApp(App):
         self.notify(message, markup=False, timeout=8)
 
     def _do_transfers(self, arg: str) -> None:
+        arg = arg.strip()
         with self.session_factory() as session:
-            if arg.strip() in {"reset", "clear"}:
+            if arg in {"reset", "clear"}:
                 reset = transfers.clear_transfers(session)
                 session.commit()
                 message = f"Un-paired {reset} transaction(s)."
+            elif arg == "same-account":
+                # Opt-in only: see transfers.detect_transfers for why this is not the
+                # default (a false same-account pairing silently drops two real
+                # transactions from the totals).
+                pairs = transfers.detect_transfers(session, allow_same_account=True)
+                session.commit()
+                message = f"Found {pairs} new transfer pair(s) (same-account allowed)."
+            elif arg:
+                self.notify(
+                    f"Unknown transfers option: {arg!r}. Try 'transfers', "
+                    "'transfers same-account', or 'transfers reset'.",
+                    severity="warning",
+                    markup=False,
+                )
+                return
             else:
                 pairs = transfers.detect_transfers(session)
                 session.commit()
@@ -1762,6 +1814,10 @@ class BudgetApp(App):
         """Space on a statistics row: fold/unfold its subtree. See check_action()."""
         table = self.query_one("#stats_table", DataTable)
         self._toggle_fold(table.cursor_row)
+
+    def action_toggle_all_stats_folds(self) -> None:
+        """``f`` on the statistics table: fold/unfold every group. See check_action()."""
+        self._toggle_fold_all()
 
     def action_rename_vendor(self) -> None:
         self._prefill_for_vendor("rename")

@@ -85,6 +85,7 @@ the bottom:
 | `stats` | Pick a time window, then see spending per category (see below) |
 | `stats <window>` | Skip the picker: `stats 6m`, `stats 1 year`, `stats 2025-01-01..2025-06-30` |
 | `transfers` | Pair up movements between your own accounts (`transfers reset` undoes it) |
+| `transfers same-account` | Also pair legs within the same account (see below); off by default |
 | `rules` | Open the rules panel — both kinds of rule (`rule` on its own does the same); `escape` returns |
 | `all` | Clear all filters |
 | `refresh` | Reload from the database |
@@ -94,9 +95,9 @@ the bottom:
 Keyboard shortcuts: `ctrl+l` clears filters, `ctrl+r` refreshes, `escape` returns to the
 transactions from the rules panel, and `ctrl+c` quits. On a statistics row, the right
 arrow drills into that category's transactions (same as `enter`); the left arrow goes
-back to the breakdown it came from, once you have drilled into one; and `space` folds or
-unfolds a category's subtree — see "Statistics" below. The footer shows the arrows only
-while they do something.
+back to the breakdown it came from, once you have drilled into one; `space` folds or
+unfolds a category's subtree; and `f` folds or unfolds every group at once — see
+"Statistics" below. The footer shows the arrows only while they do something.
 
 `ctrl+n` prefills a `rename` command for whichever vendor you are pointing at, and
 `ctrl+t` prefills a `categorize` command for the same vendor. With the transaction table
@@ -165,6 +166,7 @@ budget category merge Dining Snacks --yes
 
 # Pair up money moved between your own accounts.
 budget transfers --days 5
+budget transfers --same-account   # also pair legs within one account (see below)
 budget transfers --reset
 ```
 
@@ -412,6 +414,10 @@ rolls up its descendants. `space` does nothing on a leaf row or the closing `TOT
 Folded categories stay folded across a new window, a filter change, and drilling into a
 row and back out.
 
+Press `f` to fold or unfold every group at once, instead of one row at a time. It always
+does something visible: if any group is currently expanded, `f` collapses them all;
+otherwise it expands them all.
+
 The panel is scoped by whatever filters are already active: click an account in the
 sidebar, or run `filter`, and the statistics narrow to match. Transfers are left out of
 the figures, and the status line reports how many (`⇄ 43`) so the money is never missing
@@ -460,6 +466,16 @@ few days apart in different accounts can be paired by mistake. Two things guard 
 that: a category you set by hand is never overwritten, and `budget transfers --reset`
 un-pairs everything and restores the categories detection assigned, leaving manual ones
 alone. If you get spurious matches, a smaller `--days` window is the first thing to try.
+
+By default a pair must sit in **different** accounts — a same-account "pair" is far more
+likely to be a coincidence than a real transfer. `budget transfers --same-account` (or
+`transfers same-account` in the app) relaxes that, for the case where several
+sub-accounts of one provider are tracked here as a single account, so a move between them
+never gets a different `account_id` to pair across and would otherwise go undetected
+forever. It stays opt-in rather than the default because relaxing the rule makes an
+accidental pairing more likely, and a false pairing silently removes two real transactions
+from your totals — worse than leaving a real transfer undetected. It is reversible the
+same way, with `transfers reset`.
 
 ### Importing data
 
