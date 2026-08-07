@@ -12,7 +12,12 @@ from . import categories as categories_module
 from . import formats, queries
 from . import transfers as transfers_module
 from .db import DEFAULT_DB_PATH, get_engine, get_sessionmaker, init_db
-from .importer import DEFAULT_CURRENCY_CODE, import_csv, read_header_and_rows
+from .importer import (
+    DEFAULT_CURRENCY_CODE,
+    import_csv,
+    list_inbox,
+    read_header_and_rows,
+)
 
 # cli.py -> budget_tracker -> src -> <repo root>
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -20,24 +25,49 @@ TO_IMPORT_DIR = _REPO_ROOT / "data" / "to_import"
 
 
 def _select_csv_interactively() -> Optional[Path]:
-    csv_files = sorted(TO_IMPORT_DIR.glob("*.csv"))
-    if not csv_files:
-        print(f"No CSV files found in {TO_IMPORT_DIR}")
-        return None
-    print("Select a CSV file to import:")
-    for index, path in enumerate(csv_files, start=1):
-        print(f"  [{index}] {path.name}")
-    choice = input(f"Enter number (1-{len(csv_files)}) or q to quit: ").strip()
-    if choice.lower() in {"q", "quit", ""}:
-        return None
-    try:
-        index = int(choice)
-        if not 1 <= index <= len(csv_files):
-            raise ValueError
-    except ValueError:
-        print("Invalid selection.")
-        return None
-    return csv_files[index - 1]
+    """Pick a CSV from the inbox, descending into sub-directories on the way.
+
+    Sub-directories are offered as ordinary numbered choices, ``../`` among them, so
+    reaching a nested file needs no path typing. :func:`importer.list_inbox` supplies the
+    ``../`` only while there is one, which is what keeps the walk inside the inbox.
+    """
+    directory = TO_IMPORT_DIR
+    while True:
+        listing = list_inbox(directory, TO_IMPORT_DIR)
+        entries = []  # (label, path, is_directory)
+        if listing.parent is not None:
+            entries.append(("../", listing.parent, True))
+        for folder in listing.folders:
+            plural = "" if folder.csv_count == 1 else "s"
+            entries.append(
+                (f"{folder.name}/  ({folder.csv_count} CSV{plural})", folder.path, True)
+            )
+        entries.extend((path.name, path, False) for path in listing.files)
+
+        if not entries:
+            print(f"Nothing to import in {directory}")
+            return None
+
+        print(f"\n{directory}")
+        for index, (label, _path, _is_dir) in enumerate(entries, start=1):
+            print(f"  [{index}] {label}")
+        choice = input(f"Enter number (1-{len(entries)}) or q to quit: ").strip()
+        if choice.lower() in {"q", "quit", ""}:
+            return None
+        try:
+            index = int(choice)
+            if not 1 <= index <= len(entries):
+                raise ValueError
+        except ValueError:
+            # Re-prompt rather than giving up. A mistyped number is a slip, and quitting
+            # the whole import over it means walking back down the tree again.
+            print("Invalid selection.")
+            continue
+
+        _label, path, is_directory = entries[index - 1]
+        if not is_directory:
+            return path
+        directory = path
 
 
 def _resolve_format(session, path: Path):

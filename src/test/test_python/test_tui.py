@@ -3315,3 +3315,877 @@ def test_drill_down_after_fold_all_maps_to_the_row_actually_visible(
 
     descriptions = asyncio.run(run())
     assert descriptions == ["Paycheck"]
+
+
+
+# ------------------------------------------------------------------------- chart
+
+
+CHART_ROWS = (
+    # (day, minor amount, description, category)
+    (datetime.date(2026, 1, 15), -2000, "SHOP A", "Food"),
+    (datetime.date(2026, 1, 20), -1000, "SHOP B", "Food"),
+    (datetime.date(2026, 2, 10), -500, "SHOP C", None),
+    (datetime.date(2026, 3, 5), 300_000, "PAYCHECK", None),
+    (datetime.date(2026, 3, 6), -4000, "SHOP D", "Travel"),
+)
+
+# The window the chart tests use, chosen so month buckets land on the seeded data
+# exactly. Out: January 30.00, February 5.00, March 40.00. In: March 3,000.00.
+CHART_WINDOW = "2026-01-01..2026-03-31"
+
+# 13 cells either side of the axis, per charts.DEFAULT_WIDTH.
+HALF = 13
+
+
+def _setup_chart(tmp_path, monkeypatch):
+    """Absolute dates, seeded directly, so bucket boundaries are not relative to today."""
+    db_path = tmp_path / "chart.db"
+    engine = get_engine(db_path)
+    init_db(engine)
+    session_factory = get_sessionmaker(engine)
+    with session_factory() as session:
+        currency = Currency(value="USD", symbol="$", decimal_places=2)
+        session.add(currency)
+        session.flush()
+        account = Account(name="Checking", currency_id=currency.id)
+        session.add(account)
+        session.flush()
+        for day, amount, description, category_name in CHART_ROWS:
+            category = (
+                categories.ensure_path(session, category_name)
+                if category_name
+                else None
+            )
+            session.add(
+                Transaction(
+                    account_id=account.id,
+                    currency_id=currency.id,
+                    category_id=category.id if category is not None else None,
+                    posted_date=day,
+                    description=description,
+                    raw_description=description,
+                    value_minor=amount,
+                    import_hash=f"{day}-{amount}-{description}",
+                )
+            )
+        session.commit()
+    monkeypatch.setenv("BUDGET_DB", str(db_path))
+    return session_factory
+
+
+def _chart_rows(app):
+    return _rows_of(app, "chart")
+
+
+def _chart_headers(app):
+    table = app.query_one("#chart", DataTable)
+    return [str(column.label) for column in table.columns.values()]
+
+
+def test_the_chart_defaults_to_net_drawn_either_side_of_the_axis(tmp_path, monkeypatch):
+    """January and February cost money and grow left; March took in far more than it
+    spent, so it grows right. That sign is the whole reason net is the default."""
+    _setup_chart(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command(f"chart {CHART_WINDOW} month")
+            await pilot.pause()
+            return _chart_rows(app), app._panel, app._measure, app.focused.id
+
+    rows, panel, measure, focused = asyncio.run(run())
+    assert (panel, measure, focused) == ("chart", "net", "chart")
+    assert [row[0] for row in rows[:3]] == ["2026-01", "2026-02", "2026-03"]
+    # March is the peak (+2,960.00) and fills its whole side.
+    assert rows[2][1] == " " * HALF + "│" + "█" * HALF
+    # January (-30.00) is a rounding sliver on the other side of the axis.
+    assert rows[0][1] == " " * (HALF - 1) + "█" + "│" + " " * HALF
+    assert [row[2] for row in rows[:3]] == ["-30.00", "-5.00", "2,960.00"]
+
+
+def test_the_net_axis_lines_up_on_every_row(tmp_path, monkeypatch):
+    """A diverging chart whose centre wanders is not readable as a chart."""
+    _setup_chart(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command(f"chart {CHART_WINDOW} month")
+            await pilot.pause()
+            return [row[1] for row in _chart_rows(app)[:3]]
+
+    bars = asyncio.run(run())
+    assert all(len(bar) == 2 * HALF + 1 for bar in bars)
+    assert all(bar[HALF] == "│" for bar in bars)
+
+
+def test_a_bucket_that_came_out_even_sits_on_the_axis(tmp_path, monkeypatch):
+    """200.00 spent and 200.00 refunded is not a heavy month, and must not draw as one."""
+    session_factory = _setup_chart(tmp_path, monkeypatch)
+    with session_factory() as session:
+        currency = session.query(Currency).one()
+        account = session.query(Account).one()
+        for amount, description in ((-20_000, "BIG BUY"), (20_000, "REFUNDED")):
+            session.add(
+                Transaction(
+                    account_id=account.id,
+                    currency_id=currency.id,
+                    posted_date=datetime.date(2026, 2, 20),
+                    description=description,
+                    raw_description=description,
+                    value_minor=amount,
+                    import_hash=f"even-{description}",
+                )
+            )
+        session.commit()
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command(f"chart {CHART_WINDOW} month spending")
+            await pilot.pause()
+            spending = _chart_rows(app)
+            app._run_command("chart net")
+            await pilot.pause()
+            return spending, _chart_rows(app)
+
+    spending, net = asyncio.run(run())
+    # Charted as spending, February is now the biggest month of the three.
+    assert spending[1][2] == "205.00"
+    assert spending[1][1] == "█" * 27
+    # Charted as net, it is a sliver: the refund cancelled almost all of it.
+    assert net[1][2] == "-5.00"
+    assert net[1][1].count("█") == 1
+
+
+def test_the_measure_key_cycles_net_spending_income(tmp_path, monkeypatch):
+    _setup_chart(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command(f"chart {CHART_WINDOW} month")
+            await pilot.pause()
+            app.query_one("#chart", DataTable).focus()
+            seen = [(app._measure, _chart_headers(app)[1])]
+            for _ in range(3):
+                await pilot.press("m")
+                await pilot.pause()
+                seen.append((app._measure, _chart_headers(app)[1]))
+            return seen
+
+    seen = asyncio.run(run())
+    assert [measure for measure, _header in seen] == ["net", "spend", "income", "net"]
+    # The header names what is being drawn, and the net one explains its own axis.
+    assert seen[0][1] == "Net (← out | in →)"
+    assert seen[1][1] == "Spending"
+    assert seen[2][1] == "Income"
+
+
+def test_the_figure_columns_follow_the_measure(tmp_path, monkeypatch):
+    """The charted measure comes first, then whatever is most worth seeing beside it."""
+    _setup_chart(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            headers, rows = {}, {}
+            for measure in ("net", "spending", "income"):
+                app._run_command(f"chart {CHART_WINDOW} month {measure}")
+                await pilot.pause()
+                headers[measure] = _chart_headers(app)
+                rows[measure] = _chart_rows(app)
+            return headers, rows
+
+    headers, rows = asyncio.run(run())
+    assert headers["net"] == ["Period", "Net (← out | in →)", "Net", "Out", "Txns"]
+    assert headers["spending"] == ["Period", "Spending", "Out", "Net", "Txns"]
+    assert headers["income"] == ["Period", "Income", "In", "Net", "Txns"]
+    # March: 40.00 out, 3,000.00 in, 2,960.00 net — the same three figures, reordered.
+    assert rows["net"][2][2:4] == ["2,960.00", "40.00"]
+    assert rows["spending"][2][2:4] == ["40.00", "2,960.00"]
+    assert rows["income"][2][2:4] == ["3,000.00", "2,960.00"]
+
+
+def test_spending_and_income_bars_are_left_anchored_with_no_axis(tmp_path, monkeypatch):
+    """Only net has a sign to encode, so the other two use the conventional bar and the
+    full width of the column rather than half of it."""
+    _setup_chart(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command(f"chart {CHART_WINDOW} month spending")
+            await pilot.pause()
+            spending = _chart_rows(app)
+            app._run_command("chart income")
+            await pilot.pause()
+            return spending, _chart_rows(app)
+
+    spending, income = asyncio.run(run())
+    assert all("│" not in row[1] for row in spending[:3])
+    # March spends the most, so it fills the whole 27-column width.
+    assert spending[2][1] == "█" * 27
+    assert spending[0][1] == "█" * 20 + "▎"  # 30.00 of 40.00
+    # Income lands only in March, so the other two months are empty.
+    assert income[2][1] == "█" * 27
+    assert [income[0][1], income[1][1]] == ["", ""]
+    assert [income[0][2], income[1][2]] == ["0.00", "0.00"]
+
+
+def test_a_quiet_bucket_is_drawn_empty_rather_than_dropped(tmp_path, monkeypatch):
+    """A month with nothing in it must still occupy a row; a chart that silently skips
+    it reads as though the calendar itself had no April."""
+    _setup_chart(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command("chart 2026-01-01..2026-04-30 month spending")
+            await pilot.pause()
+            return _chart_rows(app)
+
+    rows = asyncio.run(run())
+    assert [row[0] for row in rows[:4]] == ["2026-01", "2026-02", "2026-03", "2026-04"]
+    assert rows[3][1] == ""  # April: present, empty, and not a zero-width lie
+    assert rows[3][2] == "0.00"
+
+
+def test_chart_total_row_follows_the_measure(tmp_path, monkeypatch):
+    _setup_chart(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            totals = {}
+            for measure in ("net", "spending", "income"):
+                app._run_command(f"chart {CHART_WINDOW} month {measure}")
+                await pilot.pause()
+                totals[measure] = _chart_rows(app)[-1]
+            return totals
+
+    totals = asyncio.run(run())
+    for measure, row in totals.items():
+        assert row[0] == "TOTAL", measure
+        assert row[4] == "5", measure
+    # 3,000.00 in less 75.00 out, and the average is of whatever is charted.
+    assert totals["net"][2:4] == ["2,925.00", "75.00"]
+    assert totals["net"][1] == "avg 975.00/month"
+    assert totals["spending"][2:4] == ["75.00", "2,925.00"]
+    assert totals["spending"][1] == "avg 25.00/month"
+    assert totals["income"][2:4] == ["3,000.00", "2,925.00"]
+    assert totals["income"][1] == "avg 1,000.00/month"
+
+
+def test_an_empty_window_charts_no_total_row(tmp_path, monkeypatch):
+    """Same rule as the statistics table: a row of zeroes reads as a finding."""
+    _setup_chart(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command("chart 2020-01-01..2020-03-31 month")
+            await pilot.pause()
+            return _chart_rows(app)
+
+    rows = asyncio.run(run())
+    assert [row[0] for row in rows] == ["2020-01", "2020-02", "2020-03"]
+    assert all("█" not in row[1] for row in rows)
+
+
+def test_selecting_a_category_rescopes_the_open_chart(tmp_path, monkeypatch):
+    """The headline of the feature: the sidebar is how a category is chosen, so the bars
+    have to follow it without the user reissuing the command."""
+    _setup_chart(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command(f"chart {CHART_WINDOW} month spending")
+            await pilot.pause()
+            everything = _chart_rows(app)
+
+            food = next(c for c in app._categories if c.name == "Food")
+            app.category_filter = food.id
+            app.reload()
+            await pilot.pause()
+            return everything, _chart_rows(app), str(app.query_one("#status", Static).content)
+
+    everything, food_rows, status = asyncio.run(run())
+    assert everything[-1][2] == "75.00"
+    # Food is January's 20.00 + 10.00 and nothing else.
+    assert [row[2] for row in food_rows[:3]] == ["30.00", "0.00", "0.00"]
+    assert food_rows[-1][2] == "30.00"
+    assert food_rows[0][1] == "█" * 27  # rescaled: January is now the peak
+    # And the status line says which category, or the chart is unreadable.
+    assert "Food" in status
+
+
+def test_the_measure_survives_a_new_period_but_the_bucket_is_rederived(
+    tmp_path, monkeypatch
+):
+    """The measure is a question about the money; the bucket is a property of the range.
+    Daily bars chosen for one month are unreadable stretched over a year."""
+    _setup_chart(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command("chart 2026-01-01..2026-01-20 income")
+            await pilot.pause()
+            first = (app._bucket, app._measure)
+            app._run_command("chart 2026-01-01..2026-12-31")
+            await pilot.pause()
+            return first, (app._bucket, app._measure)
+
+    first, second = asyncio.run(run())
+    assert first == ("day", "income")
+    assert second == ("month", "income")
+
+
+def test_the_bucket_key_cycles_day_week_month(tmp_path, monkeypatch):
+    _setup_chart(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command(f"chart {CHART_WINDOW} month")
+            await pilot.pause()
+            app.query_one("#chart", DataTable).focus()
+            seen = [app._bucket]
+            for _ in range(3):
+                await pilot.press("b")
+                await pilot.pause()
+                seen.append(app._bucket)
+            return seen, len(_chart_rows(app))
+
+    seen, row_count = asyncio.run(run())
+    assert seen == ["month", "day", "week", "month"]
+    assert row_count == 4  # back to three months and a total
+
+
+def test_the_chart_keys_are_inert_outside_the_chart(tmp_path, monkeypatch):
+    """'b' and 'm' are plain letters, so they must stay typeable everywhere else."""
+    _setup_chart(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command(f"chart {CHART_WINDOW} month")
+            await pilot.pause()
+            app._run_command("stats " + CHART_WINDOW)
+            await pilot.pause()
+            app.query_one("#stats_table", DataTable).focus()
+            await pilot.press("b")
+            await pilot.press("m")
+            await pilot.pause()
+            on_stats = (app._bucket, app._measure)
+
+            app.query_one("#command", Input).focus()
+            await pilot.press("b", "m")
+            await pilot.pause()
+            return on_stats, (app._bucket, app._measure), app.query_one("#command", Input).value
+
+    on_stats, after_typing, typed = asyncio.run(run())
+    assert on_stats == ("month", "net") and after_typing == ("month", "net")
+    assert typed == "bm"  # both reached the command bar as ordinary characters
+
+
+def test_the_bucket_defaults_to_the_window_length(tmp_path, monkeypatch):
+    _setup_chart(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            picked = {}
+            for spec in (
+                "2026-01-01..2026-01-20",
+                "2026-01-01..2026-03-01",
+                "2026-01-01..2026-12-31",
+            ):
+                app._run_command(f"chart {spec}")
+                await pilot.pause()
+                picked[spec] = app._bucket
+            return picked
+
+    picked = asyncio.run(run())
+    assert picked["2026-01-01..2026-01-20"] == "day"
+    assert picked["2026-01-01..2026-03-01"] == "week"
+    assert picked["2026-01-01..2026-12-31"] == "month"
+
+
+def test_a_bucket_or_measure_on_its_own_redraws_the_open_chart(tmp_path, monkeypatch):
+    _setup_chart(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command(f"chart {CHART_WINDOW} month")
+            await pilot.pause()
+            app._run_command("chart week")
+            await pilot.pause()
+            after_bucket = (app._bucket, app._measure)
+            app._run_command("chart income")
+            await pilot.pause()
+            return after_bucket, (app._bucket, app._measure), app.window.start, app.window.end
+
+    after_bucket, after_measure, start, end = asyncio.run(run())
+    assert after_bucket == ("week", "net")
+    assert after_measure == ("week", "income")  # the bucket it was already using
+    assert (start, end) == (datetime.date(2026, 1, 1), datetime.date(2026, 3, 31))
+
+
+def test_both_words_can_be_given_at_once_in_either_order(tmp_path, monkeypatch):
+    _setup_chart(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command(f"chart {CHART_WINDOW} week spending")
+            await pilot.pause()
+            first = (app._bucket, app._measure)
+            app._run_command(f"chart {CHART_WINDOW} income day")
+            await pilot.pause()
+            return first, (app._bucket, app._measure)
+
+    first, second = asyncio.run(run())
+    assert first == ("week", "spend")
+    assert second == ("day", "income")
+
+
+def test_a_bucket_with_no_window_yet_says_so(tmp_path, monkeypatch):
+    _setup_chart(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            messages = []
+            app.notify = lambda text, **kw: messages.append(text)
+            app._run_command("chart week")
+            await pilot.pause()
+            return messages, app._panel
+
+    messages, panel = asyncio.run(run())
+    assert panel == "txns"  # it did not open an empty chart
+    assert "No period yet" in messages[0] and "chart 3m week" in messages[0]
+
+
+def test_bare_chart_opens_the_picker_and_the_picker_opens_the_chart(tmp_path, monkeypatch):
+    """The period picker is shared with `stats`, so it has to remember who asked."""
+    _setup_chart(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command("chart")
+            await pilot.pause()
+            picker = app._panel
+            app.query_one("#periods", DataTable).move_cursor(row=0)  # 1 month
+            await pilot.press("enter")
+            await pilot.pause()
+            return picker, app._panel
+
+    picker, landed = asyncio.run(run())
+    assert picker == "periods"
+    assert landed == "chart"
+
+
+def test_the_picker_still_opens_the_statistics_panel_for_stats(tmp_path, monkeypatch):
+    """The other half of the same seam: routing the picker must not have stolen it."""
+    _setup_chart(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command("chart")  # leaves the picker pointed at the chart
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause()
+            app._run_command("stats")
+            await pilot.pause()
+            app.query_one("#periods", DataTable).move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause()
+            return app._panel
+
+    assert asyncio.run(run()) == "stats"
+
+
+def test_a_custom_range_typed_into_the_picker_reaches_the_chart(tmp_path, monkeypatch):
+    _setup_chart(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command("chart")
+            await pilot.pause()
+            table = app.query_one("#periods", DataTable)
+            table.move_cursor(row=len(stats.PRESETS))  # Custom…
+            await pilot.press("enter")
+            await pilot.pause()
+            app.query_one("#command", Input).value = CHART_WINDOW
+            await pilot.press("enter")
+            await pilot.pause()
+            return app._panel, app._bucket, _chart_rows(app)
+
+    panel, bucket, rows = asyncio.run(run())
+    assert panel == "chart"
+    # 90 days, so it buckets by week without being asked — a range typed into the picker
+    # goes through the same default as one typed on the command line.
+    assert bucket == "week"
+    assert rows[-1][0] == "TOTAL" and rows[-1][2] == "2,925.00"
+
+
+def test_chart_status_line_fits_the_main_panel(tmp_path, monkeypatch):
+    """Same 92-column budget as every other status line, with a long category name and
+    five-figure money in it."""
+    _setup_chart(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command("chart 2020-01-01..2026-12-31 month income")
+            await pilot.pause()
+            food = next(c for c in app._categories if c.name == "Food")
+            app.category_filter = food.id
+            app.reload()
+            await pilot.pause()
+            return str(app.query_one("#status", Static).content)
+
+    status = asyncio.run(run())
+    assert len(status) <= 92, f"{len(status)} columns: {status!r}"
+    assert "income/month" in status and "Food" in status and "peak" in status
+
+
+def test_chart_table_fits_the_main_panel(tmp_path, monkeypatch):
+    """Every column, the full-width bar included, has to land inside the panel."""
+    _setup_chart(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command(f"chart {CHART_WINDOW} month spending")
+            await pilot.pause()
+            buffer = io.StringIO()
+            Console(file=buffer, width=130).print(app.screen._compositor)
+            return buffer.getvalue()
+
+    rendered = asyncio.run(run())
+    header = next(line for line in rendered.splitlines() if "Period" in line)
+    for column in ("Period", "Spending", "Out", "Net", "Txns"):
+        assert column in header, f"{column!r} clipped: {header.strip()!r}"
+    # The widest bar plus every other column still leaves the panel's right border on
+    # screen, so nothing has been pushed off the edge.
+    peak_line = next(line for line in rendered.splitlines() if "█" * 27 in line)
+    assert len(peak_line.rstrip()) <= 130
+
+
+def test_the_net_header_survives_its_own_column_width(tmp_path, monkeypatch):
+    """The net header carries the legend for the axis, so it is the longest of the three
+    and the one that would clip first."""
+    _setup_chart(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command(f"chart {CHART_WINDOW} month")
+            await pilot.pause()
+            buffer = io.StringIO()
+            Console(file=buffer, width=130).print(app.screen._compositor)
+            return buffer.getvalue()
+
+    rendered = asyncio.run(run())
+    assert "Net (← out | in →)" in rendered
+
+
+def test_footer_shows_the_chart_keys(tmp_path, monkeypatch):
+    """The footer truncates mid-word, so a new binding has to be checked on the panel it
+    actually appears on — see test_footer_shows_every_shortcut_at_a_normal_width."""
+    _setup_chart(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command(f"chart {CHART_WINDOW} month")
+            await pilot.pause()
+            app.query_one("#chart", DataTable).focus()
+            await pilot.pause()
+            buffer = io.StringIO()
+            Console(file=buffer, width=130).print(app.screen._compositor)
+            return buffer.getvalue()
+
+    rendered = asyncio.run(run())
+    footer = next(line for line in rendered.splitlines() if "palette" in line)
+    for label in (
+        "Refresh", "Clear", "Rename", "Categorise", "Transactions", "Bucket", "Measure",
+    ):
+        assert label in footer, f"{label!r} missing or truncated: {footer.strip()!r}"
+
+
+def test_escape_leaves_the_chart_for_the_transactions(tmp_path, monkeypatch):
+    _setup_chart(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command(f"chart {CHART_WINDOW} month")
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause()
+            return app._panel, app.query_one("#chart", DataTable).display
+
+    panel, chart_visible = asyncio.run(run())
+    assert panel == "txns"
+    assert chart_visible is False
+
+
+def test_graph_is_a_synonym_for_chart(tmp_path, monkeypatch):
+    _setup_chart(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command(f"graph {CHART_WINDOW} month")
+            await pilot.pause()
+            return app._panel
+
+    assert asyncio.run(run()) == "chart"
+
+
+def test_a_bad_chart_period_is_reported_not_opened(tmp_path, monkeypatch):
+    _setup_chart(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            messages = []
+            app.notify = lambda text, **kw: messages.append(text)
+            app._run_command("chart last tuesday")
+            await pilot.pause()
+            return messages, app._panel
+
+    messages, panel = asyncio.run(run())
+    assert panel == "txns"
+    assert "last tuesday" in messages[0]
+
+
+def test_transfers_left_out_of_the_bars_are_counted_in_the_status(tmp_path, monkeypatch):
+    """The bars exclude transfers, as every other figure does. Dropping money between
+    your own accounts without saying so reads as missing spending."""
+    session_factory = _setup_chart(tmp_path, monkeypatch)
+    with session_factory() as session:
+        currency = session.query(Currency).one()
+        savings = Account(name="Savings", currency_id=currency.id)
+        session.add(savings)
+        session.flush()
+        checking = session.query(Account).filter_by(name="Checking").one()
+        for account, amount in ((checking, -50_000), (savings, 50_000)):
+            session.add(
+                Transaction(
+                    account_id=account.id,
+                    currency_id=currency.id,
+                    posted_date=datetime.date(2026, 2, 14),
+                    description="MOVE",
+                    raw_description="MOVE",
+                    value_minor=amount,
+                    import_hash=f"move-{account.id}",
+                )
+            )
+        session.commit()
+        transfers.detect_transfers(session)
+        session.commit()
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command(f"chart {CHART_WINDOW} month spending")
+            await pilot.pause()
+            return _chart_rows(app), str(app.query_one("#status", Static).content)
+
+    rows, status = asyncio.run(run())
+    # February's 500.00 transfer is not in the bar...
+    assert rows[1][2] == "5.00"
+    # ...and the status line says two transactions went missing rather than hiding it.
+    assert f"{TRANSFER_MARK} 2" in status
+
+
+# ---------------------------------------------------------- browsing the import inbox
+
+
+NESTED_CSV = """Transaction Date,Posted Date,Card No.,Description,Category,Debit,Credit
+2025-08-01,2025-08-02,8207,NESTED SHOP,Dining,7.00,
+2025-08-03,2025-08-04,8207,NESTED SHOP,Dining,8.00,
+"""
+
+
+def _nested_inbox(tmp_path, monkeypatch):
+    """An inbox with one CSV at the top and a month folder holding another."""
+    inbox = _inbox(tmp_path, monkeypatch, top=CSV)
+    month = inbox / "2026-08"
+    month.mkdir()
+    (month / "nested.csv").write_text(NESTED_CSV, encoding="utf-8")
+    return inbox
+
+
+def test_a_subdirectory_is_offered_as_a_row_with_its_csv_count(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    _nested_inbox(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._run_command("import")
+            await pilot.pause()
+            return _rows_of(app, "imports")
+
+    rows = asyncio.run(run())
+    # Folders sort above files, and the count says whether descending is worth it.
+    assert rows[0][0] == "▸ 2026-08"
+    assert rows[0][1] == "1"
+    assert rows[0][2] == "folder"
+    assert rows[1][0] == "top.csv"
+
+
+def test_enter_on_a_folder_descends_into_it(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    inbox = _nested_inbox(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._run_command("import")
+            await pilot.pause()
+            await pilot.press("enter")  # the folder row is first
+            await pilot.pause()
+            return app._import_dir, _rows_of(app, "imports")
+
+    where, rows = asyncio.run(run())
+    assert where == inbox / "2026-08"
+    # Now inside: the way back, then the file that lives here. top.csv is not in it.
+    assert rows[0][0] == "▸ .." and rows[0][2] == "up"
+    assert rows[1][0] == "nested.csv"
+    assert "top.csv" not in [row[0] for row in rows]
+
+
+def test_the_way_back_is_offered_only_below_the_root(tmp_path, monkeypatch):
+    """It is the only way up, so stopping at the root is what keeps browsing inside the
+    inbox rather than loose in the filesystem."""
+    _setup(tmp_path, monkeypatch)
+    inbox = _nested_inbox(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._run_command("import")
+            await pilot.pause()
+            at_root = [row[0] for row in _rows_of(app, "imports")]
+            app._open_import_dir(inbox / "2026-08")
+            await pilot.pause()
+            below = [row[0] for row in _rows_of(app, "imports")]
+            await pilot.press("enter")  # ".." is the first row down here
+            await pilot.pause()
+            return at_root, below, app._import_dir
+
+    at_root, below, back = asyncio.run(run())
+    assert "▸ .." not in at_root
+    assert "▸ .." in below
+    assert back == inbox
+
+
+def test_enter_imports_the_file_the_cursor_is_actually_on(tmp_path, monkeypatch):
+    """The navigation rows shift every file down, so a row index has to be offset by
+    them — otherwise enter on 'nested.csv' would import whatever used to be at that
+    index, or nothing at all."""
+    _setup(tmp_path, monkeypatch)
+    inbox = _nested_inbox(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._run_command("import")
+            await pilot.pause()
+            app._open_import_dir(inbox / "2026-08")
+            await pilot.pause()
+            table = app.query_one("#imports", DataTable)
+            table.move_cursor(row=1)  # past "..", onto nested.csv
+            await pilot.press("enter")
+            await pilot.pause()
+            app._run_command("all")
+            await pilot.pause()
+            return [t.description for t in app._txns]
+
+    descriptions = asyncio.run(run())
+    assert descriptions.count("NESTED SHOP") == 2
+
+
+def test_the_status_line_says_which_folder_is_open(tmp_path, monkeypatch):
+    """A panel that does not say where it is looking invites importing the wrong month."""
+    _setup(tmp_path, monkeypatch)
+    inbox = _nested_inbox(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._run_command("import")
+            await pilot.pause()
+            at_root = str(app.query_one("#status", Static).content)
+            app._open_import_dir(inbox / "2026-08")
+            await pilot.pause()
+            return at_root, str(app.query_one("#status", Static).content)
+
+    at_root, below = asyncio.run(run())
+    assert at_root.startswith("to_import")  # the inbox itself, named not "."
+    assert below.startswith("2026-08")
+    assert "1 file(s), 1 ready" in below
+
+
+def test_import_all_takes_the_open_folder_not_the_whole_tree(tmp_path, monkeypatch):
+    """'all' should import what the panel is showing, not quietly reach into folders you
+    have not opened."""
+    _setup(tmp_path, monkeypatch)
+    inbox = _nested_inbox(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._run_command("import")
+            await pilot.pause()
+            app._run_command("import all")
+            await pilot.pause()
+            at_root = {t.description for t in app._txns}
+
+            app._open_import_dir(inbox / "2026-08")
+            await pilot.pause()
+            app._run_command("import all")
+            await pilot.pause()
+            app._run_command("all")
+            await pilot.pause()
+            return at_root, {t.description for t in app._txns}
+
+    at_root, after_descending = asyncio.run(run())
+    assert "NESTED SHOP" not in at_root  # the folder was not reached into
+    assert "COFFEE SHOP A" in at_root
+    assert "NESTED SHOP" in after_descending
+
+
+def test_an_empty_folder_says_so_rather_than_looking_broken(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    inbox = _inbox(tmp_path, monkeypatch, top=CSV)
+    (inbox / "empty").mkdir()
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            messages = []
+            app.notify = lambda text, **kw: messages.append(text)
+            app._run_command("import")
+            await pilot.pause()
+            app._open_import_dir(inbox / "empty")
+            await pilot.pause()
+            return messages, _rows_of(app, "imports")
+
+    messages, rows = asyncio.run(run())
+    assert any("Nothing to import in empty" in m for m in messages)
+    assert rows[0][0] == "▸ .."  # still navigable back out

@@ -26,14 +26,16 @@ from textual.widgets import (
     Static,
 )
 
-from . import accounts, categories, formats, queries, stats, transfers, vendors
+from . import accounts, categories, charts, formats, queries, stats, transfers, vendors
 from .db import DuplicateCategoryNamesError, get_engine, get_sessionmaker, init_db
 from .importer import (
     ImportCandidate,
+    InboxFolder,
     UnknownImport,
     delete_import,
     import_csv,
     inspect_csv,
+    list_inbox,
     read_header_and_rows,
 )
 
@@ -67,6 +69,9 @@ def _truncate(text: str, width: int) -> str:
     return text if len(text) <= width else text[: width - 1] + "…"
 
 
+# A row of the import browser that moves you somewhere rather than importing something.
+FOLDER_MARK = "▸"
+
 # Transfers are shown greyed and flagged, because the totals deliberately ignore them —
 # a row that looks like ordinary spending but is missing from the figures reads as a bug.
 TRANSFER_MARK = "⇄"
@@ -75,6 +80,20 @@ TRANSFER_STYLE = "dim italic"
 # The last row of the period picker, and the format its answer has to take.
 CUSTOM_PERIOD = "Custom…"
 RANGE_EXAMPLE = "2025-01-01..2025-06-30"
+
+# Bar column width. The main panel has ~92 columns beside the 36-wide sidebar, and the
+# other four columns plus DataTable's cell padding account for 48 of them. Odd, so the
+# net chart's axis has equal halves either side of it (see charts.build).
+CHART_WIDTH = 27
+
+# Per measure: the header and the figure for the column beside the bar, then the same for
+# the column after it. The charted measure comes first, and the second column is whatever
+# is most worth seeing next to it — for a net chart, what the netting hid.
+CHART_COLUMNS = {
+    "net": (("Net", "net"), ("Out", "outflow")),
+    "spend": (("Out", "outflow"), ("Net", "net")),
+    "income": (("In", "inflow"), ("Net", "net")),
+}
 
 
 def _amount_cell(minor: int, is_transfer: bool = False) -> Text:
@@ -154,14 +173,14 @@ class BudgetApp(App):
     #accounts, #categories { border: round $accent; height: 1fr; }
     #txns, #rules, #imports, #setup, #periods { border: round $accent; height: 1fr; }
     #stats { height: 1fr; }
-    #stats_table { border: round $accent; height: 1fr; }
+    #stats_table, #chart { border: round $accent; height: 1fr; }
     #prompt { height: auto; padding: 1 1 0 1; color: $accent; }
     #status { height: 1; padding: 0 1; color: $text-muted; background: $panel; }
     #command { border: tall $accent; }
     .heading { padding: 0 1; text-style: bold; color: $accent; }
     """
 
-    PANELS = ("txns", "rules", "imports", "setup", "periods", "stats")
+    PANELS = ("txns", "rules", "imports", "setup", "periods", "stats", "chart")
     # Panels whose widget is not itself focusable name the child that takes focus.
     PANEL_FOCUS = {"stats": "#stats_table"}
 
@@ -193,6 +212,10 @@ class BudgetApp(App):
         # like "filter foo" still gets its 'f' typed into #command rather than toggling
         # every fold in the stats table out from under the user.
         Binding("f", "toggle_all_stats_folds", "Fold all", show=True),
+        # Same again: a plain letter, gated to the chart panel by check_action, so 'b'
+        # typed into a command is still just a letter.
+        Binding("b", "cycle_bucket", "Bucket", show=True),
+        Binding("m", "cycle_measure", "Measure", show=True),
         ("ctrl+c", "quit", "Quit"),
     ]
 
@@ -230,6 +253,13 @@ class BudgetApp(App):
         self._rules: List[queries.RuleRow] = []
         self._category_rules: List[queries.CategoryRuleRow] = []
         self._candidates: List[ImportCandidate] = []
+        # Where the import browser is currently looking, and the rows above the files
+        # that move it: the parent (as "..") first when there is one, then each
+        # sub-directory. Kept parallel to the table's leading rows so a cursor index maps
+        # back to a destination — the same discipline _stats_rows follows.
+        self._import_dir = TO_IMPORT_DIR
+        self._import_nav: List[Path] = []
+        self._import_folders: List[InboxFolder] = []
         # Past imports (from the database), shown alongside the candidates so an
         # ``unimport`` id is something the user can actually look up.
         self._imports: List[queries.ImportRow] = []
@@ -248,7 +278,21 @@ class BudgetApp(App):
         # row — a row hidden by folding is not in it, so a table row index always maps
         # back to the right CategoryStat (see _drill_into_category()).
         self._stats_rows: List[stats.CategoryStat] = []
+        # The chart's bucket size and its last-built bars. The bucket is chosen from the
+        # window's length the first time (charts.choose_bucket) and then kept, so
+        # re-scoping by category does not silently undo a bucket the user picked.
+        self._bucket: Optional[str] = None
+        # Which of spending / income / net the bars draw. Unlike the bucket this is a
+        # preference, not a function of the window, so it survives a new period.
+        self._measure = charts.MEASURES[0]
+        self._chart: Optional[charts.Chart] = None
+        # Transfers are left out of the bars, as they are out of every other figure; the
+        # count is carried so the status line can say so rather than quietly losing them.
+        self._chart_transfers = 0
         self._range_pending = False  # awaiting a typed date range for the picker
+        # Which panel the period picker is choosing for: "stats" or "chart". Both open
+        # the same picker, and it has to know where the answer goes.
+        self._picker_target = "stats"
         # Awaiting a typed "yes" to confirm a pending `unimport`; holds what it would
         # destroy, read up front so the confirmation names real numbers.
         self._pending_unimport: Optional[queries.ImportDeletePreview] = None
@@ -290,14 +334,12 @@ class BudgetApp(App):
                 yield DataTable(id="periods")
                 with Vertical(id="stats"):
                     yield DataTable(id="stats_table")
-                    # Seam for the charts to come: a bar chart of spending per bucket and
-                    # a category pie go here, under the table, fed by
-                    # stats.spending_series() and CategoryStat.share.
+                yield DataTable(id="chart")
                 yield Static("", id="status")
         yield Input(
             placeholder=(
                 "command: import | unimport | filter | categorize | category | format | "
-                "stats | rules | all | refresh | help | quit"
+                "stats | chart | rules | all | refresh | help | quit"
             ),
             id="command",
         )
@@ -320,6 +362,12 @@ class BudgetApp(App):
                 self._panel == "stats"
                 and self.focused is not None
                 and self.focused.id == "stats_table"
+            )
+        if action in ("cycle_bucket", "cycle_measure"):
+            return (
+                self._panel == "chart"
+                and self.focused is not None
+                and self.focused.id == "chart"
             )
         return True
 
@@ -391,7 +439,14 @@ class BudgetApp(App):
         # This row's outflow as a fraction of its *parent's* rolled-up outflow — blank at
         # depth 0, where it would just repeat "% spend" (see stats.CategoryStat.parent_share).
         stats_table.add_column("% parent", width=8)
+
+        chart = self.query_one("#chart", DataTable)
+        chart.cursor_type = "row"
+        # Columns are added in _fill_chart, not here: two of the headers name the measure
+        # being charted, so they change when 'm' does.
+
         self.query_one("#stats", Vertical).display = False
+        chart.display = False
         self.query_one("#prompt", Static).display = False
 
         self.reload()
@@ -438,6 +493,11 @@ class BudgetApp(App):
         if self._panel == "stats" and self.window is not None:
             self._build_report()
             self._fill_stats()
+        # Same for the chart: picking a category in the sidebar is how a chart gets
+        # scoped, so it has to redraw here or the bars would keep showing the old scope.
+        if self._panel == "chart" and self.window is not None:
+            self._build_chart()
+            self._fill_chart()
         self._refresh_status()
 
     def _fill_list(self, selector: str, labels: List[str]) -> None:
@@ -499,6 +559,23 @@ class BudgetApp(App):
     def _fill_imports(self) -> None:
         table = self.query_one("#imports", DataTable)
         table.clear()
+        # Navigation first, in the order _import_nav records: ".." (when there is one),
+        # then the sub-directories. Enter on any of them moves the browser rather than
+        # importing anything.
+        if self._import_nav and len(self._import_nav) > len(self._import_folders):
+            table.add_row(
+                Text(f"{FOLDER_MARK} ..", style="bold"),
+                "",
+                Text("up", style=TRANSFER_STYLE),
+                "",
+            )
+        for folder in self._import_folders:
+            table.add_row(
+                Text(f"{FOLDER_MARK} {_truncate(folder.name, 32)}", style="bold"),
+                Text(str(folder.csv_count), justify="right"),
+                Text("folder", style=TRANSFER_STYLE),
+                "",
+            )
         for candidate in self._candidates:
             status = Text(
                 _truncate(candidate.status, 15),
@@ -650,6 +727,157 @@ class BudgetApp(App):
             Text("", justify="right"),
         )
 
+    # ---------------------------------------------------------------- chart
+    def _build_chart(self) -> None:
+        """Fetch the series and scale it, under exactly the filters everything else uses.
+
+        The same filters go to the transfer count as to the series, so the "N transfers
+        excluded" the status line prints is the count actually missing from these bars.
+        """
+        with self.session_factory() as session:
+            series = stats.spending_series(
+                session,
+                self.window,
+                self._bucket,
+                self.account_filter,
+                self.category_filter,
+                self.vendor_filter,
+                text_filter=self.text_filter,
+            )
+            totals = queries.get_totals(
+                session,
+                self.account_filter,
+                self.category_filter,
+                self.vendor_filter,
+                text_filter=self.text_filter,
+                date_range=(self.window.start, self.window.end),
+            )
+        self._chart = charts.build(series, measure=self._measure, width=CHART_WIDTH)
+        self._chart_transfers = totals.transfer_count
+
+    def _bar_cell(self, bar: charts.Bar) -> Text:
+        """The bar, coloured by direction: red is money out, green is money in.
+
+        On a net chart that means the two sides of the axis are different colours, which
+        is the same rule the amount columns already follow — it just happens to land on
+        one row at a time there.
+        """
+        inflow_side = "green" if self._measure != "spend" else "red"
+        return Text.assemble(
+            (bar.left, "red"), (bar.axis, "dim"), (bar.right, inflow_side)
+        )
+
+    def _money_cell(self, bar: charts.Bar, field: str) -> Text:
+        """One of the two figure columns beside the bar, per CHART_COLUMNS."""
+        if field == "net":
+            return _amount_cell(bar.net_minor)
+        # Outflow and inflow are positive magnitudes, so _amount_cell's sign rule would
+        # paint them both green; the direction is what the colour has to carry here.
+        value = bar.outflow_minor if field == "outflow" else bar.inflow_minor
+        style = ("red" if field == "outflow" else "green") if value else "dim"
+        return Text(_fmt_amount(value), style=style, justify="right")
+
+    def _fill_chart(self) -> None:
+        """Redraw the table, columns included — two headers name the current measure."""
+        table = self.query_one("#chart", DataTable)
+        table.clear(columns=True)
+        if self._chart is None:
+            return
+        columns = CHART_COLUMNS[self._measure]
+        # 9 + CHART_WIDTH + 12 + 12 + 5 plus two cells of padding each: 76 of the ~92 the
+        # main panel has, leaving the bars room to be the widest thing on the row (see
+        # test_chart_table_fits_the_main_panel).
+        table.add_column("Period", width=9)
+        table.add_column(charts.MEASURE_HEADERS[self._measure], width=CHART_WIDTH)
+        for header, _field in columns:
+            table.add_column(header, width=12)
+        table.add_column("Txns", width=5)
+
+        for bar in self._chart.bars:
+            table.add_row(
+                bar.label,
+                self._bar_cell(bar),
+                *[self._money_cell(bar, field) for _header, field in columns],
+                Text(str(bar.count), justify="right"),
+            )
+        self._add_chart_total_row(table)
+
+    def _add_chart_total_row(self, table: DataTable) -> None:
+        """A closing total, plus the per-bucket average in the bar column.
+
+        The average belongs there because that column is the only one whose units are
+        per-bucket; putting a summed bar there would be meaningless, and leaving it blank
+        wastes the widest column on the row.
+
+        A window holding no transactions gets no total, for the same reason the
+        statistics table skips one: a row of zeroes reads as a finding. The test is the
+        transaction count, not the bar list — buckets are zero-filled, so an empty
+        window still has a full set of (empty) bars to draw.
+        """
+        chart = self._chart
+        if not any(bar.count for bar in chart.bars):
+            return
+
+        def figure(field: str) -> Text:
+            value = {
+                "net": chart.net_minor,
+                "outflow": chart.outflow_minor,
+                "inflow": chart.inflow_minor,
+            }[field]
+            if field == "net":
+                style = "red" if value < 0 else "green"
+            else:
+                style = "red" if field == "outflow" else "green"
+            return Text(_fmt_amount(value), style=f"bold {style}", justify="right")
+
+        table.add_row(
+            Text("TOTAL", style="bold"),
+            Text(f"avg {_fmt_amount(chart.avg_minor)}/{self._bucket}", style="dim"),
+            *[figure(field) for _header, field in CHART_COLUMNS[self._measure]],
+            Text(
+                str(sum(bar.count for bar in chart.bars)),
+                style="bold",
+                justify="right",
+            ),
+        )
+
+    def _chart_status(self) -> str:
+        """One line, under the same 92-column budget as every other panel's status."""
+        chart = self._chart
+        window = self.window
+        label = "custom" if window.key == "custom" else window.label
+        scope = self._chart_scope()
+        excluded = f"{TRANSFER_MARK} {self._chart_transfers} " if self._chart_transfers else ""
+        return (
+            f"{label} {_range_label((window.start, window.end))} "
+            f"{self._measure}/{self._bucket} "
+            f"{scope}"
+            f"{excluded}"
+            f"total {_fmt_amount(chart.total_minor)} "
+            f"peak {_fmt_amount(chart.peak_minor)}"
+        )
+
+    def _chart_scope(self) -> str:
+        """The active category, named, plus a terse marker for any other filter.
+
+        Naming the category is the point — the whole feature is charting one category, so
+        a chart that does not say which one it is showing is a trap. The other filters
+        only get a marker, as they do in the transactions status line.
+        """
+        parts = []
+        if self.category_filter is not None:
+            name = next(
+                (c.name for c in self._categories if c.id == self.category_filter), None
+            )
+            parts.append(_truncate(name, 16) if name else "category")
+        if self.account_filter is not None:
+            parts.append("account")
+        if self.vendor_filter is not None:
+            parts.append("vendor")
+        if self.text_filter is not None:
+            parts.append("text")
+        return f"[{', '.join(parts)}] " if parts else ""
+
     def _fill_periods(self) -> None:
         table = self.query_one("#periods", DataTable)
         table.clear()
@@ -692,6 +920,9 @@ class BudgetApp(App):
         if self._panel == "stats" and self._report is not None:
             status.update(self._stats_status())
             return
+        if self._panel == "chart" and self._chart is not None:
+            status.update(self._chart_status())
+            return
         if self._panel == "periods":
             status.update(
                 "choose a period   enter selects   "
@@ -716,11 +947,14 @@ class BudgetApp(App):
             return
         if self._panel == "imports":
             ready = sum(1 for c in self._candidates if c.ready)
+            # The directory comes first: every count below it is scoped to that folder,
+            # and a panel that does not say where it is looking invites importing the
+            # wrong month.
             status.update(
+                f"{_truncate(self._import_label(), 24)}   "
                 f"{len(self._candidates)} file(s), {ready} ready   "
-                "enter to import   "
-                f"{len(self._imports)} past   unimport <id>   "
-                "escape returns"
+                "enter to import, or open a folder   "
+                f"{len(self._imports)} past   escape returns"
             )
             return
         self._set_status(self._totals)
@@ -792,11 +1026,16 @@ class BudgetApp(App):
             if row == len(stats.PRESETS):  # the Custom… row, always last
                 self._ask_range()
             elif 0 <= row < len(stats.PRESETS):
-                self._show_stats(stats.resolve(stats.PRESETS[row][0]))
+                self._open_period(stats.resolve(stats.PRESETS[row][0]))
             return
         if event.data_table.id != "imports":
             return
         row = event.cursor_row
+        # The navigation rows come first, so a candidate's index is offset by them.
+        if 0 <= row < len(self._import_nav):
+            self._open_import_dir(self._import_nav[row])
+            return
+        row -= len(self._import_nav)
         if not 0 <= row < len(self._candidates):
             return
         self._import_candidate(self._candidates[row])
@@ -944,11 +1183,61 @@ class BudgetApp(App):
             self.notify(str(error), severity="error", markup=False)
             return None
 
-    def _show_periods(self) -> None:
+    def _do_chart(self, arg: str) -> None:
+        """``chart`` opens the period picker; ``chart <period> [bucket] [measure]`` skips it.
+
+        Trailing ``day``/``week``/``month`` and ``net``/``spending``/``income`` words set
+        the bucket and the measure, in either order, so ``chart 1y month spending`` and
+        ``chart 1 year`` both read the way they look. Either word on its own re-draws the
+        chart already on screen — the same thing ``b`` and ``m`` do, for anyone who would
+        rather type it than remember a key.
+        """
+        arg = arg.strip()
+        if not arg:
+            self._show_periods("chart")
+            return
+
+        parts = arg.split()
+        bucket = measure = None
+        while parts:
+            tail = parts[-1].lower()
+            if bucket is None and tail in queries.BUCKETS:
+                bucket = tail
+            elif measure is None and tail in charts.MEASURE_ALIASES:
+                measure = charts.MEASURE_ALIASES[tail]
+            else:
+                break
+            parts = parts[:-1]
+        text = " ".join(parts)
+
+        if not text:
+            if self.window is None:
+                self.notify(
+                    "No period yet: try 'chart 3m "
+                    f"{bucket or measure}', or bare 'chart' to pick one.",
+                    severity="warning",
+                )
+                return
+            self._show_chart(self.window, bucket, measure)
+            return
+
+        window = self._parse_window(text)
+        if window is not None:
+            self._show_chart(window, bucket, measure)
+
+    def _show_periods(self, target: str = "stats") -> None:
+        self._picker_target = target
         self._fill_periods()
         self._range_pending = False
         self._prompt_panel = None
         self._set_panel("periods")
+
+    def _open_period(self, window: stats.Window) -> None:
+        """Send a period the picker just produced to whichever panel asked for it."""
+        if self._picker_target == "chart":
+            self._show_chart(window)
+        else:
+            self._show_stats(window)
 
     def _show_stats(self, window: stats.Window) -> None:
         self.window = window
@@ -957,6 +1246,32 @@ class BudgetApp(App):
         self._build_report()
         self._fill_stats()
         self._set_panel("stats")
+
+    def _show_chart(
+        self,
+        window: stats.Window,
+        bucket: Optional[str] = None,
+        measure: Optional[str] = None,
+    ) -> None:
+        """Open the chart for ``window``, bucketed explicitly or by the window's length.
+
+        A bucket the user asked for is remembered across re-scopes, but a *new* window
+        re-derives its own: daily bars chosen for one month are unreadable stretched over
+        two years, and silently keeping them would be worse than overriding a choice the
+        user made about a range they have now left. The measure is not like that — it is
+        a question about the money, not about the range — so it simply sticks.
+        """
+        rebucket = bucket is not None or self._bucket is None or window != self.window
+        self.window = window
+        if rebucket:
+            self._bucket = bucket or charts.choose_bucket(window)
+        if measure is not None:
+            self._measure = measure
+        self._range_pending = False
+        self._prompt_panel = None
+        self._build_chart()
+        self._fill_chart()
+        self._set_panel("chart")
 
     def _ask_range(self) -> None:
         """Ask for an explicit range, answered in the command bar below the picker."""
@@ -980,7 +1295,7 @@ class BudgetApp(App):
         window = self._parse_window(text)
         if window is None:
             return  # a bad range leaves the prompt up, over the picker
-        self._show_stats(window)
+        self._open_period(window)
 
     def _cancel_range(self) -> None:
         # _show_periods() drops the pending question and hides the prompt with it.
@@ -1075,6 +1390,8 @@ class BudgetApp(App):
             self._do_filter(arg)
         elif name == "stats":
             self._do_stats(arg)
+        elif name in {"chart", "graph"}:
+            self._do_chart(arg)
         elif name == "help":
             self.notify(
                 "import — browse data/to_import; enter imports the selected file,\n"
@@ -1123,6 +1440,14 @@ class BudgetApp(App):
                 "  transactions; the left arrow goes back to the breakdown\n"
                 "  space, on a category row with children, folds/unfolds its subtree\n"
                 "  f folds/unfolds every group at once\n"
+                "chart — pick a period, then see money per day/week/month as bars\n"
+                "chart <period> [day|week|month] [net|spending|income] — skip the\n"
+                "  picker, set the bar width and what the bars measure (e.g.\n"
+                "  chart 1y month spending); the bucket defaults to the period's\n"
+                "  length. b cycles the bucket, m the measure. graph = chart\n"
+                "  net draws either side of a centre line: money out to the left,\n"
+                "  money in to the right, so an even month sits on the line\n"
+                "  click a category in the sidebar to chart just that category\n"
                 "all — clear filters   refresh — reload   quit — exit\n"
                 "Click an account/vendor/category to filter.\n"
                 "ctrl+n / ctrl+t — prefill rename / categorize for the selected\n"
@@ -1139,9 +1464,13 @@ class BudgetApp(App):
             self._show_imports()
             return
         if arg == "all":
-            paths = sorted(TO_IMPORT_DIR.glob("*.csv"))
+            # The directory being browsed, not the whole tree: "all" should import what
+            # the panel is showing, not quietly reach into folders you have not opened.
+            paths = list(list_inbox(self._import_dir, TO_IMPORT_DIR).files)
             if not paths:
-                self.notify(f"No CSVs in {TO_IMPORT_DIR}", severity="warning")
+                self.notify(
+                    f"No CSVs in {self._import_label()}", severity="warning"
+                )
                 return
         else:
             path = Path(arg).expanduser()
@@ -1311,15 +1640,48 @@ class BudgetApp(App):
             )
 
     def _show_imports(self) -> None:
-        """List the files in the inbox, with whatever blocks each one, plus history."""
-        paths = sorted(TO_IMPORT_DIR.glob("*.csv"))
+        """Browse one directory of the inbox: where to go, what to import, plus history.
+
+        Only the CSVs *directly* here become candidates. Inspecting a whole tree up front
+        would mean reading every file under the inbox to draw one screen, and the folder
+        rows already say how many are down there.
+        """
+        listing = list_inbox(self._import_dir, TO_IMPORT_DIR)
+        self._import_nav = ([listing.parent] if listing.parent is not None else []) + [
+            folder.path for folder in listing.folders
+        ]
+        self._import_folders = list(listing.folders)
         with self.session_factory() as session:
-            self._candidates = [inspect_csv(session, path) for path in paths]
+            self._candidates = [inspect_csv(session, path) for path in listing.files]
             self._imports = queries.get_imports(session)
         self._fill_imports()
         self._set_panel("imports")
-        if not self._candidates:
-            self.notify(f"No CSVs in {TO_IMPORT_DIR}", severity="warning")
+        if not self._candidates and not listing.folders:
+            self.notify(
+                f"Nothing to import in {self._import_label()}", severity="warning"
+            )
+
+    def _import_label(self) -> str:
+        """The current directory, relative to the inbox, named rather than ``.``.
+
+        At the top that is the inbox folder's own name: "." is technically the relative
+        path but reads as an error in a status line, and the point of the label is to say
+        where you are in words you would recognise.
+        """
+        try:
+            relative = self._import_dir.relative_to(TO_IMPORT_DIR)
+        except ValueError:
+            return str(self._import_dir)
+        return TO_IMPORT_DIR.name if relative == Path(".") else str(relative)
+
+    def _open_import_dir(self, path: Path) -> None:
+        self._import_dir = path
+        self._show_imports()
+        # A fresh directory starts at its first row rather than wherever the cursor
+        # happened to be in the directory just left.
+        table = self.query_one("#imports", DataTable)
+        if table.row_count:
+            table.move_cursor(row=0)
 
     def _do_filter(self, arg: str) -> None:
         """`filter text` searches everything; `filter vendor:text` narrows the field."""
@@ -1818,6 +2180,32 @@ class BudgetApp(App):
     def action_toggle_all_stats_folds(self) -> None:
         """``f`` on the statistics table: fold/unfold every group. See check_action()."""
         self._toggle_fold_all()
+
+    def action_cycle_bucket(self) -> None:
+        """``b`` on the chart: step day → week → month → day. See check_action().
+
+        A cycle rather than three keys, and it does not skip a bucket that would be
+        unwieldy for the window: charting two years by day is a bad idea but it is the
+        user's to make, and a key that silently refuses to do anything is worse.
+        """
+        if self.window is None or self._bucket is None:
+            return
+        order = queries.BUCKETS
+        self._bucket = order[(order.index(self._bucket) + 1) % len(order)]
+        self._redraw_chart()
+
+    def action_cycle_measure(self) -> None:
+        """``m`` on the chart: step net → spending → income → net. See check_action()."""
+        if self.window is None:
+            return
+        order = charts.MEASURES
+        self._measure = order[(order.index(self._measure) + 1) % len(order)]
+        self._redraw_chart()
+
+    def _redraw_chart(self) -> None:
+        self._build_chart()
+        self._fill_chart()
+        self._refresh_status()
 
     def action_rename_vendor(self) -> None:
         self._prefill_for_vendor("rename")

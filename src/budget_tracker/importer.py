@@ -205,6 +205,93 @@ def _read_text(path: Path) -> str:
     return raw.decode("latin-1")
 
 
+@dataclass(frozen=True)
+class InboxFolder:
+    """A sub-directory of the inbox, offered for browsing rather than importing."""
+
+    path: Path
+    csv_count: int  # CSVs anywhere beneath it, however deep
+
+    @property
+    def name(self) -> str:
+        return self.path.name
+
+
+@dataclass(frozen=True)
+class InboxListing:
+    """One directory's worth of the inbox: where to go, and what to import here."""
+
+    directory: Path
+    # Where "up" leads, or None at the root. It is None rather than the real parent
+    # precisely so browsing cannot climb out of the inbox and start offering the rest of
+    # the filesystem for import.
+    parent: Optional[Path]
+    folders: Sequence[InboxFolder]
+    files: Sequence[Path]
+
+
+def _count_csvs(directory: Path) -> int:
+    """CSVs anywhere beneath ``directory``, counted by the rules the listing itself uses.
+
+    That means matching on the lowercased suffix rather than a ``*.csv`` glob (which is
+    case-sensitive, and would miss a ``.CSV``) and skipping dot-prefixed names (which the
+    listing hides, so counting them would promise files you cannot reach). A folder
+    labelled "2 CSVs" that turns out to hold three is worse than no count at all.
+    """
+    try:
+        return sum(
+            1
+            for path in directory.rglob("*")
+            if path.is_file()
+            and path.suffix.lower() == ".csv"
+            and not any(
+                part.startswith(".") for part in path.relative_to(directory).parts
+            )
+        )
+    except OSError:
+        return 0
+
+
+def list_inbox(directory: Path, root: Path) -> InboxListing:
+    """Sub-directories and CSVs directly inside ``directory``, plus the way back up.
+
+    ``root`` bounds the walk: ``parent`` is None once ``directory`` is the root, or is
+    anywhere outside it, so a caller that only ever follows ``parent`` can never leave
+    the inbox. Names beginning with a dot are skipped — a ``.git`` or a ``.Trash`` in a
+    downloads folder is noise, not something to import.
+
+    An unreadable directory lists as empty rather than raising: the picker showing
+    nothing is a better failure than the app refusing to open.
+    """
+    directory = Path(directory)
+    try:
+        entries = sorted(directory.iterdir(), key=lambda path: path.name.lower())
+    except OSError:
+        entries = []
+    entries = [path for path in entries if not path.name.startswith(".")]
+
+    folders = [
+        InboxFolder(path=path, csv_count=_count_csvs(path))
+        for path in entries
+        if path.is_dir()
+    ]
+    files = [
+        path for path in entries if path.is_file() and path.suffix.lower() == ".csv"
+    ]
+
+    parent = None
+    try:
+        resolved, resolved_root = directory.resolve(), Path(root).resolve()
+        if resolved != resolved_root and resolved_root in resolved.parents:
+            parent = directory.parent
+    except OSError:
+        pass
+
+    return InboxListing(
+        directory=directory, parent=parent, folders=folders, files=files
+    )
+
+
 @dataclass
 class ImportCandidate:
     """A file offered for import, with whatever stands in the way of importing it."""

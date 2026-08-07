@@ -8,7 +8,7 @@ amount_style invert_amount applies to.
 import pytest
 from sqlalchemy import select
 
-from budget_tracker import formats, queries
+from budget_tracker import formats, importer, queries
 from budget_tracker.db import get_engine, get_sessionmaker, init_db
 from budget_tracker.importer import (
     UnknownImport,
@@ -469,3 +469,90 @@ def test_round_trip_wrong_polarity_delete_flip_reimport(tmp_path):
             t.value_minor for t in session.scalars(select(Transaction))
         )
     assert right_minors == sorted(-m for m in wrong_minors)
+
+
+# --------------------------------------------------------------- browsing the inbox
+
+
+def _inbox(tmp_path):
+    """An inbox with a nested month folder and some noise to ignore."""
+    root = tmp_path / "to_import"
+    (root / "2026" / "january").mkdir(parents=True)
+    (root / ".hidden").mkdir()
+    (root / "top.csv").write_text("a,b\n1,2\n", encoding="utf-8")
+    (root / "notes.txt").write_text("not a csv", encoding="utf-8")
+    (root / "2026" / "year.csv").write_text("a,b\n1,2\n", encoding="utf-8")
+    (root / "2026" / "january" / "jan.csv").write_text("a,b\n1,2\n", encoding="utf-8")
+    (root / "2026" / "january" / "also.CSV").write_text("a,b\n1,2\n", encoding="utf-8")
+    return root
+
+
+def test_the_inbox_root_lists_its_folders_and_its_own_csvs(tmp_path):
+    root = _inbox(tmp_path)
+    listing = importer.list_inbox(root, root)
+
+    assert listing.parent is None  # nowhere to climb to from the top
+    assert [folder.name for folder in listing.folders] == ["2026"]
+    assert [path.name for path in listing.files] == ["top.csv"]
+
+
+def test_a_folder_counts_every_csv_beneath_it_however_deep(tmp_path):
+    """The count is what tells you whether descending is worth it, so it cannot stop at
+    the first level."""
+    root = _inbox(tmp_path)
+    listing = importer.list_inbox(root, root)
+    assert listing.folders[0].csv_count == 3  # year.csv + two in january/
+
+
+def test_descending_lists_that_folder_and_offers_the_way_back(tmp_path):
+    root = _inbox(tmp_path)
+    listing = importer.list_inbox(root / "2026", root)
+
+    assert listing.parent == root
+    assert [folder.name for folder in listing.folders] == ["january"]
+    assert [path.name for path in listing.files] == ["year.csv"]
+
+
+def test_the_walk_cannot_climb_out_of_the_inbox(tmp_path):
+    """``parent`` is the only way up, so it has to stop at the root — otherwise browsing
+    would start offering the rest of the filesystem for import."""
+    root = _inbox(tmp_path)
+    assert importer.list_inbox(root, root).parent is None
+    # And a directory outside the inbox altogether gets no way up either.
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    assert importer.list_inbox(outside, root).parent is None
+
+
+def test_hidden_entries_and_non_csv_files_are_skipped(tmp_path):
+    root = _inbox(tmp_path)
+    listing = importer.list_inbox(root, root)
+    assert all(not folder.name.startswith(".") for folder in listing.folders)
+    assert all(path.suffix.lower() == ".csv" for path in listing.files)
+    assert "notes.txt" not in [path.name for path in listing.files]
+
+
+def test_an_uppercase_extension_still_counts_as_a_csv(tmp_path):
+    root = _inbox(tmp_path)
+    listing = importer.list_inbox(root / "2026" / "january", root)
+    assert sorted(path.name for path in listing.files) == ["also.CSV", "jan.csv"]
+
+
+def test_an_unreadable_directory_lists_as_empty_rather_than_raising(tmp_path):
+    """The picker showing nothing beats the app refusing to open."""
+    root = _inbox(tmp_path)
+    listing = importer.list_inbox(root / "does-not-exist", root)
+    assert listing.folders == [] and listing.files == []
+    # It is still inside the inbox, so it still knows the way back.
+    assert listing.parent == root
+
+
+def test_entries_are_sorted_case_insensitively(tmp_path):
+    root = tmp_path / "to_import"
+    root.mkdir()
+    for name in ("Zebra.csv", "apple.csv", "Mango.csv"):
+        (root / name).write_text("a\n1\n", encoding="utf-8")
+    listing = importer.list_inbox(root, root)
+    assert [path.name for path in listing.files] == [
+        "apple.csv", "Mango.csv", "Zebra.csv"
+    ]

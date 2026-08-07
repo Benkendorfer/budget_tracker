@@ -14,6 +14,7 @@
     - [Categorising transactions](#categorising-transactions)
     - [Nesting categories](#nesting-categories)
     - [Statistics](#statistics)
+    - [Charts](#charts)
     - [Transfers between your own accounts](#transfers-between-your-own-accounts)
     - [Importing data](#importing-data)
     - [Where the data lives](#where-the-data-lives)
@@ -84,6 +85,8 @@ the bottom:
 | `filter` | Clear the text filter |
 | `stats` | Pick a time window, then see spending per category (see below) |
 | `stats <window>` | Skip the picker: `stats 6m`, `stats 1 year`, `stats 2025-01-01..2025-06-30` |
+| `chart` | Pick a time window, then see money over time as bars (see below) |
+| `chart <window> [day\|week\|month] [net\|spending\|income]` | Skip the picker, and set the bar width and what the bars measure: `chart 1y month spending` |
 | `transfers` | Pair up movements between your own accounts (`transfers reset` undoes it) |
 | `transfers same-account` | Also pair legs within the same account (see below); off by default |
 | `rules` | Open the rules panel — both kinds of rule (`rule` on its own does the same); `escape` returns |
@@ -97,7 +100,9 @@ transactions from the rules panel, and `ctrl+c` quits. On a statistics row, the 
 arrow drills into that category's transactions (same as `enter`); the left arrow goes
 back to the breakdown it came from, once you have drilled into one; `space` folds or
 unfolds a category's subtree; and `f` folds or unfolds every group at once — see
-"Statistics" below. The footer shows the arrows only while they do something.
+"Statistics" below. On the chart, `b` cycles the bar width between day, week, and
+month, and `m` cycles what the bars measure between net, spending, and income — see
+"Charts". The footer shows the arrows only while they do something.
 
 `ctrl+n` prefills a `rename` command for whichever vendor you are pointing at, and
 `ctrl+t` prefills a `categorize` command for the same vendor. With the transaction table
@@ -426,6 +431,83 @@ without explanation.
 Averages are per *average* month (30.44 days) rather than per calendar month, so a window
 starting mid-month is not penalised by partial months at either end.
 
+### Charts
+
+Where `stats` slices a window by category, `chart` slices it by *time*. It draws one bar
+per day, week, or month, so you can see whether a category is a steady drip or one bad
+afternoon.
+
+`chart` on its own opens the same period picker `stats` uses; `chart 6m` or
+`chart 2025-01-01..2025-06-30` skips it. `graph` is a synonym. `escape` returns to the
+transactions.
+
+#### What the bars measure
+
+Three choices, cycled with `m` or named on the command line (`chart 1y income`):
+
+**`net`** — the default. Outflow and inflow added together, drawn either side of a centre
+axis: a bucket that cost more than it took in grows **left**, one that took in more grows
+**right**. A month whose spending was matched by a refund sits *on* the line rather than
+reading as a heavy month.
+
+```text
+ Period     Net (← out | in →)           Net           Out           Txns
+ 2025-09              █│                    -436.70      4,963.88     66
+ 2025-10               │█                  1,548.82      3,428.23     61
+ 2026-01            ███│                 -4,189.66      4,210.07     19
+ TOTAL      avg 965.07/month              12,545.88    102,498.34    527
+```
+
+**`spend`** (also `spending`) — what went out, as a conventional left-anchored bar.
+**`income`** (also `in`) — what came in, drawn the same way.
+
+```text
+ Period     Spending                      Out           Net           Txns
+ 2025-09    █████▍                        4,963.88       -436.70     66
+ 2025-10    ███▊                          3,428.23      1,548.82     61
+```
+
+The two figure columns follow the measure: whatever is being charted comes first, then
+whatever is most worth seeing beside it. Only `net` has a sign to encode, so the other two
+use the full width of the column in the conventional direction. That also means `net` draws
+in whole cells while the other two get eighth-cell precision (`▏▎▍`) — a bar growing
+*leftwards* is anchored at its right-hand end, and Unicode has no left-facing counterpart
+to those eighth blocks, so quantising both sides of the axis keeps the two directions of
+`net` honestly comparable with each other.
+
+The measure sticks when you change period — it is a question about the money, not about
+the range.
+
+#### Scale, buckets, and scope
+
+Bars are scaled to the tallest bucket in the window, which is what makes the shape
+readable at any level; the trade-off is that two charts are only comparable via the `peak`
+figure on the status line. For `net`, one peak covers both directions, so a month that
+earned 500 and one that cost 500 draw as mirror images rather than each filling its own
+side. Any bucket with real money in it gets at least a visible sliver, so "almost nothing"
+never renders identically to "nothing" — and an empty bucket is still given its own row
+rather than being skipped, so a quiet month is visibly quiet instead of vanishing from the
+axis.
+
+The bucket size defaults to the length of the window — daily under about six weeks, weekly
+up to about half a year, monthly beyond that. Press `b` to cycle day → week → month, or say
+so up front with `chart 1y week`. Either word on its own (`chart week`, `chart income`)
+redraws whatever is already on screen. A bucket you pick sticks while you re-scope the
+chart, but choosing a *new* window re-derives it: daily bars are unreadable stretched over
+two years.
+
+Like the statistics panel, the chart is scoped by whatever filters are active — **click a
+category in the sidebar and the bars redraw for that category alone**, subcategories
+included, rescaled to their own peak. The status line names the category, since a chart
+that does not say what it is showing is a trap:
+
+```text
+ 1 year 2025-08-08→08-07 income/month [Dining] total 7,411.60 peak 2,982.29
+```
+
+Transfers are excluded from the bars, as they are from every other figure, and the status
+line counts them (`⇄ 110`) so the money is never missing without explanation.
+
 ### Transfers between your own accounts
 
 Paying your card from your checking account produces two transactions: money leaving one
@@ -483,17 +565,18 @@ Every bank lays its CSV out differently, so the first time you import an unfamil
 layout the importer works out the mapping from the header and a sample of rows, then
 asks about anything it could not settle. This works the same way from either interface.
 
-**In the app**, `import` lists the files in `data/to_import/` with what stands in the way
-of each one, and — dimmed, below them — the imports already done, with the id an
-`unimport` needs:
+**In the app**, `import` browses `data/to_import/`: sub-directories first, then the files
+here with what stands in the way of each one, and — dimmed, below them — the imports
+already done, with the id an `unimport` needs:
 
 ```text
  File                                Rows  Status           ID
+ ▸ 2026-08                              4  folder
  statement-june.csv                   516  cards
  new-bank-export.csv                  387  needs setup
  statement-may.csv                    498  imported          6
 
- 2 file(s), 1 ready   enter to import   1 past   unimport <id>   escape returns
+ to_import   2 file(s), 1 ready   enter to import, or open a folder   1 past   escape returns
 ```
 
 Press `enter` on a file. A ready one imports straight away; one needing setup starts the
@@ -501,6 +584,29 @@ walkthrough, which asks one question at a time — pick a column by pressing `en
 or type your answer in the command bar. `escape` cancels without saving anything. Once
 the layout is learned the import continues by itself, and that file type never asks
 again.
+
+`enter` on a **folder** row opens it instead, and a `▸ ..` row at the top takes you back
+out. Keep your statements in whatever tree you like — `data/to_import/2026-08/`, one
+folder per bank, whatever — rather than in one flat pile. The count beside a folder is
+every CSV anywhere beneath it, so you can tell at a glance whether descending is worth it,
+and the status line always names the folder you are looking at. `..` is only offered while
+there is somewhere to go, which is what keeps browsing inside the inbox rather than loose
+in the filesystem.
+
+`import all` imports the folder you have open, not the whole tree — it does what the panel
+in front of you is showing, rather than quietly reaching into folders you have not opened.
+
+`budget import` with no path offers the same walk as a numbered list, sub-directories
+and `../` included, so a nested file needs no path typing:
+
+```text
+$ budget import
+
+/…/data/to_import
+  [1] 2026-08/  (4 CSVs)
+  [2] statement-june.csv
+Enter number (1-2) or q to quit:
+```
 
 **From the command line** the same walkthrough runs as prompts:
 

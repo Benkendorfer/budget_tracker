@@ -396,3 +396,81 @@ def test_transfers_reset_undoes_a_same_account_pairing(tmp_path, monkeypatch, ca
     assert "Un-paired 2 transaction(s)." in capsys.readouterr().out
     with session_factory() as session:
         assert queries.get_totals(session).transfer_count == 0
+
+
+# ------------------------------------------------------- the interactive file picker
+
+
+def _picker_inbox(tmp_path, monkeypatch):
+    """An inbox with a file at the top and one inside a folder."""
+    inbox = tmp_path / "to_import"
+    (inbox / "2026-08").mkdir(parents=True)
+    (inbox / "top.csv").write_text(CSV, encoding="utf-8")
+    (inbox / "2026-08" / "nested.csv").write_text(CSV, encoding="utf-8")
+    monkeypatch.setattr("budget_tracker.cli.TO_IMPORT_DIR", inbox)
+    return inbox
+
+
+def _answers(monkeypatch, *replies):
+    """Feed the picker a fixed sequence of typed answers."""
+    typed = iter(replies)
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(typed))
+
+
+def test_the_picker_lists_folders_above_files(tmp_path, monkeypatch, capsys):
+    _picker_inbox(tmp_path, monkeypatch)
+    _answers(monkeypatch, "q")
+
+    assert cli._select_csv_interactively() is None
+    listed = capsys.readouterr().out
+    assert "[1] 2026-08/  (1 CSV)" in listed
+    assert "[2] top.csv" in listed
+
+
+def test_the_picker_descends_into_a_folder_and_back_out(tmp_path, monkeypatch, capsys):
+    """Sub-directories are ordinary numbered choices, so reaching a nested file needs no
+    path typing — and '../' gets you back."""
+    inbox = _picker_inbox(tmp_path, monkeypatch)
+    # 1: into 2026-08/   1: back out via ../   2: top.csv
+    _answers(monkeypatch, "1", "1", "2")
+
+    chosen = cli._select_csv_interactively()
+    assert chosen == inbox / "top.csv"
+    listed = capsys.readouterr().out
+    assert "[1] ../" in listed  # offered only once inside the folder
+    assert "[2] nested.csv" in listed
+
+
+def test_the_picker_returns_a_nested_file(tmp_path, monkeypatch):
+    inbox = _picker_inbox(tmp_path, monkeypatch)
+    _answers(monkeypatch, "1", "2")  # into the folder, then the file below "../"
+
+    assert cli._select_csv_interactively() == inbox / "2026-08" / "nested.csv"
+
+
+def test_the_picker_has_no_way_up_from_the_top(tmp_path, monkeypatch, capsys):
+    """The only way up is the '../' entry, so withholding it at the root is what keeps
+    the picker inside the inbox rather than loose in the filesystem."""
+    _picker_inbox(tmp_path, monkeypatch)
+    _answers(monkeypatch, "q")
+
+    cli._select_csv_interactively()
+    assert "../" not in capsys.readouterr().out
+
+
+def test_a_mistyped_number_reprompts_rather_than_giving_up(tmp_path, monkeypatch, capsys):
+    """Quitting the whole import over a slip means walking back down the tree again."""
+    inbox = _picker_inbox(tmp_path, monkeypatch)
+    _answers(monkeypatch, "9", "banana", "2")
+
+    assert cli._select_csv_interactively() == inbox / "top.csv"
+    assert capsys.readouterr().out.count("Invalid selection.") == 2
+
+
+def test_an_empty_inbox_says_so_and_stops(tmp_path, monkeypatch, capsys):
+    inbox = tmp_path / "to_import"
+    inbox.mkdir()
+    monkeypatch.setattr("budget_tracker.cli.TO_IMPORT_DIR", inbox)
+
+    assert cli._select_csv_interactively() is None
+    assert "Nothing to import in" in capsys.readouterr().out
