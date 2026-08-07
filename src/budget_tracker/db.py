@@ -30,14 +30,24 @@ def _enable_sqlite_foreign_keys(dbapi_connection, connection_record):
     cursor.close()
 
 
+def resolve_db_path(db_path: Optional[Path] = None) -> Path:
+    """Which file an engine built the same way would actually open.
+
+    Split out of :func:`get_engine` so that anything *reporting* the database — the
+    CLI's "Database: …" line, say — resolves it the same way rather than naming
+    ``DEFAULT_DB_PATH`` and being wrong whenever ``BUDGET_DB`` is set. Telling the user
+    you wrote to one file while writing to another is worse than saying nothing.
+    """
+    if db_path is not None:
+        return Path(db_path)
+    if os.environ.get("BUDGET_DB"):
+        return Path(os.environ["BUDGET_DB"])
+    return DEFAULT_DB_PATH
+
+
 def get_engine(db_path: Optional[Path] = None) -> Engine:
     """Create an engine for the given SQLite path (env ``BUDGET_DB`` overrides)."""
-    if db_path is not None:
-        path = Path(db_path)
-    elif os.environ.get("BUDGET_DB"):
-        path = Path(os.environ["BUDGET_DB"])
-    else:
-        path = DEFAULT_DB_PATH
+    path = resolve_db_path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     return create_engine(f"sqlite:///{path}", future=True)
 

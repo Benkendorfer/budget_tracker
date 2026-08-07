@@ -4,6 +4,7 @@ Planning is pure, so none of this needs a database. Every figure below is invent
 shape of the export is what is under test, not anybody's money.
 """
 
+import datetime
 from datetime import date
 from decimal import Decimal
 
@@ -561,3 +562,47 @@ def test_routing_does_not_hijack_an_ordinary_export(tmp_path):
         candidate = inspect_csv(session, path)
     assert candidate.format_name != "Wise transfer log"
     assert candidate.problem == "needs setup"
+
+
+def test_importing_pairs_a_top_up_against_the_bank_account_that_funded_it(tmp_path):
+    """A top-up from your own bank into a Wise balance is same-currency, equal and
+    opposite, and in a different account — an ordinary transfer. The generic importer
+    runs detection at the end of every import; this one has to as well, or the pair sits
+    unnoticed and both legs are counted as real income and real spending."""
+    factory = _factory(tmp_path)
+    with factory() as session:
+        currency = Currency(value="USD", symbol="$", decimal_places=2)
+        session.add(currency)
+        session.flush()
+        bank = Account(name="Checking", currency_id=currency.id)
+        session.add(bank)
+        session.flush()
+        session.add(
+            Transaction(
+                account_id=bank.id,
+                currency_id=currency.id,
+                posted_date=datetime.date(2026, 3, 2),
+                description="TRANSFER OUT",
+                raw_description="TRANSFER OUT",
+                value_minor=-150_000,
+                import_hash="bank-topup",
+            )
+        )
+        session.commit()
+
+    path = _write_csv(tmp_path / "wise.csv", [
+        _row(ID="TOPUP", Direction="IN", **{
+            "Source name": "Checking", "Source currency": "USD",
+            "Source amount (after fees)": "1500.00",
+            "Target currency": "USD", "Target amount (after fees)": "1500.00",
+        })
+    ])
+    with factory() as session:
+        import_wise_csv(session, path)
+
+    with factory() as session:
+        legs = session.query(Transaction).all()
+        assert len(legs) == 2
+        groups = {leg.transfer_group_id for leg in legs}
+        assert None not in groups, "the top-up was never paired with the bank leg"
+        assert len(groups) == 1, "the two legs landed in different transfer groups"

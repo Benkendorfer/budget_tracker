@@ -474,3 +474,17 @@ def test_an_empty_inbox_says_so_and_stops(tmp_path, monkeypatch, capsys):
 
     assert cli._select_csv_interactively() is None
     assert "Nothing to import in" in capsys.readouterr().out
+
+
+def test_the_import_summary_names_the_database_it_actually_wrote(tmp_path, monkeypatch, capsys):
+    """It used to print DEFAULT_DB_PATH unconditionally, so with BUDGET_DB set it named
+    a file it had not touched. Saying you wrote to one database while writing to another
+    is worse than saying nothing at all."""
+    _setup(tmp_path, monkeypatch)
+    csv_path = tmp_path / "again.csv"
+    csv_path.write_text(CSV, encoding="utf-8")
+
+    assert cli.main(["import", str(csv_path)]) == 0
+    printed = capsys.readouterr().out
+    assert f"Database: {tmp_path / 't.db'}" in printed
+    assert "data/budget.db" not in printed

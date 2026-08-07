@@ -731,6 +731,15 @@ def import_wise_csv(
 
     apply_category_rules(session)
 
+    # Same as import_csv: newly imported rows may be the other leg of a transfer already
+    # on file. A top-up from your own bank into a Wise balance is same-currency, equal
+    # and opposite, and in a different account — an ordinary transfer that only this
+    # finds. Conversions are already paired above, and detection skips paired rows, so
+    # this cannot disturb them.
+    from .transfers import detect_transfers
+
+    detect_transfers(session)
+
     session.commit()
     return ImportResult(
         source_file=path.name,

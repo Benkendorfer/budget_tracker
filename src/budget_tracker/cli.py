@@ -11,7 +11,7 @@ from typing import List, Optional
 from . import categories as categories_module
 from . import formats, queries
 from . import transfers as transfers_module
-from .db import DEFAULT_DB_PATH, get_engine, get_sessionmaker, init_db
+from .db import get_engine, get_sessionmaker, init_db, resolve_db_path
 from .importer import (
     DEFAULT_CURRENCY_CODE,
     import_csv,
@@ -134,7 +134,7 @@ def _cmd_import(args: argparse.Namespace) -> int:
         f"{result.skipped_duplicates} duplicates skipped "
         f"({result.total_rows} rows total)."
     )
-    print(f"Database: {DEFAULT_DB_PATH}")
+    print(f"Database: {resolve_db_path()}")
     return 0
 
 
