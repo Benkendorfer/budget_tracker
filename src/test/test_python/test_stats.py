@@ -189,7 +189,11 @@ def test_categories_are_ordered_by_spend_and_include_uncategorised(tmp_path):
     assert sum(c.outflow_minor for c in report.categories) == report.outflow_minor
     assert sum(c.inflow_minor for c in report.categories) == report.inflow_minor
     assert sum(c.share for c in report.categories) == pytest.approx(1.0)
-    assert report.categories[0].share == pytest.approx(100000 / 104500)
+    # Net-based, not gross: Uncategorised nets to +249500 (-500 Mystery, +250000 Salary),
+    # so it contributes 0 to the denominator despite -500 of gross outflow. The
+    # denominator is net spend only: -100000 (Rent) + -4000 (Dining) = -104000, not the
+    # old gross-outflow denominator of -104500.
+    assert report.categories[0].share == pytest.approx(100000 / 104000)
 
 
 def test_share_is_zero_when_nothing_was_spent(tmp_path):
@@ -203,6 +207,69 @@ def test_share_is_zero_when_nothing_was_spent(tmp_path):
         report = stats.build_report(session, _custom("2025-03-01", "2025-03-31"))
     assert report.outflow_minor == 0
     assert [c.share for c in report.categories] == [0.0]
+
+
+def test_share_is_net_based_not_gross(tmp_path):
+    """A category with heavy churn (money out and mostly back in) must not out-rank a
+    category that is purely a net cost, even though its gross outflow is much bigger."""
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        currency, accounts, categories = _seed(
+            session, category_names=("Churn", "Travel")
+        )
+        account = accounts["Checking"]
+        # Churn: -31000 out, +28700 back in -> nets to -2300, a net cost.
+        _txn(session, currency, account, date(2025, 3, 1), -31000, "Out",
+             categories["Churn"])
+        _txn(session, currency, account, date(2025, 3, 2), 28700, "Back",
+             categories["Churn"])
+        # Travel: pure spend, nets to -8900.
+        _txn(session, currency, account, date(2025, 3, 3), -8900, "Trip",
+             categories["Travel"])
+        session.commit()
+
+    with session_factory() as session:
+        report = stats.build_report(session, _custom("2025-03-01", "2025-03-31"))
+    rows = {c.name: c for c in report.categories}
+
+    # Gross outflow still shows Churn as the bigger mover...
+    assert rows["Churn"].outflow_minor == -31000
+    assert rows["Travel"].outflow_minor == -8900
+    # ...but net spend, and therefore share, correctly shows Travel costing more.
+    assert rows["Churn"].total_minor == -2300
+    assert rows["Travel"].total_minor == -8900
+    assert report.net_spend_minor == -2300 + -8900
+    assert rows["Churn"].share == pytest.approx(2300 / 11200)
+    assert rows["Travel"].share == pytest.approx(8900 / 11200)
+    assert rows["Travel"].share > rows["Churn"].share
+
+
+def test_share_is_zero_for_a_net_positive_row(tmp_path):
+    """A category that nets positive (more refunded than spent) is not "negative spend"."""
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        currency, accounts, categories = _seed(
+            session, category_names=("Refunds", "Dining")
+        )
+        account = accounts["Checking"]
+        _txn(session, currency, account, date(2025, 3, 1), -1000, "Bought",
+             categories["Refunds"])
+        _txn(session, currency, account, date(2025, 3, 2), 5000, "Refunded",
+             categories["Refunds"])
+        _txn(session, currency, account, date(2025, 3, 3), -2000, "Lunch",
+             categories["Dining"])
+        session.commit()
+
+    with session_factory() as session:
+        report = stats.build_report(session, _custom("2025-03-01", "2025-03-31"))
+    rows = {c.name: c for c in report.categories}
+
+    assert rows["Refunds"].total_minor == 4000  # net positive
+    assert rows["Refunds"].share == 0.0
+    assert rows["Refunds"].parent_share == 0.0
+    # Dining is the only net cost, so it takes the entire denominator.
+    assert report.net_spend_minor == -2000
+    assert rows["Dining"].share == pytest.approx(1.0)
 
 
 def test_transfers_are_counted_but_contribute_no_money(tmp_path):

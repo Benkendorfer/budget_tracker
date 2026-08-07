@@ -128,13 +128,25 @@ class CategoryStat:
     outflow_minor: int  # inclusive of every descendant
     inflow_minor: int  # inclusive of every descendant
     avg_month_minor: int
-    share: float  # fraction of the window's total outflow, ready for a pie chart
-    # This row's outflow as a fraction of its *parent's* rolled-up outflow (the same
-    # figure the parent row displays) — not of the parent's own direct outflow. So
-    # siblings under a parent sum to ~1.0 only when the parent holds no direct
-    # transactions of its own; otherwise they sum to less, the remainder being the
-    # parent's own share of itself. At depth 0 there is no parent, so the denominator is
-    # the report's total outflow and this equals ``share``.
+    # This row's contribution to *net* spending — ``min(0, total_minor)``, so a row that is
+    # net positive (more inflow than outflow rolled up) contributes nothing — as a
+    # fraction of the window's total net spend: the sum of that same figure over the
+    # depth-0 rows (the same rows that already sum to ``Report.outflow_minor`` /
+    # ``inflow_minor``; see ``Report.net_spend_minor``). A net-positive row gets 0.0, and
+    # so does every row when that total is zero. A fraction, not a percentage — formatting
+    # stays the UI's job. This is *net* spend, not gross outflow, so a category with heavy
+    # churn (money moving out and back in) does not read as bigger than its actual net
+    # cost — see the "Uncategorised at 43% but net -$2,374" bug this fixed.
+    share: float
+    # The identical rule, but measured against the *parent's* own net contribution
+    # (``min(0, parent's total_minor)``) rather than the report-wide total. So siblings
+    # under a parent sum to ~1.0 only when the parent itself is entirely net spend with no
+    # offsetting income; otherwise they can sum to more or less than 1.0. At depth 0 there
+    # is no real parent, so the denominator is the same report-wide total as ``share``, and
+    # the two are equal. A parent can be net positive overall while one child beneath it is
+    # net negative — a real, if odd, case (say a big refund elsewhere in the parent more
+    # than offsets this child) — and that zero denominator is guarded to 0.0 rather than
+    # treated as impossible.
     parent_share: float
     # Filter-ready, so a UI can drill from a row straight into its transactions:
     # UNCATEGORISED_ID rather than None for the null category.
@@ -164,6 +176,10 @@ class Report:
     outflow_minor: int
     inflow_minor: int
     transfer_count: int
+    # The denominator every row's ``share`` is measured against: the sum of each depth-0
+    # row's own net contribution (``min(0, total_minor)``). Exposed so a UI can render a
+    # "100%" total row without re-summing ``categories`` itself.
+    net_spend_minor: int = 0
 
     @property
     def avg_month_outflow_minor(self) -> int:
@@ -195,7 +211,6 @@ def _roll_up_categories(
     session: Session,
     rows: List[CategoryTotal],
     window: Window,
-    report_outflow: int,
     root_category_id: Optional[int] = None,
 ) -> List[CategoryStat]:
     """``rows`` (direct, per-exact-category figures from :func:`queries.get_category_totals`)
@@ -259,9 +274,22 @@ def _roll_up_categories(
     for root_id in children.get(None, []):
         roll(root_id)
 
-    def stat_for(cid: int, depth: int, parent_id: Optional[int], parent_outflow: int) -> CategoryStat:
+    # The `share` denominator: net spend summed over the depth-0 rows only (the same rows
+    # that already sum to the report's own outflow/inflow). This is computed from the
+    # rolled totals, not from the report's gross outflow — a depth-0 category that is net
+    # positive (more refunded than spent) contributes zero here despite having nonzero
+    # gross outflow, which is the whole point of the change.
+    depth0_ids = children.get(None, [])
+    net_spend_minor = sum(min(0, rolled[cid][1]) for cid in depth0_ids)
+    if uncategorised is not None:
+        net_spend_minor += min(0, uncategorised.total_minor)
+
+    def stat_for(
+        cid: int, depth: int, parent_id: Optional[int], parent_contribution: int
+    ) -> CategoryStat:
         count, total, outflow, inflow = rolled[cid]
         row = direct.get(cid)
+        contribution = min(0, total)
         return CategoryStat(
             name=all_categories[cid].value,
             count=count,
@@ -269,8 +297,8 @@ def _roll_up_categories(
             outflow_minor=outflow,
             inflow_minor=inflow,
             avg_month_minor=per_month(total, window),
-            share=(outflow / report_outflow) if report_outflow else 0.0,
-            parent_share=(outflow / parent_outflow) if parent_outflow else 0.0,
+            share=(contribution / net_spend_minor) if net_spend_minor else 0.0,
+            parent_share=(contribution / parent_contribution) if parent_contribution else 0.0,
             category_id=cid,
             parent_id=parent_id,
             depth=depth,
@@ -282,19 +310,24 @@ def _roll_up_categories(
         # Outflow is negative, so ascending is biggest-spend-first; name breaks ties.
         return sorted(ids, key=lambda cid: (rolled[cid][2], all_categories[cid].value))
 
-    def walk(cid: int, depth: int, parent_id: Optional[int], parent_outflow: int) -> List[CategoryStat]:
-        result = [stat_for(cid, depth, parent_id, parent_outflow)]
-        _, _, own_outflow, _ = rolled[cid]
+    def walk(
+        cid: int, depth: int, parent_id: Optional[int], parent_contribution: int
+    ) -> List[CategoryStat]:
+        result = [stat_for(cid, depth, parent_id, parent_contribution)]
+        _, own_total, _, _ = rolled[cid]
+        own_contribution = min(0, own_total)
         for child_id in display_order(children.get(cid, [])):
-            result.extend(walk(child_id, depth + 1, cid, own_outflow))
+            result.extend(walk(child_id, depth + 1, cid, own_contribution))
         return result
 
     flat: List[CategoryStat] = []
-    for root_id in display_order(children.get(None, [])):
-        flat.extend(walk(root_id, 0, None, report_outflow))
+    for root_id in display_order(depth0_ids):
+        flat.extend(walk(root_id, 0, None, net_spend_minor))
 
     if uncategorised is not None:
         outflow = uncategorised.outflow_minor
+        contribution = min(0, uncategorised.total_minor)
+        share = (contribution / net_spend_minor) if net_spend_minor else 0.0
         stat = CategoryStat(
             name=UNCATEGORISED,
             count=uncategorised.count,
@@ -302,8 +335,8 @@ def _roll_up_categories(
             outflow_minor=outflow,
             inflow_minor=uncategorised.inflow_minor,
             avg_month_minor=per_month(uncategorised.total_minor, window),
-            share=(outflow / report_outflow) if report_outflow else 0.0,
-            parent_share=(outflow / report_outflow) if report_outflow else 0.0,
+            share=share,
+            parent_share=share,  # depth 0, so parent_share equals share as elsewhere
             category_id=queries.UNCATEGORISED_ID,
             parent_id=None,
             depth=0,
@@ -349,9 +382,10 @@ def build_report(
     root_category_id = (
         category_id if category_id not in (None, queries.UNCATEGORISED_ID) else None
     )
-    categories = _roll_up_categories(
-        session, rows, window, totals.outflow_minor, root_category_id
-    )
+    categories = _roll_up_categories(session, rows, window, root_category_id)
+    # Re-derived from the same depth-0 rows `share` is computed against, rather than
+    # threaded back out of _roll_up_categories, so there is exactly one definition of it.
+    net_spend_minor = sum(min(0, c.total_minor) for c in categories if c.depth == 0)
     return Report(
         window=window,
         categories=categories,
@@ -360,6 +394,7 @@ def build_report(
         outflow_minor=totals.outflow_minor,
         inflow_minor=totals.inflow_minor,
         transfer_count=totals.transfer_count,
+        net_spend_minor=net_spend_minor,
     )
 
 
