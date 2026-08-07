@@ -683,10 +683,13 @@ def _cmd_transfers(args: argparse.Namespace) -> int:
             session.commit()
             print(f"Un-paired {reset} transaction(s).")
             return 0
-        pairs = transfers.detect_transfers(session, window_days=args.days)
+        pairs = transfers.detect_transfers(
+            session, window_days=args.days, allow_same_account=args.same_account
+        )
         session.commit()
         totals = queries.get_totals(session)
-    print(f"Found {pairs} new transfer pair(s) within {args.days} day(s).")
+    scope = " (same-account allowed)" if args.same_account else ""
+    print(f"Found {pairs} new transfer pair(s) within {args.days} day(s){scope}.")
     print(f"{totals.transfer_count} transaction(s) are now excluded from totals.")
     return 0
 
@@ -931,6 +934,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     transfers_parser.add_argument(
         "--reset", action="store_true", help="Un-pair every detected transfer."
+    )
+    transfers_parser.add_argument(
+        "--same-account",
+        action="store_true",
+        help=(
+            "Also pair legs that sit in the same account, for a provider whose "
+            "sub-accounts you track here as one account. Off by default: it makes an "
+            "accidental same-size, same-account pairing more likely, and a false "
+            "pairing silently drops two real transactions from your totals."
+        ),
     )
     transfers_parser.set_defaults(func=_cmd_transfers)
 

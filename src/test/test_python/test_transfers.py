@@ -116,6 +116,60 @@ def test_same_account_is_not_a_transfer(tmp_path):
         assert transfers.detect_transfers(session) == 0
 
 
+def test_same_account_pairs_only_when_enabled(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        currency, accounts = _seed(session)
+        out = _txn(session, currency, accounts["Checking"], 1, -50000, "Move out")
+        into = _txn(session, currency, accounts["Checking"], 2, 50000, "Move in")
+        # Off by default: an exact same-account pair is left alone.
+        assert transfers.detect_transfers(session) == 0
+        assert out.transfer_group_id is None
+        assert into.transfer_group_id is None
+
+        assert transfers.detect_transfers(session, allow_same_account=True) == 1
+        session.commit()
+        assert out.transfer_group_id is not None
+        assert out.transfer_group_id == into.transfer_group_id
+
+
+def test_cross_account_pairs_regardless_of_the_same_account_flag(tmp_path):
+    session_factory = _session_factory(tmp_path / "a")
+    with session_factory() as session:
+        currency, accounts = _seed(session)
+        _txn(session, currency, accounts["Checking"], 1, -50000, "Xfer To")
+        _txn(session, currency, accounts["Savings"], 2, 50000, "Xfer From")
+        assert transfers.detect_transfers(session, allow_same_account=True) == 1
+
+    session_factory = _session_factory(tmp_path / "b")
+    with session_factory() as session:
+        currency, accounts = _seed(session)
+        _txn(session, currency, accounts["Checking"], 1, -50000, "Xfer To")
+        _txn(session, currency, accounts["Savings"], 2, 50000, "Xfer From")
+        assert transfers.detect_transfers(session, allow_same_account=False) == 1
+
+
+def test_allowing_same_account_does_not_let_a_transaction_pair_with_itself(tmp_path):
+    """A single zero-net transaction must never become its own transfer partner."""
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        currency, accounts = _seed(session)
+        solo = _txn(session, currency, accounts["Checking"], 1, -50000, "Solo")
+        assert transfers.detect_transfers(session, allow_same_account=True) == 0
+        assert solo.transfer_group_id is None
+
+
+def test_same_account_detection_is_idempotent(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        currency, accounts = _seed(session)
+        _txn(session, currency, accounts["Checking"], 1, -50000, "Move out")
+        _txn(session, currency, accounts["Checking"], 2, 50000, "Move in")
+        assert transfers.detect_transfers(session, allow_same_account=True) == 1
+        assert transfers.detect_transfers(session, allow_same_account=True) == 0
+        session.commit()
+
+
 def test_dates_outside_the_window_do_not_pair(tmp_path):
     session_factory = _session_factory(tmp_path)
     with session_factory() as session:

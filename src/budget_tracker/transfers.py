@@ -7,7 +7,9 @@ that never left your control.
 Two transactions are paired when they have the same amount with opposite signs, sit in
 different accounts, and post within ``window_days`` of each other. Paired legs share a
 ``transfer_group_id``, are categorised as ``Transfer``, and are left out of the
-inflow/outflow totals.
+inflow/outflow totals. Same-account pairing is off by default and opt-in via
+``allow_same_account``, for the case where several sub-accounts of one provider are
+tracked here as a single account.
 
 Matching is by amount and date alone, so two unrelated transactions of the same size a
 day apart can be paired by mistake. Detection is therefore reversible with
@@ -45,12 +47,22 @@ def _get_or_create_transfer_category(session: Session) -> Category:
 
 
 def detect_transfers(
-    session: Session, window_days: int = DEFAULT_WINDOW_DAYS
+    session: Session,
+    window_days: int = DEFAULT_WINDOW_DAYS,
+    allow_same_account: bool = False,
 ) -> int:
     """Pair up unpaired transactions. Returns the number of pairs found. No commit.
 
     Already-paired transactions are left alone, so running this repeatedly is safe and
     only ever finds newly imported pairs.
+
+    ``allow_same_account`` opts into pairing two legs that sit in the *same* account —
+    useful when several sub-accounts of one provider are tracked as a single account here,
+    so a move between them never has a different ``account_id`` to pair across. It
+    defaults to off: relaxing the check makes an accidental same-account pairing (two
+    unrelated same-size transactions a few days apart) more likely, and a false pairing
+    silently removes two real transactions from the user's totals — worse than leaving a
+    real transfer undetected.
     """
     unpaired = list(
         session.scalars(
@@ -83,7 +95,9 @@ def detect_transfers(
         candidates = []
         for outflow in outflows:
             for inflow in inflows:
-                if inflow.account_id == outflow.account_id:
+                if outflow.id == inflow.id:
+                    continue  # a txn can never pair with itself, same-account or not
+                if inflow.account_id == outflow.account_id and not allow_same_account:
                     continue
                 delta = abs((inflow.posted_date - outflow.posted_date).days)
                 if delta <= window_days:
