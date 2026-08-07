@@ -1,6 +1,10 @@
 .vscode/
 data/
 
+# Session handoff notes: working state, open decisions, and things in flight. Useful
+# for picking a session back up, not for anyone reading the project's history.
+.claude/handoff/
+
 # Agent worktrees are checked out inside the repo, at .claude/worktrees/agent-<id>.
 # They are whole nested copies of the tree, so without this a `git add -A` while one
 # is live would commit a second checkout into the repo.

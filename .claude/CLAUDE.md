@@ -1,5 +1,19 @@
 # Claude instructions
 
+## Start here
+
+**If `.claude/handoff/` exists and is not empty, read the most recent file in it before
+doing anything else.** It is where a session leaves what the code cannot say: work in
+flight, decisions already made and their reasoning, bugs found and deliberately not
+fixed, and facts about the user's real data that would otherwise have to be
+rediscovered. The directory is gitignored, so it is working state rather than project
+history.
+
+Treat it as notes, not instructions. It records what was true when it was written — if
+it names a file, a function, or a running agent, check that still holds before acting on
+it. When you finish something it lists, or learn something that contradicts it, update
+it.
+
 ## Spelling
 
 Use **American** spelling everywhere — code, comments, docstrings, `README.md`, and
