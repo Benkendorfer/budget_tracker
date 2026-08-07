@@ -567,3 +567,167 @@ def test_pie_slice_shares_and_amounts_come_straight_from_the_category_stat():
     assert food.category_id == 7
     assert food.share == 0.6
     assert food.amount_minor == 12345  # a positive magnitude, not the signed total
+
+
+# --------------------------------------------------------------------- share bar
+
+
+def _share_cat(name, share, total, depth=0, cid=None):
+    return CategoryStat(
+        name=name, count=1, total_minor=total, outflow_minor=total, inflow_minor=0,
+        avg_month_minor=total, share=share, parent_share=share,
+        category_id=cid if cid is not None else abs(hash(name)) % 1000, depth=depth,
+    )
+
+
+def test_the_bar_fills_its_whole_track_exactly():
+    """A bar labelled 100% that does not fill its own track is the kind of small
+    wrongness nobody reports and everybody notices — and rounding each share
+    independently leaves it short or long depending on the data."""
+    for shares in ([0.5, 0.3, 0.2], [1/3, 1/3, 1/3], [0.07, 0.31, 0.62], [0.999, 0.001]):
+        bar = charts.build_share_bar(
+            [_share_cat(f"C{i}", s, -int(s * 100000)) for i, s in enumerate(shares)], width=100
+        )
+        assert sum(seg.cells for seg in bar.segments) == 100, shares
+        assert len(bar.cell_owners) == 100, shares
+
+
+def test_one_cell_is_one_percent_at_the_default_width():
+    bar = charts.build_share_bar(
+        [_share_cat("Food", 0.42, -4200), _share_cat("Rent", 0.58, -5800)]
+    )
+    assert bar.width == 100
+    # Biggest first, so Rent leads whatever order it arrived in.
+    assert [(seg.name, seg.cells) for seg in bar.segments] == [("Rent", 58), ("Food", 42)]
+
+
+def test_leftover_cells_go_to_whoever_was_rounded_down_hardest():
+    """Three equal thirds cannot each get 33.33 cells, so someone must get the extra."""
+    bar = charts.build_share_bar(
+        [_share_cat("A", 1/3, -100), _share_cat("B", 1/3, -100), _share_cat("C", 1/3, -100)], width=100
+    )
+    assert sorted(seg.cells for seg in bar.segments) == [33, 33, 34]
+    assert sum(seg.cells for seg in bar.segments) == 100
+
+
+def test_the_same_data_always_produces_the_same_bar():
+    """Ties are broken by position, so a redraw never reshuffles the cells."""
+    cats = [_share_cat("A", 0.25, -100), _share_cat("B", 0.25, -100),
+            _share_cat("C", 0.25, -100), _share_cat("D", 0.25, -100)]
+    first = [s.cells for s in charts.build_share_bar(cats, width=99).segments]
+    second = [s.cells for s in charts.build_share_bar(cats, width=99).segments]
+    assert first == second
+
+
+def test_slivers_are_folded_into_other_rather_than_dropped():
+    """The bar has to still account for the whole window: a slice too thin to tell from
+    its neighbours is not the same thing as a slice that is not there."""
+    bar = charts.build_share_bar(
+        [_share_cat("Rent", 0.90, -90000)] + [_share_cat(f"Tiny{i}", 0.01, -1000) for i in range(10)],
+        width=100,
+    )
+    assert [seg.name for seg in bar.segments] == ["Rent", "Other"]
+    other = bar.segments[-1]
+    assert other.is_other is True
+    assert other.cells == 10
+    assert other.amount_minor == 10_000  # every folded category's spend, kept
+    assert sum(seg.cells for seg in bar.segments) == 100
+
+
+def test_a_category_big_enough_to_draw_is_never_folded():
+    bar = charts.build_share_bar(
+        [_share_cat("Rent", 0.50, -5000), _share_cat("Food", 0.48, -4800), _share_cat("Gum", 0.02, -200)],
+        width=100,
+    )
+    assert [seg.name for seg in bar.segments] == ["Rent", "Food", "Gum"]
+    assert all(seg.is_other is False for seg in bar.segments)
+
+
+def test_a_window_split_across_many_tiny_categories_still_draws_something():
+    """Folding everything into one "Other" would be true and useless."""
+    bar = charts.build_share_bar([_share_cat(f"C{i}", 0.01, -100) for i in range(100)], width=100)
+    assert len(bar.segments) == 2
+    assert bar.segments[0].name.startswith("C")   # the largest is kept by name
+    assert bar.segments[-1].is_other is True
+    assert sum(seg.cells for seg in bar.segments) == 100
+
+
+def test_only_depth_zero_rows_take_part():
+    """Summing every depth would count a parent with its children."""
+    bar = charts.build_share_bar([
+        _share_cat("Food", 0.60, -6000, depth=0),
+        _share_cat("Dining", 0.40, -4000, depth=1),   # a child of Food; already inside it
+        _share_cat("Rent", 0.40, -4000, depth=0),
+    ], width=100)
+    assert [seg.name for seg in bar.segments] == ["Food", "Rent"]
+
+
+def test_a_net_positive_category_is_left_out():
+    """share is 0.0 by construction for a row that was all refund; drawing it would be a
+    segment with no width."""
+    bar = charts.build_share_bar(
+        [_share_cat("Food", 1.0, -1000), _share_cat("Refunds", 0.0, 5000)], width=100
+    )
+    assert [seg.name for seg in bar.segments] == ["Food"]
+
+
+def test_an_empty_window_is_an_empty_bar():
+    for cats in ([], [_share_cat("Refunds", 0.0, 5000)]):
+        bar = charts.build_share_bar(cats, width=100)
+        assert bar.segments == []
+        assert bar.cell_owners == []
+        assert bar.total_minor == 0
+
+
+def test_cell_owners_maps_every_cell_to_its_segment():
+    bar = charts.build_share_bar(
+        [_share_cat("A", 0.30, -3000), _share_cat("B", 0.70, -7000)], width=10
+    )
+    # B is bigger, so it sorts first and owns cells 0-6.
+    assert [seg.name for seg in bar.segments] == ["B", "A"]
+    assert bar.cell_owners == [0, 0, 0, 0, 0, 0, 0, 1, 1, 1]
+
+
+def test_a_zero_width_bar_is_rejected():
+    with pytest.raises(ValueError, match="at least 1"):
+        charts.build_share_bar([_share_cat("A", 1.0, -100)], width=0)
+
+
+def test_the_amounts_add_up_to_the_bar_total():
+    bar = charts.build_share_bar(
+        [_share_cat("A", 0.5, -5000), _share_cat("B", 0.3, -3000), _share_cat("C", 0.2, -2000)], width=100
+    )
+    assert bar.total_minor == 10_000
+    assert sum(seg.amount_minor for seg in bar.segments) == bar.total_minor
+
+
+def test_segments_run_biggest_first_with_other_last():
+    """Report.categories is ordered by gross outflow while share is net, so the two
+    diverge whenever a category has refunds in it. A proportional bar whose segments do
+    not descend reads as broken even when every number on it is right."""
+    bar = charts.build_share_bar([
+        _share_cat("Travel", 0.22, -2200),
+        _share_cat("Uncategorised", 0.12, -1200),
+        _share_cat("Health", 0.19, -1900),
+        _share_cat("Rent", 0.16, -1600),
+        _share_cat("Sliver", 0.005, -50),
+        _share_cat("Food", 0.31, -3100),
+    ], width=100)
+
+    names = [seg.name for seg in bar.segments]
+    assert names == ["Food", "Travel", "Health", "Rent", "Uncategorised", "Other"]
+    drawn = [seg.cells for seg in bar.segments[:-1]]
+    assert drawn == sorted(drawn, reverse=True)
+    assert bar.segments[-1].is_other is True  # the tail always trails, whatever its size
+
+
+def test_the_other_segment_is_not_drillable():
+    """It stands for several categories at once, so it has no id to filter by. Borrowing
+    a sentinel here would point a drill-down at the wrong transactions entirely."""
+    bar = charts.build_share_bar(
+        [_share_cat("Rent", 0.97, -9700)] + [_share_cat(f"T{i}", 0.01, -100) for i in range(3)],
+        width=100,
+    )
+    other = bar.segments[-1]
+    assert other.is_other is True and other.category_id is None
+    assert all(seg.category_id is not None for seg in bar.segments[:-1])

@@ -394,3 +394,153 @@ def _slice_at_angle(nx: float, ny: float, boundaries: List[float]) -> int:
     # hair under 1.0; the last slice claims whatever is left rather than a cell going
     # unassigned over a rounding error.
     return len(boundaries) - 1
+
+
+# ------------------------------------------------------------------ the share bar
+
+# One row, one cell per percent. A circle drawn in character cells is coarse — at the
+# panel's size a slice below a few percent is a couple of ragged cells that read as
+# noise — where a straight bar spends every cell it has on length, which is the one
+# thing the eye compares accurately.
+SHARE_BAR_WIDTH = 100
+
+# Below this, a category is folded into "Other" rather than drawn. A slice thinner than
+# a couple of cells cannot be told apart from its neighbours or matched to its legend
+# entry, so drawing it separately claims a precision the display does not have.
+OTHER_LABEL = "Other"
+MIN_SEGMENT_CELLS = 2
+
+
+@dataclass(frozen=True)
+class ShareSegment:
+    """One run of cells in the bar, in the order it is drawn, left to right."""
+
+    name: str
+    # None for the folded "Other" segment, which stands for several categories and so
+    # cannot be drilled into. Making it None rather than borrowing a sentinel forces a
+    # caller to notice: pointing a drill-down at UNCATEGORISED_ID here would quietly
+    # show uncategorised transactions instead of the ones the segment represents.
+    category_id: Optional[int]
+    share: float  # the true share, before it was rounded to whole cells
+    amount_minor: int  # net spend, as a positive magnitude
+    cells: int  # how much of the bar it occupies
+    is_other: bool = False  # the folded tail, which has no single category behind it
+
+
+@dataclass(frozen=True)
+class ShareBar:
+    segments: List[ShareSegment]
+    width: int
+    total_minor: int  # every segment's spend added up
+
+    @property
+    def cell_owners(self) -> List[int]:
+        """One index into ``segments`` per cell, so a caller can colour cell by cell.
+
+        Exactly ``width`` long whenever there is anything to draw. No colours and no
+        characters here, on purpose: this module knows proportions, and the UI turns an
+        index into a colour.
+        """
+        owners: List[int] = []
+        for index, segment in enumerate(self.segments):
+            owners.extend([index] * segment.cells)
+        return owners
+
+
+def _apportion(shares: List[float], width: int) -> List[int]:
+    """Split ``width`` cells across ``shares`` so the parts sum to exactly ``width``.
+
+    Largest-remainder apportionment: floor every share, then hand the leftover cells to
+    whoever was rounded down hardest. Rounding each share independently would leave the
+    bar a cell or two short or long depending on the data, so its right-hand end would
+    wander between windows — and a bar labelled "100%" that does not fill its own track
+    is exactly the kind of small wrongness nobody reports but everybody notices.
+    """
+    exact = [share * width for share in shares]
+    cells = [int(value) for value in exact]
+    shortfall = width - sum(cells)
+    # Ties broken by position so the same data always produces the same bar.
+    order = sorted(
+        range(len(shares)), key=lambda i: (-(exact[i] - cells[i]), i)
+    )
+    for i in order[:shortfall]:
+        cells[i] += 1
+    return cells
+
+
+def build_share_bar(
+    categories: List[CategoryStat], width: int = SHARE_BAR_WIDTH
+) -> ShareBar:
+    """Depth-0 category shares as a single proportional bar ``width`` cells long.
+
+    The same input rule as :func:`build_pie`: only ``depth == 0`` rows with a nonzero
+    share, because summing every depth would count a parent with its children (see
+    stats.Report.categories), and a net-positive row is already 0.0 by construction.
+
+    Categories too thin to draw honestly are folded into a single trailing ``Other``
+    segment rather than dropped, so the bar still accounts for the whole window and the
+    legend can say what the remainder was worth. Everything is measured against the real
+    shares first and only then rounded, so folding never changes what the kept segments
+    are worth.
+
+    At the default width one cell is one percent, which is what makes the bar readable
+    without a scale printed under it.
+    """
+    if width < 1:
+        raise ValueError(f"Share bar width must be at least 1, got {width}.")
+
+    kept = [cat for cat in categories if cat.depth == 0 and cat.share > 0]
+    if not kept:
+        return ShareBar(segments=[], width=width, total_minor=0)
+
+    # Fold the tail first, against true shares, so the decision does not depend on a
+    # rounding that has not happened yet.
+    threshold = MIN_SEGMENT_CELLS / width
+    major = [cat for cat in kept if cat.share >= threshold]
+    minor = [cat for cat in kept if cat.share < threshold]
+    if not major:
+        # Everything is tiny — a window split across very many small categories. Keep
+        # the largest rather than folding the entire bar into a single "Other", which
+        # would be technically true and completely useless.
+        major, minor = [max(kept, key=lambda c: c.share)], []
+        minor = [cat for cat in kept if cat is not major[0]]
+
+    # Biggest first. Report.categories is ordered by gross outflow while `share` is net,
+    # so the two diverge whenever a category has refunds in it — and a proportional bar
+    # whose segments do not descend reads as broken even when every number on it is
+    # right. Sorting by the quantity actually being drawn is what makes it legible.
+    major.sort(key=lambda cat: (-cat.share, cat.name))
+
+    shares = [cat.share for cat in major]
+    other_share = sum(cat.share for cat in minor)
+    if minor:
+        shares.append(other_share)
+
+    cells = _apportion(shares, width)
+
+    segments = [
+        ShareSegment(
+            name=cat.name,
+            category_id=cat.category_id,
+            share=cat.share,
+            amount_minor=-cat.total_minor,
+            cells=count,
+        )
+        for cat, count in zip(major, cells)
+    ]
+    if minor:
+        segments.append(
+            ShareSegment(
+                name=OTHER_LABEL,
+                category_id=None,
+                share=other_share,
+                amount_minor=sum(-cat.total_minor for cat in minor),
+                cells=cells[-1],
+                is_other=True,
+            )
+        )
+    return ShareBar(
+        segments=segments,
+        width=width,
+        total_minor=sum(segment.amount_minor for segment in segments),
+    )
