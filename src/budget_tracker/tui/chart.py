@@ -12,6 +12,7 @@ from .formatting import (
     CHART_COLUMNS,
     CHART_WIDTH,
     TRANSFER_MARK,
+    UNCONVERTED_MARK,
     _amount_cell,
     _fmt_amount,
     _range_label,
@@ -144,16 +145,22 @@ def chart_status(
     account_filter: Optional[int],
     vendor_filter: Optional[queries.VendorFilter],
     text_filter: Optional[queries.TextFilter],
+    chart_unconverted: int = 0,
 ) -> str:
     """One line, under the same 92-column budget as every other panel's status."""
     label = "custom" if window.key == "custom" else window.label
     scope = chart_scope(category_filter, categories, account_filter, vendor_filter, text_filter)
     excluded = f"{TRANSFER_MARK} {chart_transfers} " if chart_transfers else ""
+    # As terse as the transfer marker beside it, for the same reason (see
+    # stats_panel.stats_status): this line has no room left for the word
+    # "unconverted", and stacking both markers at once is not budgeted for.
+    unconverted = f"{UNCONVERTED_MARK} {chart_unconverted} " if chart_unconverted else ""
     return (
         f"{label} {_range_label((window.start, window.end))} "
         f"{measure}/{bucket} "
         f"{scope}"
         f"{excluded}"
+        f"{unconverted}"
         f"total {_fmt_amount(chart.total_minor)} "
         f"peak {_fmt_amount(chart.peak_minor)}"
     )

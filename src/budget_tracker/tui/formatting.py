@@ -21,6 +21,12 @@ FOLDER_MARK = "▸"
 TRANSFER_MARK = "⇄"
 TRANSFER_STYLE = "dim italic"
 
+# A different figure is missing for a different reason than a transfer: nothing was
+# excluded on purpose, a rate to convert it just wasn't on file yet — see
+# queries.Totals.unconverted_count. Deliberately not TRANSFER_MARK, so "excluded by
+# design" and "missing until `rates fetch` runs" never read as the same thing.
+UNCONVERTED_MARK = "⚠"
+
 # A collapsed category shows this before its name; an expanded or leaf row shows nothing,
 # so the default (fully expanded) rendering is byte-for-byte what it was before folding
 # existed.

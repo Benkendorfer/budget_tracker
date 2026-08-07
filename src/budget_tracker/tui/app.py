@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Callable, Dict, List, Optional, Set
 
 from rich.text import Text
+from sqlalchemy.orm import Session
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -32,6 +33,7 @@ from .. import (
     formats,
     importer,
     queries,
+    rates,
     stats,
     transfers,
     vendors,
@@ -199,6 +201,9 @@ class BudgetApp(App):
         # Transfers are left out of the bars, as they are out of every other figure; the
         # count is carried so the status line can say so rather than quietly losing them.
         self._chart_transfers = 0
+        # Same idea for rows a missing exchange rate left out of the bars entirely --
+        # see queries.Totals.unconverted_count and UNCONVERTED_MARK.
+        self._chart_unconverted = 0
         # The pie's last-built wedges, drawn from the same report the statistics panel
         # uses (see reload()'s guard) — there is no separate query for it.
         self._pie: Optional[charts.Pie] = None
@@ -255,7 +260,7 @@ class BudgetApp(App):
         yield Input(
             placeholder=(
                 "command: import | unimport | filter | categorize | category | format | "
-                "stats | chart | pie | rules | all | refresh | help | quit"
+                "stats | chart | pie | rates | rules | all | refresh | help | quit"
             ),
             id="command",
         )
@@ -564,6 +569,7 @@ class BudgetApp(App):
             )
         self._chart = charts.build(series, measure=self._measure, width=CHART_WIDTH)
         self._chart_transfers = totals.transfer_count
+        self._chart_unconverted = totals.unconverted_count
 
     def _fill_chart(self) -> None:
         """Redraw the table, columns included — two headers name the current measure."""
@@ -583,6 +589,7 @@ class BudgetApp(App):
             self.account_filter,
             self.vendor_filter,
             self.text_filter,
+            self._chart_unconverted,
         )
 
     # ------------------------------------------------------------------- pie
@@ -677,8 +684,21 @@ class BudgetApp(App):
             if totals.transfer_count
             else ""
         )
+        # Distinct from transfers_label on purpose (see UNCONVERTED_MARK): money is
+        # missing here because a rate was never on file, not because it was excluded by
+        # design, and "rates fetch" is the one thing that actually fixes it. There is
+        # room to spell that out on this line (unlike stats_status and friends, which
+        # already spend their whole budget on the transfer marker alone), but stacking
+        # both a large transfer_count and a large unconverted_count is not — the same
+        # pre-existing limit test_drill_down_status_line_fits_the_main_panel already
+        # documents for filters.
+        unconverted_label = (
+            f"   ({totals.unconverted_count} unconverted, rates fetch)"
+            if totals.unconverted_count
+            else ""
+        )
         self.query_one("#status", Static).update(
-            f"{totals.count} txns{scope_label}{transfers_label}   "
+            f"{totals.count} txns{scope_label}{transfers_label}{unconverted_label}   "
             f"net {_fmt_amount(totals.net_minor)}   "
             f"out {_fmt_amount(totals.outflow_minor)}   "
             f"in {_fmt_amount(totals.inflow_minor)}"
@@ -758,6 +778,7 @@ class BudgetApp(App):
                 f"{candidate.path.name}: {result.inserted} added, "
                 f"{result.skipped_duplicates} skipped."
             )
+            self._fetch_rates_after_import([result.import_id])
             return
         setup = _Setup(path=candidate.path)
         if candidate.format_name is None:
@@ -819,6 +840,7 @@ class BudgetApp(App):
             f"{setup.path.name}: {result.inserted} added, "
             f"{result.skipped_duplicates} skipped."
         )
+        self._fetch_rates_after_import([result.import_id])
 
     def _cancel_setup(self) -> None:
         self._setup = None
@@ -1085,6 +1107,8 @@ class BudgetApp(App):
             self._do_chart(arg)
         elif name == "pie":
             self._do_pie(arg)
+        elif name == "rates":
+            self._do_rates(arg)
         elif name == "help":
             self.notify(
                 "import — browse data/to_import; enter imports the selected file,\n"
@@ -1147,6 +1171,10 @@ class BudgetApp(App):
                 "pie <period> — skip the picker (e.g. pie 6m, pie 1 year)\n"
                 "  only categories with real net spend get a wedge — a category\n"
                 "  that is all refund, or a window with no spending, draws none\n"
+                "rates — list cached exchange rates (pair, source, span, count)\n"
+                "rates fetch — cache ECB reference rates for every foreign currency\n"
+                "  on file, over its whole date range; runs in the background so the\n"
+                "  app stays responsive (an import does this on its own already)\n"
                 "all — clear filters   refresh — reload   quit — exit\n"
                 "Click an account/vendor/category to filter.\n"
                 "ctrl+n / ctrl+t — prefill rename / categorize for the selected\n"
@@ -1180,6 +1208,7 @@ class BudgetApp(App):
 
         added = skipped = 0
         imported = 0
+        import_ids: List[int] = []
         problems: List[str] = []
         with self.session_factory() as session:
             for path in paths:
@@ -1191,10 +1220,13 @@ class BudgetApp(App):
                 imported += 1
                 added += result.inserted
                 skipped += result.skipped_duplicates
+                import_ids.append(result.import_id)
         self.reload()
         self.notify(
             f"Imported {imported} file(s): {added} added, {skipped} skipped."
         )
+        if import_ids:
+            self._fetch_rates_after_import(import_ids)
         if problems:
             # An unknown layout needs the interactive setup, and an account-less file
             # needs --account; neither is something the app can decide for you.
@@ -1744,6 +1776,131 @@ class BudgetApp(App):
             for s in specs
         ]
         self.notify("\n".join(lines), title="Formats", markup=False, timeout=8)
+
+    # ------------------------------------------------------------------ rates
+    def _run_rate_fetch(self, job: Callable[[Session], Optional[str]]) -> None:
+        """Run ``job(session)`` off the event loop and report whatever it returns.
+
+        ``fetch_ecb_rates`` alone can take up to 40 seconds per attempt, twice over —
+        see its own docstring — so nothing that might call it runs on the UI thread.
+        This is the one place that talks to a worker thread for it, shared by the
+        post-import auto-fetch (``_fetch_rates_after_import``) and the ``rates fetch``
+        command (``_do_rates_fetch``), so neither has to repeat the plumbing.
+
+        ``job`` gets its own session (worker threads do not share one with the main
+        thread) and returns the message to show, or ``None`` to say nothing — an import
+        that turned out to need no foreign currency at all has nothing worth a
+        notification. Never raises past this point: a database or network hiccup here
+        must not take the whole app down, only report as "did not work".
+        """
+
+        def runner() -> None:
+            try:
+                with self.session_factory() as session:
+                    message = job(session)
+                    session.commit()
+            except Exception as error:  # noqa: BLE001 - reported, not swallowed
+                message = f"Rate fetch failed: {error}"
+            if message:
+                self.call_from_thread(self._on_rate_fetch_done, message)
+
+        self.run_worker(runner, thread=True, group="rates", exit_on_error=False)
+
+    def _on_rate_fetch_done(self, message: str) -> None:
+        """Runs on the UI thread (via call_from_thread) once a rate fetch worker lands."""
+        self.notify(message, markup=False)
+        self.reload()
+
+    def _fetch_rates_after_import(self, import_ids: List[int]) -> None:
+        """Cache whatever ECB rates the import(s) that just finished need, if any.
+
+        The decision -- which currencies, what span, whether anything is even missing
+        -- is entirely rates.fetch_rates_for_import's; this only loops over the ids and
+        turns its answer into a line of text. Offline or unreachable is reported, never
+        raised: the import this follows has already committed and succeeded.
+        """
+
+        def job(session: Session) -> Optional[str]:
+            messages = []
+            for import_id in import_ids:
+                outcome = rates.fetch_rates_for_import(session, import_id, queries.HOME_CURRENCY)
+                if not outcome.attempted:
+                    continue  # nothing but home_currency in this import
+                quotes = ", ".join(outcome.quotes)
+                if outcome.error is not None:
+                    messages.append(
+                        f"Could not fetch {queries.HOME_CURRENCY} -> {quotes} rates: "
+                        f"{outcome.error} Run 'rates fetch' later."
+                    )
+                else:
+                    messages.append(
+                        f"Fetched {outcome.written} rate(s) for "
+                        f"{queries.HOME_CURRENCY} -> {quotes}."
+                    )
+            return "\n".join(messages) if messages else None
+
+        self._run_rate_fetch(job)
+
+    RATES_USAGE = "Usage: rates | rates fetch"
+
+    def _do_rates(self, arg: str) -> None:
+        """Bare ``rates`` lists what is cached; ``rates fetch`` caches what is missing."""
+        arg = arg.strip().lower()
+        if arg in ("", "list"):
+            self._notify_rates()
+            return
+        if arg == "fetch":
+            self._do_rates_fetch()
+            return
+        self.notify(self.RATES_USAGE, severity="warning")
+
+    def _notify_rates(self) -> None:
+        with self.session_factory() as session:
+            rows = queries.get_exchange_rates(session)
+        if not rows:
+            self.notify("No exchange rates cached yet. Run: rates fetch")
+            return
+        lines = []
+        for row in rows:
+            span = (
+                row.first_day if row.first_day == row.last_day
+                else f"{row.first_day}..{row.last_day}"
+            )
+            plural = "" if row.count == 1 else "s"
+            lines.append(
+                f"{row.base} -> {row.quote}   {row.source:<8} {span:<23} "
+                f"{row.count} rate{plural}"
+            )
+        self.notify("\n".join(lines), title="Exchange rates", markup=False, timeout=8)
+
+    def _do_rates_fetch(self) -> None:
+        """Fetch ECB rates for every foreign currency on file, over its whole range —
+        the same derivation ``budget rates fetch`` uses (queries.default_rate_fetch_span),
+        so the two never drift.
+        """
+
+        def job(session: Session) -> str:
+            derived = queries.default_rate_fetch_span(session, queries.HOME_CURRENCY)
+            if derived is None:
+                return (
+                    "No transactions in the database to derive a date range from."
+                )
+            start, end, quotes = derived
+            if not quotes:
+                return f"Only one currency on file ({queries.HOME_CURRENCY}); nothing to fetch."
+            try:
+                written = rates.fetch_ecb_rates(
+                    session, start, end, queries.HOME_CURRENCY, quotes
+                )
+            except rates.FrankfurterError as error:
+                return f"Could not fetch ECB rates: {error}"
+            return (
+                f"Fetched {written} rate(s) for "
+                f"{queries.HOME_CURRENCY} -> {', '.join(quotes)}."
+            )
+
+        self.notify("Fetching exchange rates…")
+        self._run_rate_fetch(job)
 
     # ------------------------------------------------------------- drill-down
     def _drill_into_category(self, row: int) -> None:

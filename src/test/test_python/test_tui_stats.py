@@ -12,7 +12,13 @@ from budget_tracker import categories, queries, stats, vendors
 from budget_tracker.db import get_engine, get_sessionmaker, init_db
 from budget_tracker.importer import import_csv
 from budget_tracker.models import Account, Currency, Transaction
-from budget_tracker.tui import FOLD_INDICATOR, TRANSFER_MARK, BudgetApp, _fmt_amount
+from budget_tracker.tui import (
+    FOLD_INDICATOR,
+    TRANSFER_MARK,
+    UNCONVERTED_MARK,
+    BudgetApp,
+    _fmt_amount,
+)
 
 from conftest import (
     _panel_state,
@@ -62,6 +68,42 @@ def test_stats_status_line_fits_the_main_panel(tmp_path, monkeypatch):
     assert len(worst_case) <= width - 2
     # The transfer count only appears when there is one to report.
     assert TRANSFER_MARK in worst_case and TRANSFER_MARK not in real
+
+
+def test_stats_status_line_shows_unconverted_marker_and_still_fits(tmp_path, monkeypatch):
+    """Same shape as test_stats_status_line_fits_the_main_panel above, but stressing
+    unconverted_count instead of transfer_count -- a different reason money can be
+    missing (see UNCONVERTED_MARK), with a marker terse enough to fit the same budget.
+    Stacking both markers at once is not budgeted for, same as stacking filters isn't
+    (see test_drill_down_status_line_fits_the_main_panel).
+    """
+    _setup_recent(tmp_path, monkeypatch)
+    window = stats.parse("2024-01-01..2025-12-31")
+    big = stats.Report(
+        window=window,
+        categories=[],
+        count=99_999,
+        net_minor=0,
+        outflow_minor=-99_999_999,
+        inflow_minor=99_999_999,
+        transfer_count=0,
+        unconverted_count=999,
+    )
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command("stats 2y")
+            await pilot.pause()
+            width = app.query_one("#status", Static).size.width
+            real = app._stats_status()
+            app._report = big
+            return real, app._stats_status(), width
+
+    real, worst_case, width = asyncio.run(run())
+    assert len(real) <= width - 2
+    assert len(worst_case) <= width - 2
+    assert UNCONVERTED_MARK in worst_case and UNCONVERTED_MARK not in real
 
 
 def test_stats_with_a_preset_spec_skips_the_picker(tmp_path, monkeypatch):

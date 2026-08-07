@@ -11,8 +11,9 @@ from rich.console import Console
 from textual.widgets import DataTable, Input, Static
 
 from budget_tracker import stats, transfers
+from budget_tracker.db import get_engine, get_sessionmaker, init_db
 from budget_tracker.models import Account, Currency, Transaction
-from budget_tracker.tui import TRANSFER_MARK, BudgetApp
+from budget_tracker.tui import TRANSFER_MARK, UNCONVERTED_MARK, BudgetApp
 
 from conftest import CHART_WINDOW, HALF, _chart_headers, _chart_rows, _setup_chart
 
@@ -425,6 +426,83 @@ def test_chart_status_line_fits_the_main_panel(tmp_path, monkeypatch):
     status = asyncio.run(run())
     assert len(status) <= 92, f"{len(status)} columns: {status!r}"
     assert "income/month" in status and "Food" in status and "peak" in status
+
+
+def _seed_chart_with_an_unconvertible_currency(tmp_path, monkeypatch):
+    """A USD row and a CHF row inside CHART_WINDOW, with no CHF rate cached -- so the
+    chart's own totals have something genuinely unconverted to report."""
+    db_path = tmp_path / "chart_multi.db"
+    engine = get_engine(db_path)
+    init_db(engine)
+    session_factory = get_sessionmaker(engine)
+    with session_factory() as session:
+        usd = Currency(value="USD", symbol="$", decimal_places=2)
+        chf = Currency(value="CHF", symbol="CHF", decimal_places=2)
+        session.add_all([usd, chf])
+        session.flush()
+        checking = Account(name="Checking", currency_id=usd.id)
+        swiss = Account(name="Swiss", currency_id=chf.id)
+        session.add_all([checking, swiss])
+        session.flush()
+        session.add(
+            Transaction(
+                account_id=checking.id, currency_id=usd.id,
+                posted_date=datetime.date(2026, 2, 1), description="US",
+                raw_description="US", value_minor=-1000, import_hash="cm-us",
+            )
+        )
+        session.add(
+            Transaction(
+                account_id=swiss.id, currency_id=chf.id,
+                posted_date=datetime.date(2026, 2, 2), description="CH",
+                raw_description="CH", value_minor=-2000, import_hash="cm-ch",
+            )
+        )
+        session.commit()
+    monkeypatch.setenv("BUDGET_DB", str(db_path))
+    return session_factory
+
+
+def test_chart_status_line_shows_the_unconverted_count(tmp_path, monkeypatch):
+    """The CHF row has no cached rate, so it is missing from the bars -- and now says
+    so, the same way the transactions and statistics status lines do."""
+    _seed_chart_with_an_unconvertible_currency(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command(f"chart {CHART_WINDOW} month")
+            await pilot.pause()
+            return app._chart_status()
+
+    status = asyncio.run(run())
+    assert f"{UNCONVERTED_MARK} 1 " in status
+
+
+def test_chart_status_line_shows_unconverted_marker_and_still_fits(tmp_path, monkeypatch):
+    """Same 92-column budget as every other status line, stressing unconverted_count
+    instead of transfer_count -- a different reason money can be missing."""
+    _setup_chart(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command("chart 2020-01-01..2026-12-31 month income")
+            await pilot.pause()
+            width = app.query_one("#status", Static).size.width
+            food = next(c for c in app._categories if c.name == "Food")
+            app.category_filter = food.id
+            app.reload()
+            await pilot.pause()
+            real = app._chart_status()
+            app._chart_unconverted = 999
+            worst_case = app._chart_status()
+            return real, worst_case, width
+
+    real, worst_case, width = asyncio.run(run())
+    assert len(real) <= width - 2
+    assert len(worst_case) <= width - 2
+    assert UNCONVERTED_MARK in worst_case and UNCONVERTED_MARK not in real
 
 
 def test_chart_table_fits_the_main_panel(tmp_path, monkeypatch):

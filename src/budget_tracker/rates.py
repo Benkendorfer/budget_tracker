@@ -23,15 +23,16 @@ from __future__ import annotations
 
 import json
 import urllib.request
+from dataclasses import dataclass, field
 from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_EVEN, localcontext
-from typing import Callable, Dict, Iterable, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.error import URLError
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from .models import Currency, ExchangeRate
+from .models import Currency, ExchangeRate, Transaction
 
 MANUAL = "manual"
 OBSERVED = "observed"
@@ -343,3 +344,87 @@ def fetch_ecb_rates(
             record_rate(session, day, base, quote, Decimal(str(value)), ECB)
             written += 1
     return written
+
+
+# --------------------------------------------------------- fetching after an import
+
+def import_currency_span(
+    session: Session, import_id: int, home_currency: str
+) -> Optional[Tuple[date, date, List[str]]]:
+    """``(start, end, quotes)`` an import needs rates for, or ``None`` if it needs none.
+
+    Reads back the rows :func:`.importer.import_csv` (or ``import_wise_csv``) just
+    wrote for ``import_id``: every currency among them other than ``home_currency``,
+    and the min/max ``posted_date`` across *those* rows only -- not the whole import,
+    since a mixed-currency file's home-currency rows need no rate and should not widen
+    the span asked for. ``None`` when every row is already in ``home_currency``, so a
+    caller need not special-case "nothing foreign" itself.
+    """
+    rows = session.execute(
+        select(
+            Currency.value,
+            func.min(Transaction.posted_date),
+            func.max(Transaction.posted_date),
+        )
+        .select_from(Transaction)
+        .join(Currency, Currency.id == Transaction.currency_id)
+        .where(Transaction.import_id == import_id, Currency.value != home_currency)
+        .group_by(Currency.value)
+    ).all()
+    if not rows:
+        return None
+    quotes = sorted(row[0] for row in rows)
+    start = min(row[1] for row in rows)
+    end = max(row[2] for row in rows)
+    return start, end, quotes
+
+
+@dataclass(frozen=True)
+class ImportRatesOutcome:
+    """What came of trying to fetch rates for an import. Never raised -- see
+    :func:`fetch_rates_for_import`.
+    """
+
+    attempted: bool  # False when the import held no currency but home_currency
+    quotes: Tuple[str, ...] = field(default_factory=tuple)
+    written: int = 0
+    error: Optional[str] = None  # set on a FrankfurterError; `written` is 0 alongside it
+
+
+def fetch_rates_for_import(
+    session: Session,
+    import_id: int,
+    home_currency: str,
+    *,
+    today: Optional[date] = None,
+    fetch: Callable[[str], Dict[str, object]] = _default_fetch,
+) -> ImportRatesOutcome:
+    """Cache whatever ECB rates ``import_id`` needs against ``home_currency``, if any.
+
+    This is the whole "which currencies and what span does this import need, and
+    fetch just that" decision in one place, so ``importer.import_csv``'s callers --
+    the CLI directly, the TUI from a worker -- only ever have to call this one
+    function and render what it reports, never reimplement the question themselves.
+
+    Only asks for what :func:`import_currency_span` says is missing, and
+    :func:`fetch_ecb_rates` narrows that further to whatever span is not already
+    cached, so a file re-imported into an already-stocked database triggers no
+    request at all.
+
+    Never raises: a :class:`FrankfurterError` (offline, or the service unreachable)
+    comes back as ``.error`` instead, so a caller can report it without having to wrap
+    every call site in its own try/except -- an import must succeed even when the rate
+    service does not. Does not commit; the caller owns the transaction, same as every
+    other function here.
+    """
+    span = import_currency_span(session, import_id, home_currency)
+    if span is None:
+        return ImportRatesOutcome(attempted=False)
+    start, end, quotes = span
+    try:
+        written = fetch_ecb_rates(
+            session, start, end, home_currency, quotes, today=today, fetch=fetch
+        )
+    except FrankfurterError as error:
+        return ImportRatesOutcome(attempted=True, quotes=tuple(quotes), error=str(error))
+    return ImportRatesOutcome(attempted=True, quotes=tuple(quotes), written=written)

@@ -11,6 +11,7 @@ from typing import List, Optional
 
 from . import categories as categories_module
 from . import formats, queries
+from . import rates as rates_module
 from . import transfers as transfers_module
 from .db import get_engine, get_sessionmaker, init_db, resolve_db_path
 from .importer import import_csv, list_inbox, read_header_and_rows
@@ -144,6 +145,15 @@ def _cmd_import(args: argparse.Namespace) -> int:
                 account_name=args.account,
                 fmt=fmt,
             )
+            # A foreign-currency import with no rate on file yet would otherwise show
+            # every money figure as a silent zero (see queries.Totals.unconverted_count)
+            # until someone thinks to run `rates fetch` by hand. import_csv already
+            # committed its own rows above; this is a second, unrelated write, so it is
+            # committed on its own rather than folded into the same transaction.
+            rate_outcome = rates_module.fetch_rates_for_import(
+                session, result.import_id, queries.HOME_CURRENCY
+            )
+            session.commit()
     except (
         formats.AccountRequired,
         formats.UnknownFormat,
@@ -158,7 +168,23 @@ def _cmd_import(args: argparse.Namespace) -> int:
         f"({result.total_rows} rows total)."
     )
     print(f"Database: {resolve_db_path()}")
+    summary = _rate_fetch_summary(rate_outcome)
+    if summary:
+        print(summary)
     return 0
+
+
+def _rate_fetch_summary(outcome: rates_module.ImportRatesOutcome) -> str:
+    """One line describing what came of fetching rates for an import, or nothing to say."""
+    if not outcome.attempted:
+        return ""
+    quotes = ", ".join(outcome.quotes)
+    if outcome.error is not None:
+        return (
+            f"Could not fetch {queries.HOME_CURRENCY} -> {quotes} rates: {outcome.error} "
+            "Run 'budget rates fetch' later."
+        )
+    return f"Fetched {outcome.written} rate(s) for {queries.HOME_CURRENCY} -> {quotes}."
 
 
 def _cmd_imports(args: argparse.Namespace) -> int:
@@ -750,16 +776,13 @@ def _cmd_transfers(args: argparse.Namespace) -> int:
 def _cmd_rates(args: argparse.Namespace) -> int:
     """List cached exchange rates, fetch ECB references, or set a manual one.
 
-    ``rates.py`` and ``wise.py`` are finished modules this only wires up: the
-    aggregation for ``list`` is done here with a direct query rather than through
-    ``queries.py``, which this change does not touch.
+    The ``list`` aggregation and the ``fetch`` default range/currency derivation both
+    live in ``queries.py`` (:func:`queries.get_exchange_rates`,
+    :func:`queries.default_rate_fetch_span`) rather than here, so the TUI's own
+    ``rates`` command (see ``tui/app.py``'s ``_do_rates``) reads and derives exactly
+    the same things this does instead of a second, drifting copy.
     """
     from decimal import Decimal, InvalidOperation
-
-    from sqlalchemy import func, select
-
-    from . import rates as rates_module
-    from .models import ExchangeRate, Transaction
 
     engine = get_engine()
     init_db(engine)
@@ -782,16 +805,20 @@ def _cmd_rates(args: argparse.Namespace) -> int:
             return 0
 
         if command == "fetch":
-            start, end = args.start, args.end
-            if start is None or end is None:
-                first, last = session.execute(
-                    select(
-                        func.min(Transaction.posted_date),
-                        func.max(Transaction.posted_date),
-                    )
-                ).one()
-                start = start or first
-                end = end or last
+            # Base on the currency totals are actually reported in. rate_on can invert
+            # a cached pair but cannot chain one pair through another, so basing on
+            # anything else would leave the conversions that matter unreachable: with a
+            # USD home and a CHF base, EUR -> USD could not be resolved at all. Basing
+            # here means every X -> home lookup is either cached or a single inversion.
+            base = queries.HOME_CURRENCY
+            derived = queries.default_rate_fetch_span(session, base)
+            if args.start is not None and args.end is not None:
+                start, end = args.start, args.end
+            elif derived is not None:
+                start = args.start or derived[0]
+                end = args.end or derived[1]
+            else:
+                start = end = None
             if start is None or end is None:
                 print(
                     "No transactions in the database to derive a date range from; "
@@ -800,14 +827,16 @@ def _cmd_rates(args: argparse.Namespace) -> int:
                 return 1
             print(f"Range: {start.isoformat()}..{end.isoformat()}")
 
-            # Base on the currency totals are actually reported in. rate_on can invert
-            # a cached pair but cannot chain one pair through another, so basing on
-            # anything else would leave the conversions that matter unreachable: with a
-            # USD home and a CHF base, EUR -> USD could not be resolved at all. Basing
-            # here means every X -> home lookup is either cached or a single inversion.
-            currencies = sorted({row.currency for row in queries.get_accounts(session)})
-            base = queries.HOME_CURRENCY
-            quotes = [c for c in currencies if c != base]
+            if derived is not None:
+                quotes = derived[2]
+            else:
+                # Explicit --start/--end with no transactions on file at all: quotes
+                # come from the accounts alone, same as default_rate_fetch_span would
+                # derive if it had a date range to anchor on.
+                quotes = [
+                    c for c in sorted({row.currency for row in queries.get_accounts(session)})
+                    if c != base
+                ]
             if not quotes:
                 print(f"Only one currency on file ({base or 'none'}); nothing to fetch.")
                 return 0
@@ -821,26 +850,18 @@ def _cmd_rates(args: argparse.Namespace) -> int:
             print(f"Wrote {written} rate(s) for {base} -> {', '.join(quotes)}.")
             return 0
 
-        rows = session.execute(
-            select(
-                ExchangeRate.base,
-                ExchangeRate.quote,
-                ExchangeRate.source,
-                func.min(ExchangeRate.day),
-                func.max(ExchangeRate.day),
-                func.count(),
-            )
-            .group_by(ExchangeRate.base, ExchangeRate.quote, ExchangeRate.source)
-            .order_by(ExchangeRate.base, ExchangeRate.quote, ExchangeRate.source)
-        ).all()  # "list"
+        rows = queries.get_exchange_rates(session)  # "list"
 
     if not rows:
         print("No exchange rates cached yet. Run 'budget rates fetch' or 'budget rates set'.")
         return 0
-    for base, quote, source, first, last, count in rows:
-        span = first.isoformat() if first == last else f"{first.isoformat()}..{last.isoformat()}"
-        plural = "" if count == 1 else "s"
-        print(f"  {base} -> {quote}   {source:<8} {span:<23} {count} rate{plural}")
+    for row in rows:
+        span = (
+            row.first_day if row.first_day == row.last_day
+            else f"{row.first_day}..{row.last_day}"
+        )
+        plural = "" if row.count == 1 else "s"
+        print(f"  {row.base} -> {row.quote}   {row.source:<8} {span:<23} {row.count} rate{plural}")
     return 0
 
 

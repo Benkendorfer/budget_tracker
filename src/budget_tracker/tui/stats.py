@@ -12,7 +12,14 @@ from rich.text import Text
 from textual.widgets import DataTable
 
 from .. import stats
-from .formatting import FOLD_INDICATOR, TRANSFER_MARK, _amount_cell, _fmt_amount, _truncate
+from .formatting import (
+    FOLD_INDICATOR,
+    TRANSFER_MARK,
+    UNCONVERTED_MARK,
+    _amount_cell,
+    _fmt_amount,
+    _truncate,
+)
 
 
 def _foldable_category_ids(cats: List[stats.CategoryStat]) -> Set[int]:
@@ -179,10 +186,20 @@ def stats_status(report: stats.Report) -> str:
     # The money figures leave transfers out, so say how many vanished — silently
     # dropping a payment between your own accounts reads as missing spending.
     excluded = f"{TRANSFER_MARK} {report.transfer_count} " if report.transfer_count else ""
+    # Same idea, a different reason: these rows are missing because no exchange rate
+    # was on file for their day, not because they were excluded on purpose. This line
+    # has no slack left to spend on the word "unconverted" (see the module docstring
+    # note above and test_stats_status_line_fits_the_main_panel), so it is as terse as
+    # the transfer marker it sits beside -- and, like that marker, stacking both at once
+    # is not budgeted for.
+    unconverted = (
+        f"{UNCONVERTED_MARK} {report.unconverted_count} " if report.unconverted_count else ""
+    )
     return (
         f"{label} {window.start}→{window.end} "
         f"{report.count} txns "
         f"{excluded}"
+        f"{unconverted}"
         f"out {_fmt_amount(report.outflow_minor)} "
         f"in {_fmt_amount(report.inflow_minor)} "
         f"/mo {_fmt_amount(report.avg_month_outflow_minor)}"

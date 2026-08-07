@@ -5,13 +5,15 @@ past imports, unimport), the setup walkthrough, and the `format` command.
 from __future__ import annotations
 
 import asyncio
+import datetime
+from decimal import Decimal
 
 from textual.widgets import DataTable, Input, Static
 
-from budget_tracker import formats, queries
+from budget_tracker import formats, queries, rates
 from budget_tracker.db import get_engine, get_sessionmaker, init_db
 from budget_tracker.importer import import_csv, read_header_and_rows
-from budget_tracker.models import Account, Transaction
+from budget_tracker.models import Account, Currency, Transaction
 from budget_tracker.tui import BudgetApp
 from helpers import learn_format
 
@@ -784,3 +786,160 @@ def test_a_currency_mismatch_is_reported_rather_than_crashing_the_app(tmp_path, 
     messages, panel = asyncio.run(run())
     assert any("USD" in m and "CHF" in m for m in messages), messages
     assert panel in ("imports", "txns")  # still usable, not dead
+
+
+# ------------------------------------------------ fetching rates after an import
+
+def _empty_db(tmp_path, monkeypatch):
+    """A fresh database with no format or account yet -- for a foreign-currency import
+    that must not collide with any account _setup's USD fixture would have created."""
+    db_path = tmp_path / "empty.db"
+    engine = get_engine(db_path)
+    init_db(engine)
+    session_factory = get_sessionmaker(engine)
+    monkeypatch.setenv("BUDGET_DB", str(db_path))
+    return session_factory
+
+
+def _seed_home_currency_account(session_factory):
+    """One USD account with a single transaction, named apart from anything a CSV
+    import in this file would create -- so queries.HOME_CURRENCY has a real Currency
+    row to convert into (get_totals' conversion path needs one) without colliding with
+    the foreign-currency import's own "Card 8207" account.
+    """
+    with session_factory() as session:
+        usd = Currency(value="USD", symbol="$", decimal_places=2)
+        session.add(usd)
+        session.flush()
+        checking = Account(name="Existing Checking", currency_id=usd.id)
+        session.add(checking)
+        session.flush()
+        session.add(
+            Transaction(
+                account_id=checking.id,
+                currency_id=usd.id,
+                posted_date=datetime.date(2025, 1, 1),
+                description="Opening",
+                raw_description="Opening",
+                value_minor=100,
+                import_hash="seed-usd",
+            )
+        )
+        session.commit()
+
+
+def test_import_command_fetches_rates_for_a_foreign_currency_file(tmp_path, monkeypatch):
+    """The bug this fixes: a CHF import into a database with no CHF rates used to leave
+    every money figure a silent zero (see UNCONVERTED_MARK / the transactions status
+    line). The app fetches what it needs in a background worker -- so this never blocks
+    the event loop -- and the panel reflects it once the worker lands.
+    """
+    session_factory = _empty_db(tmp_path, monkeypatch)
+    # A pre-existing USD account, distinctly named from the CHF import's own "Card
+    # 8207" -- get_totals' conversion path needs a real Currency row for
+    # queries.HOME_CURRENCY to convert into.
+    _seed_home_currency_account(session_factory)
+    csv_path = tmp_path / "swiss.csv"
+    csv_path.write_text(CSV, encoding="utf-8")
+    with session_factory() as session:
+        spec = learn_format(session, csv_path, name="swiss")
+        formats.save_format(
+            session, formats.FormatSpec(**{**formats.to_dict(spec), "currency": "CHF"})
+        )
+        session.commit()
+
+    calls = []
+
+    def stub(session, start, end, base, quotes, **kwargs):
+        calls.append((base, tuple(quotes)))
+        written = 0
+        for quote in quotes:
+            rates.record_rate(session, start, base, quote, Decimal("0.9"), rates.ECB)
+            written += 1
+        return written
+
+    monkeypatch.setattr(rates, "fetch_ecb_rates", stub)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._run_command(f"import {csv_path}")
+            await pilot.pause()
+            # A fast, stubbed fetch can land within this first pause -- there is no
+            # reliable way to observe "before the worker lands" from the outside, so
+            # this only asserts the state once it has (see wait_for_complete below).
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            status = str(app.query_one("#status", Static).content)
+            return status, [n.message for n in app._notifications]
+
+    status, messages = asyncio.run(run())
+    assert calls == [(queries.HOME_CURRENCY, ("CHF",))]
+    # One quote, one day in range -- the stub writes exactly one rate.
+    assert any("Fetched 1 rate(s)" in m and "CHF" in m for m in messages)
+    # The CHF rows now convert: no unconverted marker.
+    assert "unconverted" not in status
+
+
+def test_import_command_does_not_fetch_rates_with_no_foreign_currency(tmp_path, monkeypatch):
+    """Only when a foreign currency is actually present -- an ordinary USD import asks
+    fetch_ecb_rates for nothing at all."""
+    session_factory = _empty_db(tmp_path, monkeypatch)
+    csv_path = tmp_path / "in.csv"
+    csv_path.write_text(CSV, encoding="utf-8")
+    with session_factory() as session:
+        learn_format(session, csv_path)
+        session.commit()
+
+    calls = []
+    monkeypatch.setattr(rates, "fetch_ecb_rates", lambda *a, **kw: calls.append(1) or 0)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._run_command(f"import {csv_path}")
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            return [n.message for n in app._notifications]
+
+    messages = asyncio.run(run())
+    assert calls == []
+    assert not any("Fetched" in m for m in messages)
+
+
+def test_import_command_reports_a_rate_fetch_failure_without_failing_the_import(
+    tmp_path, monkeypatch
+):
+    """Offline must mean 'imported N; could not reach the rate service', never a failed
+    import -- the import itself has already committed by the time the fetch runs."""
+    session_factory = _empty_db(tmp_path, monkeypatch)
+    _seed_home_currency_account(session_factory)
+    csv_path = tmp_path / "swiss.csv"
+    csv_path.write_text(CSV, encoding="utf-8")
+    with session_factory() as session:
+        spec = learn_format(session, csv_path, name="swiss")
+        formats.save_format(
+            session, formats.FormatSpec(**{**formats.to_dict(spec), "currency": "CHF"})
+        )
+        session.commit()
+
+    def failing(session, start, end, base, quotes, **kwargs):
+        raise rates.FrankfurterError("Could not reach Frankfurter at ...")
+
+    monkeypatch.setattr(rates, "fetch_ecb_rates", failing)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._run_command(f"import {csv_path}")
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            return [n.message for n in app._notifications], len(app._txns)
+
+    messages, txn_count = asyncio.run(run())
+    # The seeded USD row plus the CHF file's 3 -- the import itself still succeeded.
+    assert txn_count == 4
+    assert any("Could not fetch" in m and "Could not reach Frankfurter" in m for m in messages)
+    assert any("rates fetch" in m for m in messages)

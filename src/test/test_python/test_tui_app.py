@@ -11,13 +11,14 @@ from __future__ import annotations
 import asyncio
 import datetime
 import io
+from decimal import Decimal
 
 import pytest
 from rich.console import Console
 from sqlalchemy import text as sql_text
 from textual.widgets import DataTable, Input, ListView, Static
 
-from budget_tracker import categories, queries, stats, transfers, vendors
+from budget_tracker import categories, queries, rates, stats, transfers, vendors
 from budget_tracker.db import DuplicateCategoryNamesError, get_engine, get_sessionmaker, init_db
 from budget_tracker.models import Account, Currency, Transaction
 from budget_tracker.tui import BudgetApp
@@ -885,6 +886,151 @@ def test_duplicate_category_names_block_startup_with_a_pointer_to_merge(
     message = str(exc_info.value)
     assert "Airfare" in message
     assert "category merge" in message
+
+
+# --------------------------------------------------------------------------- rates
+
+def _setup_multi_currency_for_rates(tmp_path, monkeypatch):
+    """A USD and a CHF account, one transaction each, with no rate cached -- so `rates
+    fetch` has something real to do and the transactions status line has something
+    genuinely unconverted to report before it runs."""
+    db_path = tmp_path / "rates_multi.db"
+    engine = get_engine(db_path)
+    init_db(engine)
+    session_factory = get_sessionmaker(engine)
+    with session_factory() as session:
+        usd = Currency(value="USD", symbol="$", decimal_places=2)
+        chf = Currency(value="CHF", symbol="CHF", decimal_places=2)
+        session.add_all([usd, chf])
+        session.flush()
+        checking = Account(name="Checking", currency_id=usd.id)
+        swiss = Account(name="Swiss", currency_id=chf.id)
+        session.add_all([checking, swiss])
+        session.flush()
+        session.add(
+            Transaction(
+                account_id=checking.id, currency_id=usd.id,
+                posted_date=datetime.date(2025, 6, 1), description="US",
+                raw_description="US", value_minor=-1000, import_hash="rm-us",
+            )
+        )
+        session.add(
+            Transaction(
+                account_id=swiss.id, currency_id=chf.id,
+                posted_date=datetime.date(2025, 6, 2), description="CH",
+                raw_description="CH", value_minor=-2000, import_hash="rm-ch",
+            )
+        )
+        session.commit()
+    monkeypatch.setenv("BUDGET_DB", str(db_path))
+    return session_factory
+
+
+def test_rates_command_with_nothing_cached_says_so(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._run_command("rates")
+            await pilot.pause()
+            return [n.message for n in app._notifications]
+
+    messages = asyncio.run(run())
+    assert any("No exchange rates cached yet" in m for m in messages)
+
+
+def test_rates_command_lists_what_is_cached(tmp_path, monkeypatch):
+    """Reuses queries.get_exchange_rates -- the same aggregation 'budget rates' prints
+    -- so the two never drift."""
+    session_factory = _setup(tmp_path, monkeypatch)
+    with session_factory() as session:
+        rates.record_rate(
+            session, datetime.date(2025, 7, 1), "USD", "CHF", Decimal("0.88"), rates.ECB
+        )
+        rates.record_rate(
+            session, datetime.date(2025, 7, 5), "USD", "CHF", Decimal("0.89"), rates.ECB
+        )
+        session.commit()
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._run_command("rates")
+            await pilot.pause()
+            return [n.message for n in app._notifications]
+
+    messages = asyncio.run(run())
+    assert any(
+        "USD -> CHF" in m and "2025-07-01..2025-07-05" in m and "2 rates" in m
+        for m in messages
+    )
+
+
+def test_rates_fetch_command_writes_what_the_stub_returns_and_refreshes(
+    tmp_path, monkeypatch
+):
+    """Runs in a worker (never blocks the event loop) and reloads once it lands, so a
+    figure the fetch just fixed shows up without a separate 'refresh'."""
+    session_factory = _setup_multi_currency_for_rates(tmp_path, monkeypatch)
+
+    def stub(session, start, end, base, quotes, **kwargs):
+        written = 0
+        for quote in quotes:
+            rates.record_rate(session, start, base, quote, Decimal("0.9"), rates.ECB)
+            written += 1
+        return written
+
+    monkeypatch.setattr(rates, "fetch_ecb_rates", stub)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            before = str(app.query_one("#status", Static).content)
+            app._run_command("rates fetch")
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            after = str(app.query_one("#status", Static).content)
+            return before, after, [n.message for n in app._notifications]
+
+    before, after, messages = asyncio.run(run())
+    assert "unconverted" in before
+    assert "unconverted" not in after
+    assert any("Fetched 1 rate(s) for USD -> CHF" in m for m in messages)
+
+
+def test_rates_fetch_command_with_only_one_currency_reports_nothing_to_fetch(
+    tmp_path, monkeypatch
+):
+    _setup(tmp_path, monkeypatch)  # single-currency fixture
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._run_command("rates fetch")
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            return [n.message for n in app._notifications]
+
+    messages = asyncio.run(run())
+    assert any("nothing to fetch" in m for m in messages)
+
+
+def test_rates_unknown_subcommand_warns(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._run_command("rates bogus")
+            await pilot.pause()
+            return [(n.message, n.severity) for n in app._notifications]
+
+    messages = asyncio.run(run())
+    assert any("Usage: rates" in m and severity == "warning" for m, severity in messages)
 
 
 # ------------------------------------------------------------------------- unimport

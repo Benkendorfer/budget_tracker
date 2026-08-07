@@ -24,6 +24,7 @@ from .models import (
     Category,
     CategoryRule,
     Currency,
+    ExchangeRate,
     Import,
     Transaction,
     Vendor,
@@ -979,3 +980,65 @@ def resolve_vendor_filter(session: Session, name: str) -> Optional[VendorFilter]
     if vendor is not None:
         return ("raw", vendor)
     return None
+
+
+# ---------------------------------------------------------------- exchange rates
+# Shared between the CLI's `rates` command and the TUI's, so the two never drift --
+# see cli._cmd_rates and tui/app.py's _do_rates.
+
+@dataclass
+class ExchangeRateRow:
+    """One cached (base, quote, source) triple, spanning every day recorded for it."""
+
+    base: str
+    quote: str
+    source: str
+    first_day: str  # isoformat
+    last_day: str  # isoformat
+    count: int
+
+
+def get_exchange_rates(session: Session) -> List[ExchangeRateRow]:
+    """Every cached rate, grouped by pair and source -- what a `rates` list shows."""
+    rows = session.execute(
+        select(
+            ExchangeRate.base,
+            ExchangeRate.quote,
+            ExchangeRate.source,
+            func.min(ExchangeRate.day),
+            func.max(ExchangeRate.day),
+            func.count(),
+        )
+        .group_by(ExchangeRate.base, ExchangeRate.quote, ExchangeRate.source)
+        .order_by(ExchangeRate.base, ExchangeRate.quote, ExchangeRate.source)
+    ).all()
+    return [
+        ExchangeRateRow(
+            base=r[0], quote=r[1], source=r[2],
+            first_day=r[3].isoformat(), last_day=r[4].isoformat(), count=r[5],
+        )
+        for r in rows
+    ]
+
+
+def default_rate_fetch_span(
+    session: Session, home_currency: str = HOME_CURRENCY
+) -> Optional[Tuple[date, date, List[str]]]:
+    """``(start, end, quotes)`` covering every transaction on file -- what ``rates
+    fetch`` with no explicit range or currencies should ask for.
+
+    ``quotes`` may come back empty -- every account already in ``home_currency`` is a
+    normal state ("nothing to fetch"), not an error, so the caller decides what to say
+    about it. ``None`` is reserved for the one case that really has no answer: no
+    transactions on file to derive a date range from at all. Currencies are read from
+    account rows (``get_accounts``), not every ``Currency`` the database happens to
+    know about, so a code with no account never turns into a wasted request.
+    """
+    first, last = session.execute(
+        select(func.min(Transaction.posted_date), func.max(Transaction.posted_date))
+    ).one()
+    if first is None or last is None:
+        return None
+    currencies = sorted({row.currency for row in get_accounts(session)})
+    quotes = [c for c in currencies if c != home_currency]
+    return first, last, quotes

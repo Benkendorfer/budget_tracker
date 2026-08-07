@@ -9,7 +9,7 @@ from rich.text import Text
 from textual.widgets import Static
 
 from .. import charts, stats
-from .formatting import PIE_COLORS, TRANSFER_MARK, _fmt_amount, _truncate
+from .formatting import PIE_COLORS, TRANSFER_MARK, UNCONVERTED_MARK, _fmt_amount, _truncate
 
 
 def build_pie(report: Optional[stats.Report]) -> Optional[charts.Pie]:
@@ -65,9 +65,15 @@ def pie_status(report: stats.Report, pie: Optional[charts.Pie]) -> str:
     label = "custom" if window.key == "custom" else window.label
     count = len(pie.slices) if pie is not None else 0
     excluded = f"{TRANSFER_MARK} {report.transfer_count} " if report.transfer_count else ""
+    # As terse as the transfer marker beside it, for the same reason (see
+    # stats_panel.stats_status): no room on this line for the word "unconverted".
+    unconverted = (
+        f"{UNCONVERTED_MARK} {report.unconverted_count} " if report.unconverted_count else ""
+    )
     return (
         f"{label} {window.start}→{window.end} "
         f"{count} categor{'y' if count == 1 else 'ies'} "
         f"{excluded}"
+        f"{unconverted}"
         f"net spend {_fmt_amount(-report.net_spend_minor)}"
     )

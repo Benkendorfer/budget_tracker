@@ -569,7 +569,7 @@ def test_rates_fetch_reports_a_frankfurter_failure_without_a_traceback(
     """Never a traceback, and never a silent success that wrote nothing."""
     _seed_multi_currency_accounts(tmp_path, monkeypatch)
 
-    def failing(session, start, end, base, quotes):
+    def failing(session, start, end, base, quotes, **kwargs):
         raise rates_module.FrankfurterError("Could not reach Frankfurter at ...")
 
     monkeypatch.setattr("budget_tracker.rates.fetch_ecb_rates", failing)
@@ -717,6 +717,88 @@ def test_import_command_currency_flag_still_overrides_the_format(
     assert cli.main(["import", str(csv_path), "--currency", "EUR"]) == 0
     with session_factory() as session:
         assert {a.currency for a in queries.get_accounts(session)} == {"EUR"}
+
+
+def test_import_command_fetches_rates_for_a_foreign_currency_import(
+    tmp_path, monkeypatch, capsys
+):
+    """The bug this fixes: a CHF import into a database with no CHF rates used to leave
+    every money figure a silent zero until someone thought to run 'rates fetch' by
+    hand. An import now fetches what it needs on its own."""
+    session_factory = _empty_db(tmp_path, monkeypatch)
+    csv_path = tmp_path / "swiss.csv"
+    csv_path.write_text(CSV, encoding="utf-8")
+    with session_factory() as session:
+        spec = learn_format(session, csv_path, name="swiss")
+        formats.save_format(
+            session, formats.FormatSpec(**{**formats.to_dict(spec), "currency": "CHF"})
+        )
+        session.commit()
+
+    calls = []
+
+    def stub(session, start, end, base, quotes, **kwargs):
+        calls.append((base, tuple(quotes)))
+        return 3
+
+    monkeypatch.setattr(rates_module, "fetch_ecb_rates", stub)
+
+    assert cli.main(["import", str(csv_path)]) == 0
+    out = capsys.readouterr().out
+    assert calls == [(queries.HOME_CURRENCY, ("CHF",))]
+    assert f"Fetched 3 rate(s) for {queries.HOME_CURRENCY} -> CHF." in out
+
+
+def test_import_command_does_not_fetch_rates_for_a_home_currency_import(
+    tmp_path, monkeypatch, capsys
+):
+    """Only when a foreign currency is actually present -- a plain USD import asks
+    fetch_ecb_rates for nothing at all."""
+    session_factory = _empty_db(tmp_path, monkeypatch)
+    csv_path = tmp_path / "in.csv"
+    csv_path.write_text(CSV, encoding="utf-8")
+    with session_factory() as session:
+        learn_format(session, csv_path)
+        session.commit()
+
+    calls = []
+    monkeypatch.setattr(
+        rates_module, "fetch_ecb_rates", lambda *a, **kw: calls.append(1) or 0
+    )
+
+    assert cli.main(["import", str(csv_path)]) == 0
+    out = capsys.readouterr().out
+    assert calls == []
+    assert "Fetched" not in out
+
+
+def test_import_command_reports_a_rate_fetch_failure_without_failing_the_import(
+    tmp_path, monkeypatch, capsys
+):
+    """Offline must mean 'imported N; could not reach the rate service', never a failed
+    or rolled-back import."""
+    session_factory = _empty_db(tmp_path, monkeypatch)
+    csv_path = tmp_path / "swiss.csv"
+    csv_path.write_text(CSV, encoding="utf-8")
+    with session_factory() as session:
+        spec = learn_format(session, csv_path, name="swiss")
+        formats.save_format(
+            session, formats.FormatSpec(**{**formats.to_dict(spec), "currency": "CHF"})
+        )
+        session.commit()
+
+    def failing(session, start, end, base, quotes, **kwargs):
+        raise rates_module.FrankfurterError("Could not reach Frankfurter at ...")
+
+    monkeypatch.setattr(rates_module, "fetch_ecb_rates", failing)
+
+    assert cli.main(["import", str(csv_path)]) == 0  # the import itself still succeeds
+    out = capsys.readouterr().out
+    assert "3 added" in out
+    assert "Could not fetch" in out and "Could not reach Frankfurter" in out
+    assert "rates fetch" in out
+    with session_factory() as session:
+        assert {a.currency for a in queries.get_accounts(session)} == {"CHF"}
 
 
 def test_import_command_reports_a_currency_mismatch(tmp_path, monkeypatch, capsys):

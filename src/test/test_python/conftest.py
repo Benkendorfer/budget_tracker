@@ -18,6 +18,35 @@ from budget_tracker.db import get_engine, get_sessionmaker, init_db
 from budget_tracker.importer import import_csv
 from budget_tracker.models import Account, Currency, Transaction
 from budget_tracker.tui import BudgetApp
+
+
+@pytest.fixture(autouse=True)
+def _no_network(monkeypatch):
+    """Stop any test reaching the network, whether or not it meant to.
+
+    Importing a statement in a foreign currency now fetches exchange rates, so four
+    tests that merely imported a CHF or EUR file began calling api.frankfurter.dev for
+    real -- eight requests between them, counting the retry. They still passed, because
+    a failed fetch deliberately never fails an import, which is exactly what made it
+    invisible: the suite quietly depended on the network and nobody would have noticed
+    until it ran on a plane or in a sandbox, where each of those tests waits out two
+    forty-second timeouts instead.
+
+    Refusing at ``urlopen`` rather than per test means a test cannot acquire the
+    dependency by accident later. The error is an OSError because that is what an
+    unreachable host raises, so code paths that already handle being offline are
+    exercised honestly rather than seeing an exception no real network produces.
+    Anything that wants to test fetching stubs ``fetch_ecb_rates`` or its ``fetch``
+    argument, well above this line.
+    """
+
+    def refuse(*args, **kwargs):
+        raise OSError(
+            "network access is disabled in tests; stub fetch_ecb_rates or its "
+            "fetch argument instead of reaching a real host"
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", refuse)
 from helpers import learn_format
 
 
@@ -291,3 +320,11 @@ def _chart_rows(app):
 def _chart_headers(app):
     table = app.query_one("#chart", DataTable)
     return [str(column.label) for column in table.columns.values()]
+
+
+def test_the_network_guard_is_active():
+    """A guard nobody checks is a guard that quietly stops working."""
+    import urllib.request
+
+    with pytest.raises(OSError, match="network access is disabled"):
+        urllib.request.urlopen("https://example.invalid")

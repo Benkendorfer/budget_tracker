@@ -9,9 +9,12 @@ import io
 from rich.console import Console
 from textual.widgets import Static
 
+from dataclasses import replace
+
 from budget_tracker import categories, charts, stats
+from budget_tracker.db import get_engine, get_sessionmaker, init_db
 from budget_tracker.models import Account, Currency, Transaction
-from budget_tracker.tui import BudgetApp
+from budget_tracker.tui import UNCONVERTED_MARK, BudgetApp
 
 from conftest import (
     CHART_WINDOW,
@@ -126,6 +129,79 @@ def test_pie_status_line_fits_the_main_panel(tmp_path, monkeypatch):
     status = asyncio.run(run())
     assert len(status) <= 92, f"{len(status)} columns: {status!r}"
     assert "category" in status and "net spend" in status
+
+
+def _seed_pie_with_an_unconvertible_currency(tmp_path, monkeypatch):
+    """A USD row and a CHF row in the same window, with no CHF rate cached -- so the
+    pie's own report has something genuinely unconverted to report."""
+    db_path = tmp_path / "pie_multi.db"
+    engine = get_engine(db_path)
+    init_db(engine)
+    session_factory = get_sessionmaker(engine)
+    with session_factory() as session:
+        usd = Currency(value="USD", symbol="$", decimal_places=2)
+        chf = Currency(value="CHF", symbol="CHF", decimal_places=2)
+        session.add_all([usd, chf])
+        session.flush()
+        checking = Account(name="Checking", currency_id=usd.id)
+        swiss = Account(name="Swiss", currency_id=chf.id)
+        session.add_all([checking, swiss])
+        session.flush()
+        session.add(
+            Transaction(
+                account_id=checking.id, currency_id=usd.id,
+                posted_date=datetime.date(2025, 6, 1), description="US",
+                raw_description="US", value_minor=-1000, import_hash="pm-us",
+            )
+        )
+        session.add(
+            Transaction(
+                account_id=swiss.id, currency_id=chf.id,
+                posted_date=datetime.date(2025, 6, 2), description="CH",
+                raw_description="CH", value_minor=-2000, import_hash="pm-ch",
+            )
+        )
+        session.commit()
+    monkeypatch.setenv("BUDGET_DB", str(db_path))
+    return session_factory
+
+
+def test_pie_status_line_shows_the_unconverted_count(tmp_path, monkeypatch):
+    """The CHF row has no cached rate, so it is missing from the wedges -- and now says
+    so, the same way the other three status lines do."""
+    _seed_pie_with_an_unconvertible_currency(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command("pie 2025-06-01..2025-06-30")
+            await pilot.pause()
+            return app._pie_status()
+
+    status = asyncio.run(run())
+    assert f"{UNCONVERTED_MARK} 1 " in status
+
+
+def test_pie_status_line_shows_unconverted_marker_and_still_fits(tmp_path, monkeypatch):
+    """Same 92-column budget as every other status line, stressing unconverted_count
+    instead of transfer_count -- a different reason money can be missing."""
+    _seed_category_hierarchy(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command("pie 2025-01-01..2025-12-31")
+            await pilot.pause()
+            width = app.query_one("#status", Static).size.width
+            real = app._pie_status()
+            app._report = replace(app._report, transfer_count=0, unconverted_count=999)
+            worst_case = app._pie_status()
+            return real, worst_case, width
+
+    real, worst_case, width = asyncio.run(run())
+    assert len(real) <= width - 2
+    assert len(worst_case) <= width - 2
+    assert UNCONVERTED_MARK in worst_case and UNCONVERTED_MARK not in real
 
 
 def test_pie_panel_looks_like_a_circle_and_fits_the_main_panel(tmp_path, monkeypatch):

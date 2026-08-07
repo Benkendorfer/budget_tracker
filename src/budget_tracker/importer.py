@@ -56,6 +56,9 @@ class ImportResult:
     total_rows: int
     inserted: int
     skipped_duplicates: int
+    # Which Import row this was, so a caller can ask rates.fetch_rates_for_import what
+    # currencies (if any) it needs rates for, without a second query of its own.
+    import_id: int = 0
 
 
 # Shown in the import panel's Status column for a transfer-log export. Not a row in
@@ -687,6 +690,7 @@ def import_csv(
         total_rows=len(rows),
         inserted=inserted,
         skipped_duplicates=skipped,
+        import_id=import_record.id,
     )
 
 
@@ -911,4 +915,5 @@ def import_wise_csv(
         total_rows=len(rows),
         inserted=inserted,
         skipped_duplicates=skipped,
+        import_id=import_record.id,
     )

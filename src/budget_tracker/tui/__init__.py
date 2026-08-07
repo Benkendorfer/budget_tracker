@@ -12,6 +12,13 @@ and ``TRANSFER_MARK`` from here.
 from __future__ import annotations
 
 from .app import BudgetApp, run
-from .formatting import FOLD_INDICATOR, TRANSFER_MARK, _fmt_amount
+from .formatting import FOLD_INDICATOR, TRANSFER_MARK, UNCONVERTED_MARK, _fmt_amount
 
-__all__ = ["BudgetApp", "run", "FOLD_INDICATOR", "TRANSFER_MARK", "_fmt_amount"]
+__all__ = [
+    "BudgetApp",
+    "run",
+    "FOLD_INDICATOR",
+    "TRANSFER_MARK",
+    "UNCONVERTED_MARK",
+    "_fmt_amount",
+]

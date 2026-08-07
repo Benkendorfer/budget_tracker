@@ -93,6 +93,8 @@ the bottom:
 | `pie <window>` | Skip the picker: `pie 6m`, `pie 1 year`, `pie 2025-01-01..2025-06-30` |
 | `transfers` | Pair up movements between your own accounts (`transfers reset` undoes it) |
 | `transfers same-account` | Also pair legs within the same account (see below); off by default |
+| `rates` | List cached exchange rates: pair, source, date span, count (see below) |
+| `rates fetch` | Cache ECB reference rates for every foreign currency on file, over its whole date range; runs in the background so the app stays responsive (an import does this on its own already — see below) |
 | `rules` | Open the rules panel — both kinds of rule (`rule` on its own does the same); `escape` returns |
 | `all` | Clear all filters |
 | `refresh` | Reload from the database |
@@ -125,6 +127,8 @@ budget import ~/Downloads/statement.csv
 budget import --currency EUR ~/Downloads/statement_eur.csv
 # Exports that do not name their account (see "Importing data") need --account.
 budget import --account "Checking" ~/Downloads/checking.csv
+# A foreign-currency import fetches whatever rates it needs on its own -- see
+# "Currencies and exchange rates" below -- so nothing extra to run here.
 
 # List past imports (id, source file, transaction count), and undo one.
 budget imports
@@ -566,12 +570,30 @@ budget rates fetch      # works out the date range and currency pairs from your 
 budget rates list       # pair, source, date span, count
 ```
 
+The app has the same two commands: `rates` lists what is cached, and `rates fetch` covers
+every foreign currency on file. Both are worked the same way underneath, so the two never
+disagree about what is cached or what a fetch would cover.
+
 Fetching needs no API key. Only the pair actually stored is needed: the reverse is derived
 by inversion, so caching `USD → CHF` also answers `CHF → USD`.
 
+**Importing a foreign currency fetches its rates on its own.** After a successful import,
+if any of its rows are in a currency other than your reporting currency and there is no
+cached rate for their dates, the app fetches what is missing straight away — in the
+background, so it never freezes the interface, and it tells you what it found (or why it
+didn't) once the fetch lands. Offline, or the rate service unreachable, means "imported N;
+run `rates fetch` later," never a failed import — the transactions themselves are already
+safely written before the fetch is even attempted. The CLI does the same on `budget
+import`, just synchronously (a one-shot command has nothing to stay responsive for).
+
 **A missing rate is never guessed.** It is not treated as 1.0 and not averaged from
 neighbours; the amount is reported as unconverted instead, the same way transfers excluded
-from a total are counted rather than silently dropped.
+from a total are counted rather than silently dropped. Every status line that shows money —
+transactions, statistics, the chart, the pie — says so when it happens: `(N unconverted,
+rates fetch)` on the transactions line, and a terser `⚠ N` where the line has no room to
+spell it out. It is a different marker from `⇄ N` (transfers excluded on purpose) on
+purpose too: one means money was left out by design, the other means it is missing only
+until a rate is on file.
 
 ### Transfers between your own accounts
 

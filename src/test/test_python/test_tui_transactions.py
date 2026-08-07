@@ -8,9 +8,9 @@ import datetime
 import io
 
 from rich.console import Console
-from textual.widgets import DataTable
+from textual.widgets import DataTable, Static
 
-from budget_tracker import transfers
+from budget_tracker import queries, transfers
 from budget_tracker.db import get_engine, get_sessionmaker, init_db
 from budget_tracker.importer import import_csv
 from budget_tracker.models import Account, Currency, Transaction
@@ -215,3 +215,65 @@ def test_txns_amount_column_fits_a_symbol_and_a_six_figure_amount(tmp_path, monk
 
     rendered = asyncio.run(run())
     assert "CHF-999,999.99" in rendered
+
+
+# --------------------------------------------------------------- unconverted amounts
+
+def test_status_line_shows_the_unconverted_count_and_a_hint(tmp_path, monkeypatch):
+    """The bug this fixes: a window with no exchange rate for one of its currencies
+    used to read as "you spent nothing" (every money figure zeroed) with nothing on
+    screen saying why. JPY and CHF have no cached rate here, so both are missing from
+    the totals -- and now say so."""
+    _seed_multi_currency(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            await pilot.pause()
+            return str(app.query_one("#status", Static).content)
+
+    status = asyncio.run(run())
+    assert "2 unconverted" in status
+    assert "rates fetch" in status
+
+
+def test_status_line_has_no_unconverted_marker_when_everything_converts(tmp_path, monkeypatch):
+    """A single-currency database never has anything to convert, so the marker this
+    test's sibling checks for must never appear here."""
+    _setup(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            return str(app.query_one("#status", Static).content)
+
+    status = asyncio.run(run())
+    assert "unconverted" not in status
+
+
+def test_status_line_with_unconverted_marker_fits_the_main_panel(tmp_path, monkeypatch):
+    """Same 92-column budget as every other status line, against a year of six-figure
+    transactions and a three-digit unconverted count -- the widest realistic case."""
+    _setup(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            width = app.query_one("#status", Static).size.width
+            app._set_status(
+                queries.Totals(
+                    count=99_999,
+                    net_minor=0,
+                    outflow_minor=-99_999_999,
+                    inflow_minor=99_999_999,
+                    transfer_count=0,
+                    unconverted_count=999,
+                )
+            )
+            status = str(app.query_one("#status", Static).content)
+            return status, width
+
+    status, width = asyncio.run(run())
+    assert len(status) <= width - 2
+    assert "999 unconverted" in status
