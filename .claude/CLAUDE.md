@@ -1,6 +1,18 @@
 # Claude instructions
 
-## Priorities
+## Spelling
+
+Use **American** spelling everywhere — code, comments, docstrings, `README.md`, and
+user-facing strings: `categorize`, `normalize`, `recognize`, `Uncategorized`, `behavior`,
+`color`, `canceled`, `center`, `gray`.
+
+Much of this codebase was written in British spelling, so this means correcting existing
+text as you touch it, not matching what is already there.
+
+Never blind-replace `ise`→`ize`. `otherwise`, `precise`, `concise`, `raise`, `promise`,
+`advise`, `revise`, `supervise` and `expertise` are all legitimate, as is the module
+`wise.py`. Match whole words. Leave external data alone too: a provider's own status
+value (`CANCELLED` in a Wise export) is data, not prose.
 
 1. Keep core simulation logic separate from rendering/UI.
 2. Prefer simple, testable code over clever abstractions.
@@ -22,9 +34,27 @@ Two consequences worth remembering:
   tested by nobody and needs its own run.
 - A git worktree contains only **committed** files, so uncommitted work is invisible to
   agents running in one.
-- **The dispatcher must hold still while an agent is running.** An agent verifies itself
-  with the whole suite, so editing *any* file — even one it was told not to touch — makes
-  its runs disagree with each other. It cannot tell your edits from its own bug, so it
-  re-runs, and re-runs. If something small needs doing mid-flight, either queue it or
-  accept that the agent's test results are now unreliable and re-verify yourself
-  afterwards.
+
+## Who runs which tests
+
+**Agents verify only the test files covering what they touched. The dispatcher runs the
+full suite, once, after the agent returns.**
+
+The merged run is required either way — see "merging cleanly is not the same as working"
+above — so a full-suite run from inside an agent duplicates it and buys nothing. What it
+costs is real: it sweeps up every file in the repo, including the ones other agents and
+the dispatcher are editing at that moment, and reports failures the agent did not cause
+and cannot fix. It cannot tell those from its own bug, so it re-runs, and re-runs. That
+is the loop.
+
+With agents scoped to their own suites, the dispatcher no longer has to hold still, and
+several agents can run at once. Three things still hold:
+
+- **Keep shared modules importable.** A targeted run still imports the app, so a
+  half-finished edit that leaves `importer.py` unparseable will break an agent whose
+  tests import it. Land edits in states that at least parse.
+- **Do not edit a file an agent is editing.** Agents share one working tree, so
+  concurrent edits to the same file clobber rather than merge. Partition agents by file,
+  or give them `isolation: worktree` and merge afterwards.
+- **Each agent must report which suites it ran**, so the dispatcher knows what the green
+  result does not cover. Everything outside that list is unverified until the merged run.

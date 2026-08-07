@@ -18,14 +18,18 @@ TUI plus an argparse CLI, over a SQLAlchemy/SQLite core you do **not** change.
 4. **No native extensions.**
 5. **Avoid large refactors.** A small amount of tech debt is fine if it keeps the change
    small.
-6. **Never write a real bank or institution name** anywhere in the source tree —
+6. **Use American spelling** — `categorize`, `normalize`, `recognize`, `behavior`,
+   `color`, `canceled`. Much of this codebase is still British, so correct it as you
+   touch it rather than matching it. Never blind-replace `ise`→`ize`: `otherwise`,
+   `precise`, `raise`, `promise` and the module `wise.py` are all legitimate.
+7. **Never write a real bank or institution name** anywhere in the source tree —
    including test fixtures and README examples. Use neutral names like `Checking`,
    `Card 1234`.
-7. **Do not modify existing tests to make them pass.** A breaking test means your change
+8. **Do not modify existing tests to make them pass.** A breaking test means your change
    is wrong, or the test encodes a decision you should not silently overturn. Stop and
    report it.
-8. **Do not commit.**
-9. **Python 3.9 is the floor** and CI runs it: `typing.Optional/List/Dict`, plus
+9. **Do not commit.**
+10. **Python 3.9 is the floor** and CI runs it: `typing.Optional/List/Dict`, plus
    `from __future__ import annotations`.
 
 ## How this app is put together
@@ -107,23 +111,34 @@ While you work, run only the files you are touching — `pytest -q src/test/test
 or `-k` a single test. They are seconds instead of half a minute, and the output is short
 enough to read.
 
-Run the **full suite once**, at the end:
+**Do not run the whole suite.** Verify against the test files that cover what you
+touched, and nothing more:
 
 ```bash
-PYTHONPATH="$PWD/src" .venv/bin/python -m pytest -q
+PYTHONPATH="$PWD/src" .venv/bin/python -m pytest -q src/test/test_python/test_charts.py
 ```
 
-Three rules about that run, because getting them wrong burns a lot of tokens for nothing:
+The dispatcher runs the full suite once, after you hand back, against the merged tree.
+That run is required whether or not you also did one — merging cleanly is not the same as
+working — so a full run from inside your task duplicates it and buys nothing. What it
+*costs* is real: it sweeps up every file in the repo, including ones other agents and the
+dispatcher are editing right now, so it reports failures you did not cause and cannot fix.
+That is what sends an agent round in circles.
 
-- **One clean run is the record.** Do not re-run the full suite to confirm a result you
-  already have, to "double-check", or "for the record". If nothing changed, the answer
-  will not change either.
-- **A failure outside the files you own is a finding, not a task.** When your change has
-  an intended consequence in a file another agent owns, name the failing tests in your
-  report and stop. Do not re-run hoping they pass, and do not reach outside your
+**Say in your report which test files you ran.** The dispatcher needs to know what your
+green result does and does not cover, because everything outside it is unverified until
+the merged run.
+
+Three rules, because getting them wrong burns a lot of tokens for nothing:
+
+- **One clean run is the record.** Do not re-run a suite to confirm a result you already
+  have, to "double-check", or "for the record". If nothing changed, the answer will not
+  change either.
+- **A failure outside the files you own is a finding, not a task.** Name the failing tests
+  in your report and stop. Do not re-run hoping they pass, and do not reach outside your
   ownership to fix them.
 - **If two identical runs disagree, stop and report it.** Varying results mean something
-  outside your control is editing the tree while you test. You cannot debug that from
+  outside your control is editing a file your tests import. You cannot debug that from
   inside, and trying is a loop. Say which tests varied and hand it back.
 
 The `PYTHONPATH` is not decoration. The package is installed editable via a `.pth` file
