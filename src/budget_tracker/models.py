@@ -3,7 +3,7 @@
 This is the minimal slice of the schema in README.md needed to import a CSV:
 ``currency``, ``account``, ``category``, ``import`` and ``transaction``. The other
 tables (budget, rule, tag, transaction_tag, transaction_split, recurring,
-balance_snapshot, app_config, exchange_rate) are deferred until their features exist.
+balance_snapshot, app_config) are deferred until their features exist.
 """
 
 from __future__ import annotations
@@ -212,3 +212,31 @@ class Transaction(Base):
     category: Mapped[Optional[Category]] = relationship()
     currency: Mapped[Currency] = relationship()
     vendor: Mapped[Optional[Vendor]] = relationship()
+
+
+class ExchangeRate(Base):
+    """A currency conversion rate observed or fetched for one day.
+
+    ``rate`` is the number of ``quote`` units one ``base`` unit buys. Stored as text and
+    read back as :class:`~decimal.Decimal` in :mod:`.rates` — a SQLite ``REAL`` column
+    would reintroduce the binary floating-point error this app otherwise avoids by
+    keeping money in integer minor units.
+
+    ``source`` records provenance the same way ``transaction.category_source`` does:
+    one of :data:`.rates.MANUAL`, :data:`.rates.OBSERVED`, :data:`.rates.ECB`. See
+    :func:`.rates.rate_on` for the precedence between them.
+    """
+
+    __tablename__ = "exchange_rate"
+    __table_args__ = (
+        UniqueConstraint(
+            "day", "base", "quote", "source", name="uq_exchange_rate_day_base_quote_source"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    day: Mapped[date] = mapped_column()
+    base: Mapped[str] = mapped_column(String)
+    quote: Mapped[str] = mapped_column(String)
+    rate: Mapped[str] = mapped_column(String)
+    source: Mapped[str] = mapped_column(String)
