@@ -7,11 +7,9 @@ transactions table, a totals line, and a command bar at the bottom.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
-from rich.table import Table
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -27,9 +25,19 @@ from textual.widgets import (
     Static,
 )
 
-from . import accounts, categories, charts, formats, queries, stats, transfers, vendors
-from .db import DuplicateCategoryNamesError, get_engine, get_sessionmaker, init_db
-from .importer import (
+from .. import (
+    accounts,
+    categories,
+    charts,
+    formats,
+    importer,
+    queries,
+    stats,
+    transfers,
+    vendors,
+)
+from ..db import DuplicateCategoryNamesError, get_engine, get_sessionmaker, init_db
+from ..importer import (
     ImportCandidate,
     InboxFolder,
     UnknownImport,
@@ -39,161 +47,29 @@ from .importer import (
     list_inbox,
     read_header_and_rows,
 )
+from . import chart as chart_panel
+from . import imports as imports_panel
+from . import periods as periods_panel
+from . import pie as pie_panel
+from . import rules as rules_panel
+from . import stats as stats_panel
+from . import transactions
+from .formatting import CHART_WIDTH, _fmt_amount, _range_label, _truncate
+from .imports import _Setup
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+_REPO_ROOT = Path(__file__).resolve().parents[3]
 TO_IMPORT_DIR = _REPO_ROOT / "data" / "to_import"
 
 
-@dataclass
-class _Setup:
-    """State for the in-app walkthrough that teaches the app a new CSV layout.
-
-    Questions come from :mod:`.formats`, the same source the CLI uses, so both routes
-    ask exactly the same things in the same order.
-    """
-
-    path: Path
-    fieldnames: List[str] = field(default_factory=list)
-    rows: List[dict] = field(default_factory=list)
-    values: dict = field(default_factory=dict)
-    asked: set = field(default_factory=set)
-    spec: Optional[formats.FormatSpec] = None
-    account_name: Optional[str] = None
-    question: Optional[formats.Question] = None
-
-
-def _fmt_amount(minor: int, decimal_places: int = 2) -> str:
-    return f"{minor / (10 ** decimal_places):,.{decimal_places}f}"
-
-
-def _fmt_amount_for(minor: int, currency: Optional[queries.CurrencyRow]) -> str:
-    """Format ``minor`` in *its own* currency: the right decimal places, and its symbol.
-
-    ``currency`` is ``None`` for a figure with no single obvious currency — a total
-    summed across a filter that may mix currencies, or a code this database has no
-    Currency row for. Either way a guess would be worse than the plain two-decimal
-    figure this falls back to: showing JPY's zero decimal places on a EUR/CHF mix, or a
-    symbol that names the wrong currency, is a worse error than showing no symbol at
-    all. Callers that know which single currency they are summing (e.g. once
-    home-currency conversion lands) can pass that currency's row instead.
-    """
-    if currency is None:
-        return _fmt_amount(minor)
-    number = _fmt_amount(minor, currency.decimal_places)
-    return f"{currency.symbol}{number}" if currency.symbol else number
-
-
-def _truncate(text: str, width: int) -> str:
-    return text if len(text) <= width else text[: width - 1] + "…"
-
-
-# A row of the import browser that moves you somewhere rather than importing something.
-FOLDER_MARK = "▸"
-
-# Transfers are shown greyed and flagged, because the totals deliberately ignore them —
-# a row that looks like ordinary spending but is missing from the figures reads as a bug.
-TRANSFER_MARK = "⇄"
-TRANSFER_STYLE = "dim italic"
-
-# The last row of the period picker, and the format its answer has to take.
-CUSTOM_PERIOD = "Custom…"
-RANGE_EXAMPLE = "2025-01-01..2025-06-30"
-
-# Bar column width. The main panel has ~92 columns beside the 36-wide sidebar, and the
-# other four columns plus DataTable's cell padding account for 48 of them. Odd, so the
-# net chart's axis has equal halves either side of it (see charts.build).
-CHART_WIDTH = 27
-
-# Per measure: the header and the figure for the column beside the bar, then the same for
-# the column after it. The charted measure comes first, and the second column is whatever
-# is most worth seeing next to it — for a net chart, what the netting hid.
-CHART_COLUMNS = {
-    "net": (("Net", "net"), ("Out", "outflow")),
-    "spend": (("Out", "outflow"), ("Net", "net")),
-    "income": (("In", "inflow"), ("Net", "net")),
-}
-
-# Cycled by slice index. charts.build_pie() only knows which cell belongs to which
-# slice — this is the styling half of that split, and the only place a colour is chosen.
-PIE_COLORS = (
-    "red", "green", "yellow", "blue", "magenta", "cyan",
-    "bright_red", "bright_green", "bright_yellow", "bright_blue",
-    "bright_magenta", "bright_cyan",
+# Every way an import can refuse a file for a reason the user can act on. Gathered into
+# one tuple because the app imports from three places and only one of them used to catch
+# anything -- the other two crashed the whole app with a traceback, which is how a Wise
+# file taking the wrong branch became a stack trace instead of a message.
+IMPORT_PROBLEMS = (
+    formats.AccountRequired,
+    formats.UnknownFormat,
+    formats.AccountCurrencyMismatch,
 )
-
-
-def _amount_cell(
-    minor: int, is_transfer: bool = False, currency: Optional[queries.CurrencyRow] = None
-) -> Text:
-    text = _fmt_amount_for(minor, currency)
-    if is_transfer:
-        return Text(text, style=TRANSFER_STYLE, justify="right")
-    style = "red" if minor < 0 else "green"
-    return Text(text, style=style, justify="right")
-
-
-def _txn_cell(text: str, width: int, is_transfer: bool) -> Text:
-    return Text(_truncate(text, width), style=TRANSFER_STYLE if is_transfer else "")
-
-
-def _range_label(date_range: queries.DateRange) -> str:
-    """``2025-07-01→12-31``, dropping a repeated year.
-
-    The status line has 90 columns for a count, a scope list, and three money figures, so
-    five columns of year that the start date has already given are not worth spending.
-    """
-    start, end = date_range
-    tail = end.isoformat()[5:] if end.year == start.year else end.isoformat()
-    return f"{start}→{tail}"
-
-
-# A collapsed category shows this before its name; an expanded or leaf row shows nothing,
-# so the default (fully expanded) rendering is byte-for-byte what it was before folding
-# existed.
-FOLD_INDICATOR = "▸"
-
-
-def _foldable_category_ids(cats: List[stats.CategoryStat]) -> Set[int]:
-    """category_ids that own at least one child in ``cats``.
-
-    ``cats`` is depth-first (see stats.Report.categories), so a row has children exactly
-    when the next row is deeper.
-    """
-    return {
-        cats[i].category_id
-        for i in range(len(cats) - 1)
-        if cats[i + 1].depth > cats[i].depth
-    }
-
-
-def _visible_stats(
-    cats: List[stats.CategoryStat], collapsed: Set[int], foldable: Set[int]
-) -> List[stats.CategoryStat]:
-    """``cats`` with every collapsed row's subtree hidden — recursively.
-
-    A row is hidden while some ancestor still in ``collapsed`` is being skipped; the
-    parent itself always stays visible. Both a nested collapse and the parent's own are
-    remembered independently, keyed by category_id, so re-expanding a parent reveals
-    whatever fold state its children already had.
-    """
-    visible = []
-    hide_below_depth: Optional[int] = None
-    for stat in cats:
-        if hide_below_depth is not None:
-            if stat.depth > hide_below_depth:
-                continue
-            hide_below_depth = None
-        visible.append(stat)
-        if stat.category_id in foldable and stat.category_id in collapsed:
-            hide_below_depth = stat.depth
-    return visible
-
-
-def _stats_label(stat: stats.CategoryStat, collapsed: Set[int]) -> str:
-    indent = "  " * stat.depth
-    if stat.category_id in collapsed:
-        return f"{indent}{FOLD_INDICATOR} {stat.name}"
-    return f"{indent}{stat.name}"
 
 
 class BudgetApp(App):
@@ -591,79 +467,22 @@ class BudgetApp(App):
 
     def _fill_txns(self, txns: List[queries.TxnRow]) -> None:
         table = self.query_one("#txns", DataTable)
-        table.clear()
         self._txns = txns
-        for txn in txns:
-            marked = f"{TRANSFER_MARK} {txn.description}" if txn.is_transfer else txn.description
-            table.add_row(
-                _txn_cell(txn.posted_date, 10, txn.is_transfer),
-                _txn_cell(marked, 26, txn.is_transfer),
-                _txn_cell(txn.vendor, 18, txn.is_transfer),
-                _txn_cell(txn.category, 12, txn.is_transfer),
-                _amount_cell(
-                    txn.amount_minor, txn.is_transfer, self._currencies.get(txn.currency)
-                ),
-                _txn_cell(txn.account, 18, txn.is_transfer),
-            )
+        transactions.fill_txns(table, txns, self._currencies)
 
     def _fill_rules(self) -> None:
-        table = self.query_one("#rules", DataTable)
-        table.clear()
-        for rule in self._rules:
-            table.add_row(
-                "vendor",
-                _truncate(rule.pattern, 26),
-                _truncate(rule.name, 18),
-                Text(str(rule.vendor_count), justify="right"),
-            )
-        for rule in self._category_rules:
-            table.add_row(
-                "category",
-                _truncate(rule.pattern, 26),
-                _truncate(rule.category, 18),
-                Text(str(rule.txn_count), justify="right"),
-            )
+        rules_panel.fill_rules(
+            self.query_one("#rules", DataTable), self._rules, self._category_rules
+        )
 
     def _fill_imports(self) -> None:
-        table = self.query_one("#imports", DataTable)
-        table.clear()
-        # Navigation first, in the order _import_nav records: ".." (when there is one),
-        # then the sub-directories. Enter on any of them moves the browser rather than
-        # importing anything.
-        if self._import_nav and len(self._import_nav) > len(self._import_folders):
-            table.add_row(
-                Text(f"{FOLDER_MARK} ..", style="bold"),
-                "",
-                Text("up", style=TRANSFER_STYLE),
-                "",
-            )
-        for folder in self._import_folders:
-            table.add_row(
-                Text(f"{FOLDER_MARK} {_truncate(folder.name, 32)}", style="bold"),
-                Text(str(folder.csv_count), justify="right"),
-                Text("folder", style=TRANSFER_STYLE),
-                "",
-            )
-        for candidate in self._candidates:
-            status = Text(
-                _truncate(candidate.status, 15),
-                style="" if candidate.ready else "yellow",
-            )
-            table.add_row(
-                _truncate(candidate.path.name, 34),
-                Text(str(candidate.row_count), justify="right"),
-                status,
-                "",  # not imported yet, so no id
-            )
-        # Already-imported files, dimmed: not actionable by enter here (that only
-        # imports a candidate), but this is where an `unimport <id>` id comes from.
-        for imp in self._imports:
-            table.add_row(
-                Text(_truncate(imp.source_file, 34), style=TRANSFER_STYLE),
-                Text(str(imp.transaction_count), justify="right", style=TRANSFER_STYLE),
-                Text("imported", style=TRANSFER_STYLE),
-                Text(str(imp.id), justify="right", style=TRANSFER_STYLE),
-            )
+        imports_panel.fill_imports(
+            self.query_one("#imports", DataTable),
+            self._import_nav,
+            self._import_folders,
+            self._candidates,
+            self._imports,
+        )
 
     def _build_report(self) -> None:
         with self.session_factory() as session:
@@ -677,41 +496,11 @@ class BudgetApp(App):
             )
 
     def _fill_stats(self) -> None:
-        """Render the report, honouring folded subtrees.
-
-        Folding never changes a number: every row already rolls up its descendants (see
-        stats.CategoryStat), so hiding them here only removes rows, never edits one.
-        self._stats_rows is rebuilt in lock-step with the table, so a table row index
-        always maps back to the CategoryStat it actually shows — see
-        _drill_into_category(), which depends on that and would otherwise open the
-        wrong category once rows can be hidden.
-        """
+        """Render the report, honouring folded subtrees. See stats_panel.fill_stats()."""
         table = self.query_one("#stats_table", DataTable)
-        table.clear()
-        if self._report is None:
-            self._stats_rows = []
-            self._foldable_ids = set()
-            return
-        cats = self._report.categories
-        self._foldable_ids = _foldable_category_ids(cats)
-        self._stats_rows = _visible_stats(cats, self._collapsed, self._foldable_ids)
-        for stat in self._stats_rows:
-            # Blank at depth 0: parent_share is identical to share there by construction
-            # (see stats.CategoryStat.parent_share), so printing it twice is noise.
-            parent_pct = (
-                "" if stat.depth == 0 else f"{abs(stat.parent_share) * 100:.1f}%"
-            )
-            table.add_row(
-                _truncate(_stats_label(stat, self._collapsed), 26),
-                Text(str(stat.count), justify="right"),
-                _amount_cell(stat.total_minor),
-                _amount_cell(stat.avg_month_minor),
-                # Shares are a fraction of a negative outflow, so a category that spent
-                # nothing comes out as -0.0; abs() keeps that off the screen.
-                Text(f"{abs(stat.share) * 100:.1f}%", justify="right"),
-                Text(parent_pct, justify="right"),
-            )
-        self._add_stats_total_row(table)
+        self._stats_rows, self._foldable_ids = stats_panel.fill_stats(
+            table, self._report, self._collapsed
+        )
 
     def _toggle_fold(self, row: int) -> None:
         """Space on a stats row: collapse/expand its subtree if it has one.
@@ -720,15 +509,8 @@ class BudgetApp(App):
         not a notification, since space is not obviously "for" the stats table the way
         enter or the arrows are.
         """
-        if not 0 <= row < len(self._stats_rows):
+        if not stats_panel.toggle_fold(row, self._stats_rows, self._foldable_ids, self._collapsed):
             return
-        stat = self._stats_rows[row]
-        if stat.category_id not in self._foldable_ids:
-            return
-        if stat.category_id in self._collapsed:
-            self._collapsed.discard(stat.category_id)
-        else:
-            self._collapsed.add(stat.category_id)
         self._fill_stats()
         # The toggled row's own subtree is what grows or shrinks, always right after it,
         # so its own row index is unchanged by the toggle — the cursor can just stay put.
@@ -747,53 +529,13 @@ class BudgetApp(App):
             return
         table = self.query_one("#stats_table", DataTable)
         row = table.cursor_row
-        if self._foldable_ids - self._collapsed:
-            self._collapsed |= self._foldable_ids
-        else:
-            self._collapsed -= self._foldable_ids
+        stats_panel.toggle_fold_all(self._foldable_ids, self._collapsed)
         self._fill_stats()
         # Collapsing/expanding everything moves rows around far more than a single
         # toggle does, so there is no single "same row" to return to — just keep the
         # cursor in range rather than landing on an arbitrary category.
         if table.row_count:
             table.move_cursor(row=min(row, table.row_count - 1))
-
-    def _add_stats_total_row(self, table: DataTable) -> None:
-        """A closing total, summing the depth-0 rows above it.
-
-        Only the depth-0 rows: every row's money already includes its descendants, so
-        adding the nested ones too would count a parent's spending twice (see
-        stats.Report.categories). These figures come from the report's own totals rather
-        than from re-adding the column, so the row cannot drift from the status line.
-
-        Selecting it does nothing — _drill_into_category()'s bounds check already rejects
-        a row index past the last category, which is exactly this one.
-
-        A window with no transactions gets no total: a lone "TOTAL 0.00" reads as a
-        result, where an empty table plainly says there is nothing here.
-        """
-        report = self._report
-        if not report.categories:
-            return
-        table.add_row(
-            Text("TOTAL", style="bold"),
-            Text(str(report.count), style="bold", justify="right"),
-            Text(
-                _fmt_amount(report.net_minor),
-                style="bold " + ("red" if report.net_minor < 0 else "green"),
-                justify="right",
-            ),
-            Text(
-                _fmt_amount(stats.per_month(report.net_minor, report.window)),
-                style="bold "
-                + ("red" if report.net_minor < 0 else "green"),
-                justify="right",
-            ),
-            # 100% by construction, and worth printing: it says the column above is a
-            # share of this window's spending and nothing has been left out of it.
-            Text("100.0%" if report.outflow_minor else "", style="bold", justify="right"),
-            Text("", justify="right"),
-        )
 
     # ---------------------------------------------------------------- chart
     def _build_chart(self) -> None:
@@ -823,232 +565,45 @@ class BudgetApp(App):
         self._chart = charts.build(series, measure=self._measure, width=CHART_WIDTH)
         self._chart_transfers = totals.transfer_count
 
-    def _bar_cell(self, bar: charts.Bar) -> Text:
-        """The bar, coloured by direction: red is money out, green is money in.
-
-        On a net chart that means the two sides of the axis are different colours, which
-        is the same rule the amount columns already follow — it just happens to land on
-        one row at a time there.
-        """
-        inflow_side = "green" if self._measure != "spend" else "red"
-        return Text.assemble(
-            (bar.left, "red"), (bar.axis, "dim"), (bar.right, inflow_side)
-        )
-
-    def _money_cell(self, bar: charts.Bar, field: str) -> Text:
-        """One of the two figure columns beside the bar, per CHART_COLUMNS."""
-        if field == "net":
-            return _amount_cell(bar.net_minor)
-        # Outflow and inflow are positive magnitudes, so _amount_cell's sign rule would
-        # paint them both green; the direction is what the colour has to carry here.
-        value = bar.outflow_minor if field == "outflow" else bar.inflow_minor
-        style = ("red" if field == "outflow" else "green") if value else "dim"
-        return Text(_fmt_amount(value), style=style, justify="right")
-
     def _fill_chart(self) -> None:
         """Redraw the table, columns included — two headers name the current measure."""
         table = self.query_one("#chart", DataTable)
-        table.clear(columns=True)
-        if self._chart is None:
-            return
-        columns = CHART_COLUMNS[self._measure]
-        # 9 + CHART_WIDTH + 12 + 12 + 5 plus two cells of padding each: 76 of the ~92 the
-        # main panel has, leaving the bars room to be the widest thing on the row (see
-        # test_chart_table_fits_the_main_panel).
-        table.add_column("Period", width=9)
-        table.add_column(charts.MEASURE_HEADERS[self._measure], width=CHART_WIDTH)
-        for header, _field in columns:
-            table.add_column(header, width=12)
-        table.add_column("Txns", width=5)
-
-        for bar in self._chart.bars:
-            table.add_row(
-                bar.label,
-                self._bar_cell(bar),
-                *[self._money_cell(bar, field) for _header, field in columns],
-                Text(str(bar.count), justify="right"),
-            )
-        self._add_chart_total_row(table)
-
-    def _add_chart_total_row(self, table: DataTable) -> None:
-        """A closing total, plus the per-bucket average in the bar column.
-
-        The average belongs there because that column is the only one whose units are
-        per-bucket; putting a summed bar there would be meaningless, and leaving it blank
-        wastes the widest column on the row.
-
-        A window holding no transactions gets no total, for the same reason the
-        statistics table skips one: a row of zeroes reads as a finding. The test is the
-        transaction count, not the bar list — buckets are zero-filled, so an empty
-        window still has a full set of (empty) bars to draw.
-        """
-        chart = self._chart
-        if not any(bar.count for bar in chart.bars):
-            return
-
-        def figure(field: str) -> Text:
-            value = {
-                "net": chart.net_minor,
-                "outflow": chart.outflow_minor,
-                "inflow": chart.inflow_minor,
-            }[field]
-            if field == "net":
-                style = "red" if value < 0 else "green"
-            else:
-                style = "red" if field == "outflow" else "green"
-            return Text(_fmt_amount(value), style=f"bold {style}", justify="right")
-
-        table.add_row(
-            Text("TOTAL", style="bold"),
-            Text(f"avg {_fmt_amount(chart.avg_minor)}/{self._bucket}", style="dim"),
-            *[figure(field) for _header, field in CHART_COLUMNS[self._measure]],
-            Text(
-                str(sum(bar.count for bar in chart.bars)),
-                style="bold",
-                justify="right",
-            ),
-        )
+        chart_panel.fill_chart(table, self._chart, self._measure, self._bucket)
 
     def _chart_status(self) -> str:
         """One line, under the same 92-column budget as every other panel's status."""
-        chart = self._chart
-        window = self.window
-        label = "custom" if window.key == "custom" else window.label
-        scope = self._chart_scope()
-        excluded = f"{TRANSFER_MARK} {self._chart_transfers} " if self._chart_transfers else ""
-        return (
-            f"{label} {_range_label((window.start, window.end))} "
-            f"{self._measure}/{self._bucket} "
-            f"{scope}"
-            f"{excluded}"
-            f"total {_fmt_amount(chart.total_minor)} "
-            f"peak {_fmt_amount(chart.peak_minor)}"
+        return chart_panel.chart_status(
+            self._chart,
+            self.window,
+            self._measure,
+            self._bucket,
+            self._chart_transfers,
+            self.category_filter,
+            self._categories,
+            self.account_filter,
+            self.vendor_filter,
+            self.text_filter,
         )
-
-    def _chart_scope(self) -> str:
-        """The active category, named, plus a terse marker for any other filter.
-
-        Naming the category is the point — the whole feature is charting one category, so
-        a chart that does not say which one it is showing is a trap. The other filters
-        only get a marker, as they do in the transactions status line.
-        """
-        parts = []
-        if self.category_filter is not None:
-            name = next(
-                (c.name for c in self._categories if c.id == self.category_filter), None
-            )
-            parts.append(_truncate(name, 16) if name else "category")
-        if self.account_filter is not None:
-            parts.append("account")
-        if self.vendor_filter is not None:
-            parts.append("vendor")
-        if self.text_filter is not None:
-            parts.append("text")
-        return f"[{', '.join(parts)}] " if parts else ""
 
     # ------------------------------------------------------------------- pie
     def _build_pie(self) -> None:
-        """Turn the already-built report into wedges — no query of its own.
-
-        The pie and the statistics table read the same report (see reload()'s guard and
-        _show_pie()), so this is pure reshaping: charts.build_pie() already does the
-        depth-0, nonzero-share filtering (see its own docstring for why).
-        """
-        self._pie = (
-            charts.build_pie(self._report.categories) if self._report is not None else None
-        )
+        """Turn the already-built report into wedges. See pie_panel.build_pie()."""
+        self._pie = pie_panel.build_pie(self._report)
 
     def _fill_pie(self) -> None:
         """Render the wedges and their legend into the pie Static."""
-        static = self.query_one("#pie", Static)
-        pie = self._pie
-        if pie is None or not pie.slices:
-            static.update(Text("No net spending in this window.", style="dim"))
-            return
-
-        art = Text()
-        for row in range(pie.height):
-            for col in range(pie.width):
-                index = pie.mask[row][col]
-                if index is None:
-                    art.append(" ")
-                else:
-                    art.append(charts.BLOCK, style=PIE_COLORS[index % len(PIE_COLORS)])
-            art.append("\n")
-
-        legend = Table.grid(padding=(0, 1))
-        legend.add_column()  # swatch
-        legend.add_column()  # category name
-        legend.add_column(justify="right")  # share
-        legend.add_column(justify="right")  # amount
-        for index, one_slice in enumerate(pie.slices):
-            color = PIE_COLORS[index % len(PIE_COLORS)]
-            legend.add_row(
-                Text(charts.BLOCK * 2, style=color),
-                Text(_truncate(one_slice.name, 20)),
-                Text(f"{one_slice.share * 100:.1f}%", justify="right"),
-                Text(_fmt_amount(one_slice.amount_minor), style="red", justify="right"),
-            )
-
-        grid = Table.grid(padding=(0, 2))
-        grid.add_column()
-        grid.add_column()
-        grid.add_row(art, legend)
-        static.update(grid)
+        pie_panel.fill_pie(self.query_one("#pie", Static), self._pie)
 
     def _pie_status(self) -> str:
         """One line, the same shape as _stats_status()/_chart_status()."""
-        report = self._report
-        window = report.window
-        label = "custom" if window.key == "custom" else window.label
-        pie = self._pie
-        count = len(pie.slices) if pie is not None else 0
-        excluded = (
-            f"{TRANSFER_MARK} {report.transfer_count} " if report.transfer_count else ""
-        )
-        return (
-            f"{label} {window.start}→{window.end} "
-            f"{count} categor{'y' if count == 1 else 'ies'} "
-            f"{excluded}"
-            f"net spend {_fmt_amount(-report.net_spend_minor)}"
-        )
+        return pie_panel.pie_status(self._report, self._pie)
 
     def _fill_periods(self) -> None:
-        table = self.query_one("#periods", DataTable)
-        table.clear()
-        # Spelling out the dates each preset resolves to saves the user working out what
-        # "3 months" means when their imports are a month stale.
-        for key, label, _months in stats.PRESETS:
-            window = stats.resolve(key)
-            table.add_row(label, f"{window.start} → {window.end}")
-        table.add_row(CUSTOM_PERIOD, RANGE_EXAMPLE)
+        periods_panel.fill_periods(self.query_one("#periods", DataTable))
 
     def _stats_status(self) -> str:
-        """One line: the main panel gives the status 92 columns, so every field is terse.
-
-        No "escape returns" hint here, unlike the other panels — the footer already spells
-        that key out, and against a real year of five-figure totals the sentence ran the
-        line to exactly the panel width, one digit away from truncating the money. The
-        right-arrow drill-down hint lives in the footer for the same reason: this line has
-        no slack left to spend on it (see test_stats_status_line_fits_the_main_panel).
-        """
-        report = self._report
-        window = report.window
-        # A custom window's label is its own date range, which follows anyway.
-        label = "custom" if window.key == "custom" else window.label
-        # The money figures leave transfers out, so say how many vanished — silently
-        # dropping a payment between your own accounts reads as missing spending.
-        excluded = (
-            f"{TRANSFER_MARK} {report.transfer_count} " if report.transfer_count else ""
-        )
-        return (
-            f"{label} {window.start}→{window.end} "
-            f"{report.count} txns "
-            f"{excluded}"
-            f"out {_fmt_amount(report.outflow_minor)} "
-            f"in {_fmt_amount(report.inflow_minor)} "
-            f"/mo {_fmt_amount(report.avg_month_outflow_minor)}"
-        )
+        """One line under the status budget. See stats_panel.stats_status()."""
+        return stats_panel.stats_status(self._report)
 
     def _refresh_status(self) -> None:
         status = self.query_one("#status", Static)
@@ -1182,7 +737,28 @@ class BudgetApp(App):
         self._import_candidate(self._candidates[row])
 
     def _import_candidate(self, candidate: ImportCandidate) -> None:
-        """Import the file, first walking through whatever it still needs."""
+        """Import the file, first walking through whatever it still needs.
+
+        A file with a built-in reader (e.g. a Wise transfer log) is recognized from its
+        own columns rather than a saved layout, so ``candidate.format_name`` is a label,
+        not a row in the csv_format table — there is nothing for the setup walkthrough
+        to look up or ask about. Import it directly instead; import_csv already routes
+        on the file's signature regardless of any format argument.
+        """
+        if candidate.format_name == importer.WISE_FORMAT_NAME:
+            with self.session_factory() as session:
+                try:
+                    result = import_csv(session, candidate.path)
+                except IMPORT_PROBLEMS as error:
+                    self.notify(str(error), severity="error", markup=False)
+                    return
+            self.reload()
+            self._show_imports()
+            self.notify(
+                f"{candidate.path.name}: {result.inserted} added, "
+                f"{result.skipped_duplicates} skipped."
+            )
+            return
         setup = _Setup(path=candidate.path)
         if candidate.format_name is None:
             # An unseen layout: infer what we can, then ask about the rest.
@@ -1196,52 +772,13 @@ class BudgetApp(App):
         self._setup = setup
         self._advance_setup()
 
-    def _next_setup_question(self, setup: _Setup) -> Optional[formats.Question]:
-        """The next thing we need from the user, or None when ready to import."""
-        if setup.spec is None:
-            if "name" not in setup.asked:
-                return formats.Question(
-                    field="name",
-                    prompt="Name for this layout",
-                    default=setup.values.get("name"),
-                )
-            pending = formats.remaining_questions(
-                setup.values, setup.rows, setup.fieldnames
-            )
-            if pending:
-                return pending[0]
-            if setup.values.get("account_column") and "account_prefix" not in setup.asked:
-                column = setup.values["account_column"]
-                sample = next(
-                    ((r.get(column) or "").strip() for r in setup.rows if r.get(column)),
-                    "1234",
-                )
-                return formats.Question(
-                    field="account_prefix",
-                    prompt=(
-                        f"Accounts are named after {column!r}, e.g. {sample!r}. "
-                        "Prefix for those names? (blank for none)"
-                    ),
-                    allow_empty=True,
-                )
-            return None
-        if setup.spec.needs_account and setup.account_name is None:
-            return formats.Question(
-                field="__account",
-                prompt=(
-                    f"{setup.path.name} does not say which account it is. "
-                    "Name the account"
-                ),
-            )
-        return None
-
     def _advance_setup(self) -> None:
         """Ask the next question, or finish: save the layout and import."""
         setup = self._setup
         if setup is None:
             return
 
-        question = self._next_setup_question(setup)
+        question = imports_panel.next_setup_question(setup)
         if question is None and setup.spec is None:
             try:
                 spec = formats.spec_from_values(setup.values)
@@ -1254,7 +791,7 @@ class BudgetApp(App):
                 session.commit()
             setup.spec = spec
             self.notify(f"Learned layout {spec.name!r}.")
-            question = self._next_setup_question(setup)
+            question = imports_panel.next_setup_question(setup)
 
         if question is not None:
             setup.question = question
@@ -1267,7 +804,15 @@ class BudgetApp(App):
         setup = self._setup
         self._setup = None
         with self.session_factory() as session:
-            result = import_csv(session, setup.path, account_name=setup.account_name)
+            try:
+                result = import_csv(session, setup.path, account_name=setup.account_name)
+            except IMPORT_PROBLEMS as error:
+                # The walkthrough is already finished and its format saved, so there is
+                # nothing to go back to -- report and return to the file list rather
+                # than dying on a problem the user can act on.
+                self.notify(str(error), severity="error", markup=False)
+                self._show_imports()
+                return
         self.reload()
         self._show_imports()
         self.notify(
@@ -1281,26 +826,11 @@ class BudgetApp(App):
 
     def _show_setup_question(self) -> None:
         table = self.query_one("#setup", DataTable)
-        table.clear()
-        self._prompt_panel = "setup"
         question = self._setup.question
-        for index, choice in enumerate(question.choices, start=1):
-            table.add_row(Text(str(index), justify="right"), _truncate(str(choice), 44))
+        imports_panel.fill_setup_choices(table, question)
+        self._prompt_panel = "setup"
         self._set_panel("setup")
-
-        hint = (
-            "Enter on a row, or type the number below."
-            if question.choices
-            else "Type your answer in the command bar below."
-        )
-        if question.default:
-            hint += f"  Blank accepts {question.default!r}."
-        elif question.allow_empty:
-            hint += "  Blank is allowed."
-        # Text(), not markup: prompts quote column names that may contain brackets.
-        self.query_one("#prompt", Static).update(
-            Text.assemble((question.prompt + "\n", "bold"), (hint, "dim"))
-        )
+        self.query_one("#prompt", Static).update(imports_panel.setup_prompt_text(question))
         # An empty choices table is just noise, so only show it when there is a list.
         table.display = bool(question.choices)
         if not question.choices:
@@ -1443,7 +973,7 @@ class BudgetApp(App):
             Text.assemble(
                 ("Date range for the statistics\n", "bold"),
                 (
-                    f"Type it in the command bar below, as {RANGE_EXAMPLE}.  "
+                    f"Type it in the command bar below, as {periods_panel.RANGE_EXAMPLE}.  "
                     "Escape returns to the list.",
                     "dim",
                 ),
@@ -1598,7 +1128,7 @@ class BudgetApp(App):
                 "filter — clear the text filter\n"
                 "stats — pick a period, then see spending per category\n"
                 "stats <period> — skip the picker (e.g. stats 6m, stats 1 year,\n"
-                f"  stats {RANGE_EXAMPLE})\n"
+                f"  stats {periods_panel.RANGE_EXAMPLE})\n"
                 "  enter, or the right arrow, on a category row lists that window's\n"
                 "  transactions; the left arrow goes back to the breakdown\n"
                 "  space, on a category row with children, folds/unfolds its subtree\n"
@@ -1655,7 +1185,7 @@ class BudgetApp(App):
             for path in paths:
                 try:
                     result = import_csv(session, path)
-                except (formats.AccountRequired, formats.UnknownFormat) as error:
+                except IMPORT_PROBLEMS as error:
                     problems.append(f"{path.name}: {error}")
                     continue
                 imported += 1
@@ -1836,17 +1366,8 @@ class BudgetApp(App):
             )
 
     def _import_label(self) -> str:
-        """The current directory, relative to the inbox, named rather than ``.``.
-
-        At the top that is the inbox folder's own name: "." is technically the relative
-        path but reads as an error in a status line, and the point of the label is to say
-        where you are in words you would recognise.
-        """
-        try:
-            relative = self._import_dir.relative_to(TO_IMPORT_DIR)
-        except ValueError:
-            return str(self._import_dir)
-        return TO_IMPORT_DIR.name if relative == Path(".") else str(relative)
+        """The current directory, named for the status line. See imports_panel.import_label()."""
+        return imports_panel.import_label(self._import_dir, TO_IMPORT_DIR)
 
     def _open_import_dir(self, path: Path) -> None:
         self._import_dir = path
