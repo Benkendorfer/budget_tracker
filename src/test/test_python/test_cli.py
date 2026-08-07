@@ -668,3 +668,36 @@ def test_the_import_summary_names_the_database_it_actually_wrote(tmp_path, monke
     printed = capsys.readouterr().out
     assert f"Database: {tmp_path / 't.db'}" in printed
     assert "data/budget.db" not in printed
+
+
+def test_rates_fetch_bases_on_the_reporting_currency(tmp_path, monkeypatch, capsys):
+    """Every conversion the aggregates perform is X -> home, and rate_on can invert a
+    cached pair but cannot chain two together. Basing the fetch on anything other than
+    the reporting currency would leave the conversions that actually matter unreachable.
+    """
+    session_factory = _setup(tmp_path, monkeypatch)
+    from budget_tracker import queries, rates
+    from budget_tracker.models import Account, Currency
+
+    with session_factory() as session:
+        for code in ("CHF", "EUR"):
+            currency = Currency(value=code, symbol=code, decimal_places=2)
+            session.add(currency)
+            session.flush()
+            session.add(Account(name=f"Wise {code}", currency_id=currency.id))
+        session.commit()
+
+    seen = {}
+
+    def fake_fetch(session, start, end, base, quotes, **kwargs):
+        seen["base"] = base
+        seen["quotes"] = sorted(quotes)
+        return 0
+
+    monkeypatch.setattr(rates, "fetch_ecb_rates", fake_fetch)
+    assert cli.main(["rates", "fetch", "--start", "2026-01-01", "--end", "2026-01-31"]) == 0
+
+    assert seen["base"] == queries.HOME_CURRENCY
+    # The home currency is never fetched against itself, and every other one is covered.
+    assert queries.HOME_CURRENCY not in seen["quotes"]
+    assert seen["quotes"] == ["CHF", "EUR"]

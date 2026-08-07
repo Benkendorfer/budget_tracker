@@ -1,13 +1,14 @@
 """Tests for time windows and the statistics report."""
 
 from datetime import date
+from decimal import Decimal
 
 import pytest
 
 from sqlalchemy import event
 from sqlalchemy.engine import Engine
 
-from budget_tracker import categories, queries, stats, transfers
+from budget_tracker import categories, queries, rates, stats, transfers
 from budget_tracker.db import get_engine, get_sessionmaker, init_db
 from budget_tracker.models import Account, Category, Currency, Transaction, Vendor
 
@@ -763,3 +764,204 @@ def test_get_currencies_reports_symbols_and_decimal_places(tmp_path):
         rows = {c.code: c for c in queries.get_currencies(session)}
     assert rows["USD"].symbol == "$" and rows["USD"].decimal_places == 2
     assert rows["JPY"].decimal_places == 0
+
+
+# ---------------------------------------------------------------- currency conversion
+
+def _seed_two_currencies(session):
+    """USD (the default home currency) and CHF, one account each, no categories."""
+    usd = Currency(value="USD", symbol="$", decimal_places=2)
+    chf = Currency(value="CHF", symbol="Fr", decimal_places=2)
+    session.add(usd)
+    session.add(chf)
+    session.flush()
+    checking = Account(name="Checking", currency_id=usd.id)
+    card = Account(name="Card CHF", currency_id=chf.id)
+    session.add(checking)
+    session.add(card)
+    session.flush()
+    return {"USD": usd, "CHF": chf}, {"Checking": checking, "Card CHF": card}
+
+
+def test_get_totals_single_currency_is_byte_identical_to_before(tmp_path):
+    """With every matching row already in the home currency, this must be exactly the
+    query that ran before conversion existed -- no rate lookup, no rounding."""
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        currency, accounts, _ = _seed(session)
+        _txn(session, currency, accounts["Checking"], date(2025, 3, 1), -2500, "Coffee")
+        _txn(session, currency, accounts["Checking"], date(2025, 3, 2), 100000, "Salary")
+        session.commit()
+
+    with session_factory() as session:
+        totals = queries.get_totals(session)
+
+    assert totals.outflow_minor == -2500
+    assert totals.inflow_minor == 100000
+    assert totals.net_minor == 97500
+    assert totals.unconverted_count == 0
+
+
+def test_get_totals_converts_a_second_currency_into_the_home_currency(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        currencies, accounts = _seed_two_currencies(session)
+        day = date(2025, 6, 1)
+        # 1 CHF buys 1.10 USD.
+        rates.record_rate(session, day, "CHF", "USD", Decimal("1.10"), rates.ECB)
+        _txn(session, currencies["USD"], accounts["Checking"], day, -2000, "Snack")
+        _txn(session, currencies["CHF"], accounts["Card CHF"], day, -10000, "Fondue")
+        _txn(session, currencies["CHF"], accounts["Card CHF"], day, 5000, "Refund")
+        session.commit()
+
+    with session_factory() as session:
+        totals = queries.get_totals(session)
+
+    # -100.00 CHF * 1.10 = -110.00 USD (-11000 minor); +50.00 CHF * 1.10 = +55.00 USD.
+    assert totals.outflow_minor == -2000 + -11000
+    assert totals.inflow_minor == 5500
+    assert totals.net_minor == totals.outflow_minor + totals.inflow_minor
+    assert totals.unconverted_count == 0
+
+
+def test_get_totals_converts_each_row_at_its_own_dates_rate(tmp_path):
+    """Rates move; a whole window converted at one rate would be quietly wrong."""
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        currencies, accounts = _seed_two_currencies(session)
+        early, late = date(2025, 6, 1), date(2025, 9, 1)
+        rates.record_rate(session, early, "CHF", "USD", Decimal("1.00"), rates.ECB)
+        rates.record_rate(session, late, "CHF", "USD", Decimal("2.00"), rates.ECB)
+        _txn(session, currencies["CHF"], accounts["Card CHF"], early, -10000, "Early")
+        _txn(session, currencies["CHF"], accounts["Card CHF"], late, -10000, "Later")
+        session.commit()
+
+    with session_factory() as session:
+        totals = queries.get_totals(session)
+
+    # -100.00 * 1.00 and -100.00 * 2.00 -- not 20000 minor summed first at either rate.
+    assert totals.outflow_minor == -10000 + -20000
+
+
+def test_get_totals_counts_unconvertible_rows_without_dropping_or_zeroing_them(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        currencies, accounts = _seed_two_currencies(session)
+        day = date(2025, 6, 1)
+        # No CHF->USD rate recorded at all for this day.
+        _txn(session, currencies["USD"], accounts["Checking"], day, -2000, "Snack")
+        _txn(session, currencies["CHF"], accounts["Card CHF"], day, -10000, "Fondue")
+        session.commit()
+
+    with session_factory() as session:
+        totals = queries.get_totals(session)
+
+    assert totals.count == 2  # both rows are still real, counted transactions
+    assert totals.outflow_minor == -2000  # the unconvertible CHF leg contributes nothing
+    assert totals.unconverted_count == 1  # ...but is never silently zeroed or dropped
+
+
+def test_get_totals_home_currency_argument_can_target_a_non_usd_currency(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        currencies, accounts = _seed_two_currencies(session)
+        day = date(2025, 6, 1)
+        rates.record_rate(session, day, "USD", "CHF", Decimal("0.80"), rates.ECB)
+        _txn(session, currencies["USD"], accounts["Checking"], day, -10000, "Snack")
+        session.commit()
+
+    with session_factory() as session:
+        totals = queries.get_totals(session, home_currency="CHF")
+
+    # -100.00 USD * 0.80 = -80.00 CHF = -8000 minor.
+    assert totals.outflow_minor == -8000
+
+
+def test_get_category_totals_convert_before_summing(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        currencies, accounts = _seed_two_currencies(session)
+        dining = Category(value="Dining")
+        session.add(dining)
+        session.flush()
+        day = date(2025, 6, 1)
+        rates.record_rate(session, day, "CHF", "USD", Decimal("1.10"), rates.ECB)
+        _txn(session, currencies["USD"], accounts["Checking"], day, -2000, "Snack",
+             category=dining)
+        _txn(session, currencies["CHF"], accounts["Card CHF"], day, -10000, "Fondue",
+             category=dining)
+        session.commit()
+
+    with session_factory() as session:
+        rows = queries.get_category_totals(session)
+
+    assert len(rows) == 1
+    assert rows[0].name == "Dining"
+    assert rows[0].count == 2
+    assert rows[0].outflow_minor == -2000 + -11000
+    assert rows[0].total_minor == rows[0].outflow_minor
+
+
+def test_get_category_totals_leave_an_unconvertible_categorys_money_out(tmp_path):
+    """A category holding an unconvertible row still shows its (real) count, exactly
+    like a category holding a transfer -- money missing, row not."""
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        currencies, accounts = _seed_two_currencies(session)
+        dining = Category(value="Dining")
+        session.add(dining)
+        session.flush()
+        day = date(2025, 6, 1)
+        # No rate recorded.
+        _txn(session, currencies["CHF"], accounts["Card CHF"], day, -10000, "Fondue",
+             category=dining)
+        session.commit()
+
+    with session_factory() as session:
+        rows = queries.get_category_totals(session)
+
+    assert len(rows) == 1
+    assert rows[0].count == 1
+    assert rows[0].outflow_minor == 0
+    assert rows[0].total_minor == 0
+
+
+def test_get_bucket_totals_convert_before_summing(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        currencies, accounts = _seed_two_currencies(session)
+        day = date(2025, 6, 15)
+        rates.record_rate(session, day, "CHF", "USD", Decimal("1.10"), rates.ECB)
+        _txn(session, currencies["USD"], accounts["Checking"], day, -2000, "Snack")
+        _txn(session, currencies["CHF"], accounts["Card CHF"], day, -10000, "Fondue")
+        session.commit()
+
+    with session_factory() as session:
+        rows = queries.get_bucket_totals(session, "month")
+
+    assert [r.key for r in rows] == ["2025-06"]
+    assert rows[0].count == 2
+    assert rows[0].outflow_minor == -2000 + -11000
+
+
+def test_build_report_and_spending_series_surface_the_unconverted_count(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        currencies, accounts = _seed_two_currencies(session)
+        day = date(2025, 6, 1)
+        # No rate recorded for CHF at all.
+        _txn(session, currencies["USD"], accounts["Checking"], day, -2000, "Snack")
+        _txn(session, currencies["CHF"], accounts["Card CHF"], day, -10000, "Fondue")
+        session.commit()
+
+    window = _custom("2025-06-01", "2025-06-30")
+    with session_factory() as session:
+        report = stats.build_report(session, window)
+        series = stats.spending_series(session, window, "month")
+
+    assert report.count == 2
+    assert report.outflow_minor == -2000
+    assert report.unconverted_count == 1
+    # The bucket itself still shows the transaction was there, just without its money.
+    assert [s.count for s in series] == [2]
+    assert [s.outflow_minor for s in series] == [-2000]

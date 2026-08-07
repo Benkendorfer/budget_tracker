@@ -66,6 +66,23 @@ def _fmt_amount(minor: int, decimal_places: int = 2) -> str:
     return f"{minor / (10 ** decimal_places):,.{decimal_places}f}"
 
 
+def _fmt_amount_for(minor: int, currency: Optional[queries.CurrencyRow]) -> str:
+    """Format ``minor`` in *its own* currency: the right decimal places, and its symbol.
+
+    ``currency`` is ``None`` for a figure with no single obvious currency — a total
+    summed across a filter that may mix currencies, or a code this database has no
+    Currency row for. Either way a guess would be worse than the plain two-decimal
+    figure this falls back to: showing JPY's zero decimal places on a EUR/CHF mix, or a
+    symbol that names the wrong currency, is a worse error than showing no symbol at
+    all. Callers that know which single currency they are summing (e.g. once
+    home-currency conversion lands) can pass that currency's row instead.
+    """
+    if currency is None:
+        return _fmt_amount(minor)
+    number = _fmt_amount(minor, currency.decimal_places)
+    return f"{currency.symbol}{number}" if currency.symbol else number
+
+
 def _truncate(text: str, width: int) -> str:
     return text if len(text) <= width else text[: width - 1] + "…"
 
@@ -105,11 +122,14 @@ PIE_COLORS = (
 )
 
 
-def _amount_cell(minor: int, is_transfer: bool = False) -> Text:
+def _amount_cell(
+    minor: int, is_transfer: bool = False, currency: Optional[queries.CurrencyRow] = None
+) -> Text:
+    text = _fmt_amount_for(minor, currency)
     if is_transfer:
-        return Text(_fmt_amount(minor), style=TRANSFER_STYLE, justify="right")
+        return Text(text, style=TRANSFER_STYLE, justify="right")
     style = "red" if minor < 0 else "green"
-    return Text(_fmt_amount(minor), style=style, justify="right")
+    return Text(text, style=style, justify="right")
 
 
 def _txn_cell(text: str, width: int, is_transfer: bool) -> Text:
@@ -255,6 +275,10 @@ class BudgetApp(App):
         self._accounts: List[queries.AccountRow] = []
         self._vendors: List[queries.VendorRow] = []
         self._categories: List[queries.CategoryRow] = []
+        # By ISO code, so a per-row currency (queries.TxnRow.currency) can be formatted
+        # in its own decimal places and symbol rather than always assuming two decimal
+        # places — see _fmt_amount_for().
+        self._currencies: Dict[str, queries.CurrencyRow] = {}
         # Last labels rendered into each sidebar list, so _fill_list can skip a rebuild
         # that would produce exactly what is already on screen.
         self._list_labels: Dict[str, List[str]] = {}
@@ -406,7 +430,10 @@ class BudgetApp(App):
         table.add_column("Description", width=26)
         table.add_column("Vendor", width=18)
         table.add_column("Category", width=12)
-        table.add_column("Amount", width=12)
+        # Wide enough for a three-character symbol (CHF) plus a signed six-figure
+        # amount ("CHF-999,999.99" is 14) with a column to spare — see
+        # test_txns_amount_column_fits_a_symbol_and_a_six_figure_amount.
+        table.add_column("Amount", width=15)
         table.add_column("Account", width=18)
 
         rules = self.query_one("#rules", DataTable)
@@ -485,6 +512,7 @@ class BudgetApp(App):
             self._accounts = queries.get_accounts(session)
             self._vendors = queries.get_vendors(session)
             self._categories = queries.get_categories(session)
+            self._currencies = {c.code: c for c in queries.get_currencies(session)}
             self._rules = queries.get_rules(session)
             self._category_rules = queries.get_category_rules(session)
             txns = queries.get_transactions(
@@ -508,6 +536,10 @@ class BudgetApp(App):
         self._fill_list(
             "#categories",
             [
+                # Rolled up across every account a category has transactions in, so
+                # there is no single currency to format this in — it stays plain
+                # two-decimal-place formatting rather than guessing one (see
+                # _fmt_amount_for's docstring).
                 f"{'  ' * c.depth}{c.name} ({c.count})  {_fmt_amount(c.total_minor)}"
                 for c in self._categories
             ],
@@ -568,7 +600,9 @@ class BudgetApp(App):
                 _txn_cell(marked, 26, txn.is_transfer),
                 _txn_cell(txn.vendor, 18, txn.is_transfer),
                 _txn_cell(txn.category, 12, txn.is_transfer),
-                _amount_cell(txn.amount_minor, txn.is_transfer),
+                _amount_cell(
+                    txn.amount_minor, txn.is_transfer, self._currencies.get(txn.currency)
+                ),
                 _txn_cell(txn.account, 18, txn.is_transfer),
             )
 

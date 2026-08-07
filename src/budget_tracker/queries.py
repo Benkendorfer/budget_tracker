@@ -13,11 +13,12 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from sqlalchemy import case, func, or_, select, true
 from sqlalchemy.orm import Session, selectinload
 
+from . import rates
 from .models import (
     Account,
     Category,
@@ -29,6 +30,11 @@ from .models import (
     VendorName,
     VendorRule,
 )
+
+# Aggregates convert every amount into this currency before summing (see
+# ``rates.convert``). A module-level constant rather than hard-coding "USD" at each
+# call site, so every caller that wants the default gets the same one.
+HOME_CURRENCY = "USD"
 
 VendorFilter = Tuple[str, int]
 # Inclusive on both ends, so a one-day range is ``(day, day)``.
@@ -151,6 +157,10 @@ class Totals:
     outflow_minor: int
     inflow_minor: int
     transfer_count: int = 0  # of `count`, how many were excluded from the money figures
+    # Of the real (non-transfer) rows, how many had no exchange rate to `home_currency`
+    # for their posted date and so are missing from net/outflow/inflow entirely -- never
+    # silently zeroed. See `get_totals`.
+    unconverted_count: int = 0
 
 
 @dataclass
@@ -495,6 +505,24 @@ def get_transactions(
     return result
 
 
+def _currencies_present(session: Session, base, condition=None) -> Set[str]:
+    """Currency codes among ``base``'s rows, optionally narrowed by ``condition``.
+
+    Used to decide whether an aggregate can take the single-currency fast path (see
+    ``get_totals``): with everything already in ``home_currency``, no rate lookup or
+    per-row conversion is needed and the original single-query plan runs unchanged.
+    """
+    query = (
+        select(Currency.value)
+        .select_from(base)
+        .join(Currency, Currency.id == base.c.currency_id)
+        .distinct()
+    )
+    if condition is not None:
+        query = query.where(condition)
+    return set(session.scalars(query))
+
+
 def get_totals(
     session: Session,
     account_id: Optional[int] = None,
@@ -502,6 +530,7 @@ def get_totals(
     vendor_filter: Optional[VendorFilter] = None,
     text_filter: Optional[TextFilter] = None,
     date_range: Optional[DateRange] = None,
+    home_currency: str = HOME_CURRENCY,
 ) -> Totals:
     base = _txn_query(
         account_id, category_id, vendor_filter, text_filter, date_range
@@ -522,15 +551,61 @@ def get_totals(
     # (rather than relying on the legs canceling out) also keeps the figures right
     # when a filter selects only one leg.
     real = base.c.transfer_group_id.is_(None)
-    total = lambda condition: (  # noqa: E731 - reads better than three near-copies
-        session.scalar(select(func.coalesce(func.sum(amount), 0)).where(condition)) or 0
-    )
+
+    # Fast path: everything real is already in home_currency (true for every database
+    # today), so this is exactly the query that ran before conversion existed.
+    if _currencies_present(session, base, real) <= {home_currency}:
+        total = lambda condition: (  # noqa: E731 - reads better than three near-copies
+            session.scalar(select(func.coalesce(func.sum(amount), 0)).where(condition)) or 0
+        )
+        return Totals(
+            count=count,
+            net_minor=total(real),
+            outflow_minor=total(real & (amount < 0)),
+            inflow_minor=total(real & (amount > 0)),
+            transfer_count=transfer_count,
+        )
+
+    # Slow path: more than one currency among the real rows. Summing centimes into
+    # cents would be meaningless, so amounts are grouped by (currency, posted_date) --
+    # small enough to pull into Python -- and converted at each day's own rate rather
+    # than one rate for the whole window, since rates move.
+    groups = session.execute(
+        select(
+            Currency.value,
+            base.c.posted_date,
+            func.count(),
+            func.coalesce(func.sum(case((amount < 0, amount), else_=0)), 0),
+            func.coalesce(func.sum(case((amount > 0, amount), else_=0)), 0),
+        )
+        .select_from(base)
+        .join(Currency, Currency.id == base.c.currency_id)
+        .where(real)
+        .group_by(Currency.value, base.c.posted_date)
+    ).all()
+
+    outflow_minor = 0
+    inflow_minor = 0
+    unconverted_count = 0
+    for currency, day, group_count, outflow_sum, inflow_sum in groups:
+        converted_outflow = rates.convert(session, outflow_sum, currency, home_currency, day)
+        converted_inflow = rates.convert(session, inflow_sum, currency, home_currency, day)
+        # A missing rate is missing for the whole (currency, day) group -- rate_on does
+        # not depend on the amount -- so either both convert or neither does. Never
+        # guessed as zero: the group is left out and its rows counted as unconverted.
+        if converted_outflow is None or converted_inflow is None:
+            unconverted_count += group_count
+            continue
+        outflow_minor += converted_outflow
+        inflow_minor += converted_inflow
+
     return Totals(
         count=count,
-        net_minor=total(real),
-        outflow_minor=total(real & (amount < 0)),
-        inflow_minor=total(real & (amount > 0)),
+        net_minor=outflow_minor + inflow_minor,
+        outflow_minor=outflow_minor,
+        inflow_minor=inflow_minor,
         transfer_count=transfer_count,
+        unconverted_count=unconverted_count,
     )
 
 
@@ -556,6 +631,7 @@ def get_category_totals(
     vendor_filter: Optional[VendorFilter] = None,
     text_filter: Optional[TextFilter] = None,
     date_range: Optional[DateRange] = None,
+    home_currency: str = HOME_CURRENCY,
 ) -> List[CategoryTotal]:
     """Per-category rows, most-spent first.
 
@@ -572,30 +648,87 @@ def get_category_totals(
         account_id, category_id, vendor_filter, text_filter, date_range
     ).subquery()
     amount = base.c.value_minor
-    total, outflow, inflow = _signed_sums(amount, base.c.transfer_group_id.is_(None))
-    rows = session.execute(
+    real = base.c.transfer_group_id.is_(None)
+
+    if _currencies_present(session, base, real) <= {home_currency}:
+        total, outflow, inflow = _signed_sums(amount, real)
+        rows = session.execute(
+            select(
+                base.c.category_id,
+                func.coalesce(Category.value, ""),
+                func.count(),
+                total,
+                outflow,
+                inflow,
+                Category.parent_id,
+            )
+            .select_from(base)
+            .join(Category, Category.id == base.c.category_id, isouter=True)
+            .group_by(base.c.category_id)
+            # Outflow is negative, so ascending is biggest-spend-first.
+            .order_by(outflow, func.coalesce(Category.value, ""))
+        ).all()
+        return [
+            CategoryTotal(
+                id=r[0], name=r[1], count=r[2], total_minor=r[3], outflow_minor=r[4],
+                inflow_minor=r[5], parent_id=r[6],
+            )
+            for r in rows
+        ]
+
+    # Slow path: category id/name/count come from the same query as always (currency
+    # never affects counting), but money is grouped by (category, currency,
+    # posted_date), converted per group at that day's rate, and summed in Python.
+    info_rows = session.execute(
         select(
             base.c.category_id,
             func.coalesce(Category.value, ""),
             func.count(),
-            total,
-            outflow,
-            inflow,
             Category.parent_id,
         )
         .select_from(base)
         .join(Category, Category.id == base.c.category_id, isouter=True)
         .group_by(base.c.category_id)
-        # Outflow is negative, so ascending is biggest-spend-first.
-        .order_by(outflow, func.coalesce(Category.value, ""))
     ).all()
-    return [
-        CategoryTotal(
-            id=r[0], name=r[1], count=r[2], total_minor=r[3], outflow_minor=r[4],
-            inflow_minor=r[5], parent_id=r[6],
+
+    money_groups = session.execute(
+        select(
+            base.c.category_id,
+            Currency.value,
+            base.c.posted_date,
+            func.count(),
+            func.coalesce(func.sum(case((amount < 0, amount), else_=0)), 0),
+            func.coalesce(func.sum(case((amount > 0, amount), else_=0)), 0),
         )
-        for r in rows
+        .select_from(base)
+        .join(Currency, Currency.id == base.c.currency_id)
+        .where(real)
+        .group_by(base.c.category_id, Currency.value, base.c.posted_date)
+    ).all()
+
+    sums: Dict[Optional[int], Tuple[int, int]] = defaultdict(lambda: (0, 0))
+    for cat_id, currency, day, _group_count, outflow_sum, inflow_sum in money_groups:
+        converted_outflow = rates.convert(session, outflow_sum, currency, home_currency, day)
+        converted_inflow = rates.convert(session, inflow_sum, currency, home_currency, day)
+        if converted_outflow is None or converted_inflow is None:
+            continue  # missing rate: this group's money is left out, not zeroed
+        cur_outflow, cur_inflow = sums[cat_id]
+        sums[cat_id] = (cur_outflow + converted_outflow, cur_inflow + converted_inflow)
+
+    results = [
+        CategoryTotal(
+            id=cat_id,
+            name=name,
+            count=count,
+            total_minor=sums[cat_id][0] + sums[cat_id][1],
+            outflow_minor=sums[cat_id][0],
+            inflow_minor=sums[cat_id][1],
+            parent_id=parent_id,
+        )
+        for cat_id, name, count, parent_id in info_rows
     ]
+    results.sort(key=lambda r: (r.outflow_minor, r.name))
+    return results
 
 
 def get_bucket_totals(
@@ -606,6 +739,7 @@ def get_bucket_totals(
     vendor_filter: Optional[VendorFilter] = None,
     text_filter: Optional[TextFilter] = None,
     date_range: Optional[DateRange] = None,
+    home_currency: str = HOME_CURRENCY,
 ) -> List[BucketTotal]:
     """Money grouped into day/week/month buckets, chronologically. Transfers excluded.
 
@@ -621,19 +755,62 @@ def get_bucket_totals(
         account_id, category_id, vendor_filter, text_filter, date_range
     ).subquery()
     amount = base.c.value_minor
-    _total, outflow, inflow = _signed_sums(amount)
-    key = func.strftime(key_format, base.c.posted_date)
-    label = func.strftime(label_format, base.c.posted_date)
-    rows = session.execute(
-        select(key, label, func.count(), outflow, inflow)
+    real = base.c.transfer_group_id.is_(None)
+
+    if _currencies_present(session, base, real) <= {home_currency}:
+        _total, outflow, inflow = _signed_sums(amount)
+        key = func.strftime(key_format, base.c.posted_date)
+        label = func.strftime(label_format, base.c.posted_date)
+        rows = session.execute(
+            select(key, label, func.count(), outflow, inflow)
+            .select_from(base)
+            .where(real)
+            .group_by(key, label)
+            .order_by(key)
+        ).all()
+        return [
+            BucketTotal(key=r[0], label=r[1], count=r[2], outflow_minor=r[3], inflow_minor=r[4])
+            for r in rows
+        ]
+
+    # Slow path: grouped by (currency, posted_date) -- finer than the bucket itself --
+    # so each day converts at its own rate before being rolled up into its bucket.
+    groups = session.execute(
+        select(
+            Currency.value,
+            base.c.posted_date,
+            func.count(),
+            func.coalesce(func.sum(case((amount < 0, amount), else_=0)), 0),
+            func.coalesce(func.sum(case((amount > 0, amount), else_=0)), 0),
+        )
         .select_from(base)
-        .where(base.c.transfer_group_id.is_(None))
-        .group_by(key, label)
-        .order_by(key)
+        .join(Currency, Currency.id == base.c.currency_id)
+        .where(real)
+        .group_by(Currency.value, base.c.posted_date)
     ).all()
+
+    # (count, outflow, inflow) per bucket key, built up from the converted day groups.
+    # Count is added unconditionally -- a real transaction that could not be converted
+    # is still a real transaction, exactly as a category holding one still shows its
+    # count (see get_category_totals) -- only its money is left out.
+    buckets: Dict[str, List[int]] = {}
+    labels: Dict[str, str] = {}
+    for currency, day, group_count, outflow_sum, inflow_sum in groups:
+        key = day.strftime(key_format)
+        labels[key] = day.strftime(label_format)
+        count, outflow, inflow = buckets.setdefault(key, [0, 0, 0])
+        converted_outflow = rates.convert(session, outflow_sum, currency, home_currency, day)
+        converted_inflow = rates.convert(session, inflow_sum, currency, home_currency, day)
+        if converted_outflow is None or converted_inflow is None:
+            buckets[key] = [count + group_count, outflow, inflow]
+            continue
+        buckets[key] = [
+            count + group_count, outflow + converted_outflow, inflow + converted_inflow
+        ]
+
     return [
-        BucketTotal(key=r[0], label=r[1], count=r[2], outflow_minor=r[3], inflow_minor=r[4])
-        for r in rows
+        BucketTotal(key=key, label=labels[key], count=v[0], outflow_minor=v[1], inflow_minor=v[2])
+        for key, v in sorted(buckets.items())
     ]
 
 

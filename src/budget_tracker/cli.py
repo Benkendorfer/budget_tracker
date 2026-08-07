@@ -784,14 +784,14 @@ def _cmd_rates(args: argparse.Namespace) -> int:
                 return 1
             print(f"Range: {start.isoformat()}..{end.isoformat()}")
 
-            # A single base against every other currency on file: rate_on can derive
-            # the inverse of a cached pair, but not a third currency from two others, so
-            # this covers every pair only when one side of each is the base.
+            # Base on the currency totals are actually reported in. rate_on can invert
+            # a cached pair but cannot chain one pair through another, so basing on
+            # anything else would leave the conversions that matter unreachable: with a
+            # USD home and a CHF base, EUR -> USD could not be resolved at all. Basing
+            # here means every X -> home lookup is either cached or a single inversion.
             currencies = sorted({row.currency for row in queries.get_accounts(session)})
-            base = DEFAULT_CURRENCY_CODE if DEFAULT_CURRENCY_CODE in currencies else (
-                currencies[0] if currencies else None
-            )
-            quotes = [c for c in currencies if c != base] if base else []
+            base = queries.HOME_CURRENCY
+            quotes = [c for c in currencies if c != base]
             if not quotes:
                 print(f"Only one currency on file ({base or 'none'}); nothing to fetch.")
                 return 0

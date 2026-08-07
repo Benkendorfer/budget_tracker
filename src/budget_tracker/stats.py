@@ -20,7 +20,14 @@ from sqlalchemy.orm import Session
 
 from . import queries
 from .models import Category
-from .queries import BUCKET_FORMATS, BucketTotal, CategoryTotal, TextFilter, VendorFilter
+from .queries import (
+    BUCKET_FORMATS,
+    HOME_CURRENCY,
+    BucketTotal,
+    CategoryTotal,
+    TextFilter,
+    VendorFilter,
+)
 
 UNCATEGORISED = "Uncategorised"
 
@@ -180,6 +187,10 @@ class Report:
     # row's own net contribution (``min(0, total_minor)``). Exposed so a UI can render a
     # "100%" total row without re-summing ``categories`` itself.
     net_spend_minor: int = 0
+    # Of the real rows, how many had no exchange rate to the report's home currency for
+    # their posted date and so are missing from every money figure above -- see
+    # ``queries.Totals.unconverted_count``, which this is copied from.
+    unconverted_count: int = 0
 
     @property
     def avg_month_outflow_minor(self) -> int:
@@ -362,6 +373,7 @@ def build_report(
     category_id: Optional[int] = None,
     vendor_filter: Optional[VendorFilter] = None,
     text_filter: Optional[TextFilter] = None,
+    home_currency: str = HOME_CURRENCY,
 ) -> Report:
     """Totals and per-category rows for ``window``, honoring the active filters.
 
@@ -375,6 +387,7 @@ def build_report(
         vendor_filter=vendor_filter,
         text_filter=text_filter,
         date_range=date_range,
+        home_currency=home_currency,
     )
     totals = queries.get_totals(session, **filters)
     rows = queries.get_category_totals(session, **filters)
@@ -395,6 +408,7 @@ def build_report(
         inflow_minor=totals.inflow_minor,
         transfer_count=totals.transfer_count,
         net_spend_minor=net_spend_minor,
+        unconverted_count=totals.unconverted_count,
     )
 
 
@@ -425,6 +439,7 @@ def spending_series(
     category_id: Optional[int] = None,
     vendor_filter: Optional[VendorFilter] = None,
     text_filter: Optional[TextFilter] = None,
+    home_currency: str = HOME_CURRENCY,
 ) -> List[BucketTotal]:
     """The window's money bucketed for a bar chart, with empty buckets zero-filled.
 
@@ -439,6 +454,7 @@ def spending_series(
         vendor_filter=vendor_filter,
         text_filter=text_filter,
         date_range=(window.start, window.end),
+        home_currency=home_currency,
     )
     key_format, label_format = BUCKET_FORMATS[bucket]  # get_bucket_totals validated it
     found: Dict[str, BucketTotal] = {t.key: t for t in totals}

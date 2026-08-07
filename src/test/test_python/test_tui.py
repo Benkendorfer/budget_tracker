@@ -20,6 +20,23 @@ from budget_tracker.models import Account, Currency, Transaction
 from helpers import learn_format
 from budget_tracker.tui import FOLD_INDICATOR, TRANSFER_MARK, BudgetApp, _fmt_amount
 
+@pytest.fixture(autouse=True)
+def _keep_notifications_for_the_length_of_a_test(monkeypatch):
+    """Stop Textual expiring notifications while a test is still looking at them.
+
+    ``App.NOTIFICATION_TIMEOUT`` is 5 seconds and ``Notifications.__iter__`` reaps
+    expired entries as a side effect of iterating, so roughly thirty assertions in this
+    file that read ``app._notifications`` can find it empty purely because the machine
+    was busy — the notification was raised, then quietly deleted before it was read.
+    That surfaced as a single unreproducible failure in a full-suite run that passed
+    when the same test ran alone.
+
+    Nothing about what the tests assert changes; this only stops the wall clock from
+    being part of the assertion.
+    """
+    monkeypatch.setattr(BudgetApp, "NOTIFICATION_TIMEOUT", 3600, raising=False)
+
+
 CSV = """Transaction Date,Posted Date,Card No.,Description,Category,Debit,Credit
 2025-07-01,2025-07-02,8207,COFFEE SHOP A,Dining,3.00,
 2025-07-01,2025-07-02,8207,COFFEE SHOP B,Dining,4.00,
@@ -4672,3 +4689,134 @@ def test_a_new_filter_does_not_disturb_an_open_pie_until_reload(tmp_path, monkey
     panel, names = asyncio.run(run())
     assert panel == "pie"
     assert set(names) == {"Food", "Travel"}
+
+
+def _seed_jpy_account(tmp_path, monkeypatch):
+    """A single JPY transaction. JPY has no minor unit (Currency.decimal_places=0), so
+    100 minor units is 100 yen — a formatter that assumed two decimal places, the way
+    _fmt_amount's default does, would render it as 1.00.
+    """
+    db_path = tmp_path / "jpy.db"
+    engine = get_engine(db_path)
+    init_db(engine)
+    session_factory = get_sessionmaker(engine)
+    with session_factory() as session:
+        jpy = Currency(value="JPY", symbol="¥", decimal_places=0)
+        session.add(jpy)
+        session.flush()
+        account = Account(name="Yen Wallet", currency_id=jpy.id)
+        session.add(account)
+        session.flush()
+        session.add(
+            Transaction(
+                account_id=account.id,
+                currency_id=jpy.id,
+                posted_date=datetime.date(2025, 3, 1),
+                description="Yen snack",
+                raw_description="Yen snack",
+                value_minor=100,
+                import_hash="jpy-100",
+            )
+        )
+        session.commit()
+    monkeypatch.setenv("BUDGET_DB", str(db_path))
+    return session_factory
+
+
+def test_zero_decimal_currency_shows_whole_units_not_cents(tmp_path, monkeypatch):
+    _seed_jpy_account(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            return _rows_of(app, "txns")
+
+    rows = asyncio.run(run())
+    assert len(rows) == 1
+    # Not "1.00" — JPY has no minor unit, so 100 minor units is 100 yen.
+    assert rows[0][4] == "¥100"
+
+
+def _seed_multi_currency(tmp_path, monkeypatch):
+    """Three accounts, one per currency: USD (2dp, one-character symbol), JPY (0dp, no
+    minor units), and CHF (2dp, three-character symbol) — so the transactions table has
+    to format each row in its own currency rather than assuming two decimal places or a
+    one-character symbol. The CHF amount is six figures, the shape most likely to clip
+    once a symbol is added to the column (see
+    test_txns_amount_column_fits_a_symbol_and_a_six_figure_amount).
+    """
+    db_path = tmp_path / "multi.db"
+    engine = get_engine(db_path)
+    init_db(engine)
+    session_factory = get_sessionmaker(engine)
+    with session_factory() as session:
+        usd = Currency(value="USD", symbol="$", decimal_places=2)
+        jpy = Currency(value="JPY", symbol="¥", decimal_places=0)
+        chf = Currency(value="CHF", symbol="CHF", decimal_places=2)
+        session.add_all([usd, jpy, chf])
+        session.flush()
+        checking = Account(name="Checking", currency_id=usd.id)
+        yen = Account(name="Yen Wallet", currency_id=jpy.id)
+        swiss = Account(name="Swiss", currency_id=chf.id)
+        session.add_all([checking, yen, swiss])
+        session.flush()
+
+        def txn(account, currency, day, amount, description):
+            session.add(
+                Transaction(
+                    account_id=account.id,
+                    currency_id=currency.id,
+                    posted_date=day,
+                    description=description,
+                    raw_description=description,
+                    value_minor=amount,
+                    import_hash=f"multi-{description}",
+                )
+            )
+
+        txn(checking, usd, datetime.date(2025, 3, 3), -4200, "US coffee")
+        txn(yen, jpy, datetime.date(2025, 3, 2), -1500, "Japan lunch")
+        # A six-figure, signed CHF amount: the widest realistic case for a
+        # three-character symbol beside the Amount column.
+        txn(swiss, chf, datetime.date(2025, 3, 1), -99_999_999, "Swiss rent")
+        session.commit()
+    monkeypatch.setenv("BUDGET_DB", str(db_path))
+    return session_factory
+
+
+def test_txns_table_formats_each_row_in_its_own_currency(tmp_path, monkeypatch):
+    _seed_multi_currency(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            await pilot.pause()
+            return _rows_of(app, "txns")
+
+    rows = asyncio.run(run())
+    by_description = {row[1]: row[4] for row in rows}
+    assert by_description["US coffee"] == "$-42.00"
+    # JPY has no minor unit: 1,500 minor units is 1,500 yen, not 15.00.
+    assert by_description["Japan lunch"] == "¥-1,500"
+    assert by_description["Swiss rent"] == "CHF-999,999.99"
+
+
+def test_txns_amount_column_fits_a_symbol_and_a_six_figure_amount(tmp_path, monkeypatch):
+    """Renders the real compositor at 130 columns with a three-character symbol (CHF)
+    beside a signed six-figure amount — the widest realistic value the widened Amount
+    column has to hold without clipping the digits (see test_txns_table_formats_...
+    above for the value itself; this checks it actually reaches the screen intact).
+    """
+    _seed_multi_currency(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            await pilot.pause()
+            buffer = io.StringIO()
+            Console(file=buffer, width=130).print(app.screen._compositor)
+            return buffer.getvalue()
+
+    rendered = asyncio.run(run())
+    assert "CHF-999,999.99" in rendered
