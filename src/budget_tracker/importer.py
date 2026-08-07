@@ -246,9 +246,26 @@ def inspect_csv(session: Session, path: Path) -> ImportCandidate:
     return ImportCandidate(path=path, row_count=len(rows), format_name=fmt.name)
 
 
+def _dict_reader(text: str) -> "csv.DictReader":
+    """A reader whose header is the first line that actually names any column.
+
+    An export edited in a spreadsheet can carry blank leading rows — lines of bare
+    commas. csv would take the first of those as the header, name every column "", and
+    leave the setup wizard asking which of ten empty strings holds the amount.
+
+    Lines are dropped whole and the remainder rejoined untouched, so a quoted field
+    containing a newline further down the file survives.
+    """
+    lines = text.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        if any((cell or "").strip() for cell in next(csv.reader([line]), [])):
+            return csv.DictReader(io.StringIO("".join(lines[index:])))
+    return csv.DictReader(io.StringIO(text))  # nothing but blanks; let csv report it
+
+
 def read_header_and_rows(path: Path):
     """Return ``(fieldnames, rows)`` for a CSV, for format detection and inference."""
-    reader = csv.DictReader(io.StringIO(_read_text(Path(path))))
+    reader = _dict_reader(_read_text(Path(path)))
     return list(reader.fieldnames or []), list(reader)
 
 
@@ -268,7 +285,9 @@ def import_csv(
     passing it for other formats overrides the account they would have derived.
     """
     path = Path(path)
-    reader = csv.DictReader(io.StringIO(_read_text(path)))
+    # Same reader as inference used, or the two would disagree about which line is the
+    # header and a format learned from this file would not match it on import.
+    reader = _dict_reader(_read_text(path))
     fieldnames = reader.fieldnames or []
     if fmt is None:
         fmt = detect(session, fieldnames)

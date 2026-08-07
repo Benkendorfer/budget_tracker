@@ -132,6 +132,11 @@ CURRENCY_CARD_CSV = """Transaction Date,Posted Date,Card No.,Description,Amount
 2026-07-03,2026-07-04,1234,PAYMENT RECEIVED,"-$1,000.00"
 """
 
+# The same layout, but with the header pushed down by blank leading rows, as an export
+# saved out of a spreadsheet arrives. csv would name every column "" from the first line.
+PREAMBLE_LEDGER_CSV = ",,,,,\n,,,,,\n,,,,,\nPosting Date,Description,Debit,Credit,,\n" \
+    "20260722,TRANSFER IN,,200,,\n20260727,TRANSFER OUT,-100,,,\n"
+
 # Compact dates, a debit column that is already negative, a blank row left behind by a
 # spreadsheet, and the trailing empty columns such an edit pads every line with.
 COMPACT_LEDGER_CSV = """Posting Date,Description,Debit,Credit,,
@@ -240,6 +245,41 @@ def test_import_handles_currency_formatted_amounts(tmp_path):
         "1234", "2026-07-01", "2026-07-02", "COFFEE SHOP", "$617.66", 0
     )
     assert expected in hashes  # the literal "$" is in the hash, not the parsed amount
+
+
+def test_header_is_found_below_blank_leading_rows(tmp_path):
+    """A spreadsheet-saved export can begin with rows of bare commas. csv takes the
+    first line as the header, so every column comes out named "" and the setup wizard
+    asks which of several empty strings holds the amount — unanswerable.
+
+    Inference and import must agree on which line is the header, or a format learned
+    from a file would fail to match that same file on import.
+    """
+    session_factory = _session_factory(tmp_path)
+    path = _write(tmp_path, "preamble.csv", PREAMBLE_LEDGER_CSV)
+
+    fieldnames, rows = read_header_and_rows(path)
+    assert fieldnames[:4] == ["Posting Date", "Description", "Debit", "Credit"]
+    assert len(rows) == 2
+
+    inference = formats.infer("preamble", fieldnames, rows)
+    with session_factory() as session:
+        formats.save_format(
+            session,
+            formats.from_dict({
+                **inference.values,
+                "signature": list(fieldnames),
+                "dedup_columns": ["Posting Date", "Description", "Debit", "Credit"],
+            }),
+        )
+        session.commit()
+        # No fmt= : this also proves detect() sees the same header inference did.
+        result = import_csv(session, path, account_name="Brokerage")
+    assert result.inserted == 2
+
+    with session_factory() as session:
+        amounts = {t.description: t.amount_minor for t in queries.get_transactions(session)}
+    assert amounts == {"TRANSFER IN": 20000, "TRANSFER OUT": -10000}
 
 
 def test_import_skips_blank_rows_and_reads_a_signed_debit_column(tmp_path):
