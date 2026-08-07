@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Set
 
 from rich.text import Text
 from textual.app import App, ComposeResult
@@ -99,6 +99,55 @@ def _range_label(date_range: queries.DateRange) -> str:
     return f"{start}→{tail}"
 
 
+# A collapsed category shows this before its name; an expanded or leaf row shows nothing,
+# so the default (fully expanded) rendering is byte-for-byte what it was before folding
+# existed.
+FOLD_INDICATOR = "▸"
+
+
+def _foldable_category_ids(cats: List[stats.CategoryStat]) -> Set[int]:
+    """category_ids that own at least one child in ``cats``.
+
+    ``cats`` is depth-first (see stats.Report.categories), so a row has children exactly
+    when the next row is deeper.
+    """
+    return {
+        cats[i].category_id
+        for i in range(len(cats) - 1)
+        if cats[i + 1].depth > cats[i].depth
+    }
+
+
+def _visible_stats(
+    cats: List[stats.CategoryStat], collapsed: Set[int], foldable: Set[int]
+) -> List[stats.CategoryStat]:
+    """``cats`` with every collapsed row's subtree hidden — recursively.
+
+    A row is hidden while some ancestor still in ``collapsed`` is being skipped; the
+    parent itself always stays visible. Both a nested collapse and the parent's own are
+    remembered independently, keyed by category_id, so re-expanding a parent reveals
+    whatever fold state its children already had.
+    """
+    visible = []
+    hide_below_depth: Optional[int] = None
+    for stat in cats:
+        if hide_below_depth is not None:
+            if stat.depth > hide_below_depth:
+                continue
+            hide_below_depth = None
+        visible.append(stat)
+        if stat.category_id in foldable and stat.category_id in collapsed:
+            hide_below_depth = stat.depth
+    return visible
+
+
+def _stats_label(stat: stats.CategoryStat, collapsed: Set[int]) -> str:
+    indent = "  " * stat.depth
+    if stat.category_id in collapsed:
+        return f"{indent}{FOLD_INDICATOR} {stat.name}"
+    return f"{indent}{stat.name}"
+
+
 class BudgetApp(App):
     CSS = """
     #sidebar { width: 36; }
@@ -129,6 +178,12 @@ class BudgetApp(App):
         # left/right without a visible job of their own, so falling through there is safe.
         Binding("right", "drill_down", "Drill down", show=True, priority=True),
         Binding("left", "drill_up", "Back to stats", show=True, priority=True),
+        # Deliberately not priority=True: the #command Input holds focus most of the
+        # time, and a priority binding would steal the space bar before Input ever saw
+        # it, breaking ordinary typing. DataTable does not bind space itself, so a
+        # plain (non-priority) binding reaches this once it has bubbled past whatever
+        # is focused — see check_action() below for the "only on #stats_table" gate.
+        Binding("space", "toggle_stats_fold", "Fold/unfold", show=True),
         ("ctrl+c", "quit", "Quit"),
     ]
 
@@ -172,6 +227,15 @@ class BudgetApp(App):
         # The statistics window survives panel switches, so reload() can re-scope it.
         self.window: Optional[stats.Window] = None
         self._report: Optional[stats.Report] = None
+        # category_ids folded shut, keyed by id rather than table row so the state
+        # survives a rebuild (a new window, a filter, drilling in and back out) — see
+        # _fill_stats() and _visible_stats().
+        self._collapsed: Set[int] = set()
+        self._foldable_ids: Set[int] = set()
+        # Parallel to the rendered rows of #stats_table, *excluding* the closing TOTAL
+        # row — a row hidden by folding is not in it, so a table row index always maps
+        # back to the right CategoryStat (see _drill_into_category()).
+        self._stats_rows: List[stats.CategoryStat] = []
         self._range_pending = False  # awaiting a typed date range for the picker
         # Awaiting a typed "yes" to confirm a pending `unimport`; holds what it would
         # destroy, read up front so the confirmation names real numbers.
@@ -239,6 +303,12 @@ class BudgetApp(App):
             return self._panel == "stats"
         if action == "drill_up":
             return self._drilled_from_stats
+        if action == "toggle_stats_fold":
+            return (
+                self._panel == "stats"
+                and self.focused is not None
+                and self.focused.id == "stats_table"
+            )
         return True
 
     def on_mount(self) -> None:
@@ -434,18 +504,32 @@ class BudgetApp(App):
             )
 
     def _fill_stats(self) -> None:
+        """Render the report, honouring folded subtrees.
+
+        Folding never changes a number: every row already rolls up its descendants (see
+        stats.CategoryStat), so hiding them here only removes rows, never edits one.
+        self._stats_rows is rebuilt in lock-step with the table, so a table row index
+        always maps back to the CategoryStat it actually shows — see
+        _drill_into_category(), which depends on that and would otherwise open the
+        wrong category once rows can be hidden.
+        """
         table = self.query_one("#stats_table", DataTable)
         table.clear()
         if self._report is None:
+            self._stats_rows = []
+            self._foldable_ids = set()
             return
-        for stat in self._report.categories:
+        cats = self._report.categories
+        self._foldable_ids = _foldable_category_ids(cats)
+        self._stats_rows = _visible_stats(cats, self._collapsed, self._foldable_ids)
+        for stat in self._stats_rows:
             # Blank at depth 0: parent_share is identical to share there by construction
             # (see stats.CategoryStat.parent_share), so printing it twice is noise.
             parent_pct = (
                 "" if stat.depth == 0 else f"{abs(stat.parent_share) * 100:.1f}%"
             )
             table.add_row(
-                _truncate("  " * stat.depth + stat.name, 26),
+                _truncate(_stats_label(stat, self._collapsed), 26),
                 Text(str(stat.count), justify="right"),
                 _amount_cell(stat.total_minor),
                 _amount_cell(stat.avg_month_minor),
@@ -455,6 +539,29 @@ class BudgetApp(App):
                 Text(parent_pct, justify="right"),
             )
         self._add_stats_total_row(table)
+
+    def _toggle_fold(self, row: int) -> None:
+        """Space on a stats row: collapse/expand its subtree if it has one.
+
+        A leaf row, the TOTAL row, or an out-of-range row does nothing — not a crash,
+        not a notification, since space is not obviously "for" the stats table the way
+        enter or the arrows are.
+        """
+        if not 0 <= row < len(self._stats_rows):
+            return
+        stat = self._stats_rows[row]
+        if stat.category_id not in self._foldable_ids:
+            return
+        if stat.category_id in self._collapsed:
+            self._collapsed.discard(stat.category_id)
+        else:
+            self._collapsed.add(stat.category_id)
+        self._fill_stats()
+        # The toggled row's own subtree is what grows or shrinks, always right after it,
+        # so its own row index is unchanged by the toggle — the cursor can just stay put.
+        table = self.query_one("#stats_table", DataTable)
+        if 0 <= row < table.row_count:
+            table.move_cursor(row=row)
 
     def _add_stats_total_row(self, table: DataTable) -> None:
         """A closing total, summing the depth-0 rows above it.
@@ -960,6 +1067,7 @@ class BudgetApp(App):
                 f"  stats {RANGE_EXAMPLE})\n"
                 "  enter, or the right arrow, on a category row lists that window's\n"
                 "  transactions; the left arrow goes back to the breakdown\n"
+                "  space, on a category row with children, folds/unfolds its subtree\n"
                 "all — clear filters   refresh — reload   quit — exit\n"
                 "Click an account/vendor/category to filter.\n"
                 "ctrl+n / ctrl+t — prefill rename / categorize for the selected\n"
@@ -1517,9 +1625,9 @@ class BudgetApp(App):
         every transaction that category ever had, and the figures the user just clicked
         would not match the rows they are now looking at.
         """
-        if self._report is None or not 0 <= row < len(self._report.categories):
+        if self._report is None or not 0 <= row < len(self._stats_rows):
             return
-        stat = self._report.categories[row]
+        stat = self._stats_rows[row]
         # Remember what the drill-down is about to overwrite, and where it came from, so
         # a left arrow can undo exactly this rather than blanking filters the user set
         # themselves, and can put the cursor back where it was.
@@ -1630,6 +1738,11 @@ class BudgetApp(App):
     def action_drill_up(self) -> None:
         """The left arrow's "back" out of a statistics drill-down."""
         self._go_back_to_stats()
+
+    def action_toggle_stats_fold(self) -> None:
+        """Space on a statistics row: fold/unfold its subtree. See check_action()."""
+        table = self.query_one("#stats_table", DataTable)
+        self._toggle_fold(table.cursor_row)
 
     def action_rename_vendor(self) -> None:
         self._prefill_for_vendor("rename")

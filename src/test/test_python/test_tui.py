@@ -16,7 +16,7 @@ from budget_tracker.db import DuplicateCategoryNamesError, get_engine, get_sessi
 from budget_tracker.importer import import_csv, read_header_and_rows
 from budget_tracker.models import Account, Currency, Transaction
 from helpers import learn_format
-from budget_tracker.tui import TRANSFER_MARK, BudgetApp, _fmt_amount
+from budget_tracker.tui import FOLD_INDICATOR, TRANSFER_MARK, BudgetApp, _fmt_amount
 
 CSV = """Transaction Date,Posted Date,Card No.,Description,Category,Debit,Credit
 2025-07-01,2025-07-02,8207,COFFEE SHOP A,Dining,3.00,
@@ -2474,3 +2474,392 @@ def test_format_invert_reports_an_unknown_format(tmp_path, monkeypatch):
 
     messages = asyncio.run(run())
     assert any("Unknown format" in m and "nope" in m for m in messages)
+
+
+# --------------------------------------------------------- statistics fold/unfold
+
+
+def _seed_deep_foldable_hierarchy(tmp_path, monkeypatch):
+    """A foldable category with a long name three levels deep, for the width guard.
+
+    ``Food > Dining > Casual and Fast Dining Establishments > Takeout`` — the third
+    level is both foldable (it has one child) and long enough that the fold indicator's
+    two extra characters are the difference between fitting the Category column and not.
+    """
+    db_path = tmp_path / "deep_fold.db"
+    engine = get_engine(db_path)
+    init_db(engine)
+    session_factory = get_sessionmaker(engine)
+    with session_factory() as session:
+        currency = Currency(value="USD", symbol="$", decimal_places=2)
+        session.add(currency)
+        session.flush()
+        account = Account(name="Checking", currency_id=currency.id)
+        session.add(account)
+        session.flush()
+        parent = categories.ensure_path(
+            session, "Food > Dining > Casual and Fast Dining Establishments"
+        )
+        child = categories.ensure_path(
+            session,
+            "Food > Dining > Casual and Fast Dining Establishments > Takeout",
+        )
+        session.flush()
+
+        def txn(day, amount, description, category):
+            session.add(
+                Transaction(
+                    account_id=account.id,
+                    currency_id=currency.id,
+                    posted_date=day,
+                    description=description,
+                    raw_description=description,
+                    value_minor=amount,
+                    category_id=category.id,
+                    category_source="manual",
+                    import_hash=f"deepfold-{description}-{day}-{amount}",
+                )
+            )
+
+        txn(datetime.date(2025, 3, 1), -12_345_678, "Big meal", parent)
+        txn(datetime.date(2025, 3, 2), -2_345_678, "Takeout order", child)
+        session.commit()
+    monkeypatch.setenv("BUDGET_DB", str(db_path))
+    return session_factory
+
+
+def test_space_folds_and_unfolds_a_stats_row_with_children(tmp_path, monkeypatch):
+    _seed_category_hierarchy(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command("stats 2025-01-01..2025-12-31")
+            await pilot.pause()
+            table = app.query_one("#stats_table", DataTable)
+            table.focus()
+            expanded = _stats_rows(app)
+
+            table.move_cursor(row=1)  # Dining, which has two children
+            await pilot.press("space")
+            await pilot.pause()
+            collapsed = _stats_rows(app)
+
+            await pilot.press("space")  # press it again: back to expanded
+            await pilot.pause()
+            reexpanded = _stats_rows(app)
+
+            return expanded, collapsed, reexpanded
+
+    expanded, collapsed, reexpanded = asyncio.run(run())
+    names_expanded = [row[0] for row in expanded]
+    assert names_expanded == [
+        "Food",
+        "  Dining",
+        "    Restaurants and Fast …",
+        "    Fast Food",
+        "  Groceries",
+        "TOTAL",
+    ]
+    names_collapsed = [row[0] for row in collapsed]
+    # Restaurants and Fast Food, Dining's subtree, are gone; Groceries moves up.
+    assert names_collapsed == [
+        "Food",
+        f"  {FOLD_INDICATOR} Dining",
+        "  Groceries",
+        "TOTAL",
+    ]
+    assert [row[0] for row in reexpanded] == names_expanded
+
+
+def test_folding_a_group_hides_its_whole_subtree_recursively(tmp_path, monkeypatch):
+    """Collapsing ``Food`` (depth 0) must hide Dining, Groceries, and Dining's own
+    children — not just its immediate row."""
+    _seed_category_hierarchy(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command("stats 2025-01-01..2025-12-31")
+            await pilot.pause()
+            table = app.query_one("#stats_table", DataTable)
+            table.focus()
+            table.move_cursor(row=0)  # Food, the root of everything seeded
+            await pilot.press("space")
+            await pilot.pause()
+            return _stats_rows(app)
+
+    rows = asyncio.run(run())
+    assert [row[0] for row in rows] == [f"{FOLD_INDICATOR} Food", "TOTAL"]
+
+
+def test_space_does_nothing_on_a_leaf_row_or_the_total_row(tmp_path, monkeypatch):
+    _seed_category_hierarchy(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command("stats 2025-01-01..2025-12-31")
+            await pilot.pause()
+            table = app.query_one("#stats_table", DataTable)
+            table.focus()
+            before = _stats_rows(app)
+
+            table.move_cursor(row=4)  # Groceries, a leaf
+            await pilot.press("space")
+            await pilot.pause()
+            after_leaf = _stats_rows(app)
+
+            table.move_cursor(row=table.row_count - 1)  # TOTAL
+            await pilot.press("space")
+            await pilot.pause()
+            after_total = _stats_rows(app)
+
+            return before, after_leaf, after_total
+
+    before, after_leaf, after_total = asyncio.run(run())
+    assert before == after_leaf == after_total
+
+
+def test_folding_does_not_change_any_numbers(tmp_path, monkeypatch):
+    """Every row's figures already roll up its descendants, so folding — which only
+    hides rows — must not edit a single one of them."""
+    _seed_category_hierarchy(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command("stats 2025-01-01..2025-12-31")
+            await pilot.pause()
+            before = _stats_rows(app)
+            table = app.query_one("#stats_table", DataTable)
+            table.focus()
+            table.move_cursor(row=1)  # Dining
+            await pilot.press("space")
+            await pilot.pause()
+            after = _stats_rows(app)
+            return before, after
+
+    before, after = asyncio.run(run())
+    assert len(before) == 6 and len(after) == 4
+    # Food's row rolls up all of Dining's subtree; that total does not move.
+    assert before[0] == after[0]
+    # Dining's own figures are unchanged; only its name grows the fold indicator.
+    assert before[1][1:] == after[1][1:]
+    assert before[1][0] == "  Dining"
+    assert after[1][0] == f"  {FOLD_INDICATOR} Dining"
+    # Groceries and TOTAL, untouched by the fold, are byte-for-byte identical, just
+    # moved up to fill the gap Dining's hidden children left.
+    assert before[4] == after[2]
+    assert before[5] == after[3]
+
+
+def test_fold_state_survives_a_window_change_a_filter_and_a_drill_round_trip(
+    tmp_path, monkeypatch
+):
+    _seed_category_hierarchy(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command("stats 2025-01-01..2025-12-31")
+            await pilot.pause()
+            table = app.query_one("#stats_table", DataTable)
+            table.focus()
+            table.move_cursor(row=1)  # Dining
+            await pilot.press("space")  # collapse
+            await pilot.pause()
+            after_fold = [row[0] for row in _stats_rows(app)]
+
+            # A new window rebuilds the report from scratch.
+            app._run_command("stats 2020-01-01..2025-12-31")
+            await pilot.pause()
+            after_window = [row[0] for row in _stats_rows(app)]
+
+            # So does a filter.
+            app.reload()
+            await pilot.pause()
+            after_filter = [row[0] for row in _stats_rows(app)]
+
+            # And so does a full drill-in/drill-out round trip.
+            table.move_cursor(row=0)  # Food, still visible with Dining collapsed
+            await pilot.press("right")
+            await pilot.pause()
+            await pilot.press("left")
+            await pilot.pause()
+            after_drill = [row[0] for row in _stats_rows(app)]
+
+            return after_fold, after_window, after_filter, after_drill
+
+    after_fold, after_window, after_filter, after_drill = asyncio.run(run())
+    expected = ["Food", f"  {FOLD_INDICATOR} Dining", "  Groceries", "TOTAL"]
+    assert after_fold == expected
+    assert after_window == expected
+    assert after_filter == expected
+    assert after_drill == expected
+
+
+def test_drill_down_maps_to_the_row_actually_clicked_after_a_collapse(
+    tmp_path, monkeypatch
+):
+    """The trap: once rows can be hidden, table row N is no longer report.categories[N].
+
+    A row below a collapsed group has to drill into the category it visibly shows, not
+    into whatever used to sit at that table index before the collapse.
+    """
+    _seed_category_hierarchy(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command("stats 2025-01-01..2025-12-31")
+            await pilot.pause()
+            table = app.query_one("#stats_table", DataTable)
+            table.focus()
+            table.move_cursor(row=1)  # Dining
+            await pilot.press("space")  # hides Restaurants and Fast Food
+            await pilot.pause()
+            rows = _stats_rows(app)
+            assert rows[2][0] == "  Groceries"  # moved up into what was row 2
+
+            table.move_cursor(row=2)
+            await pilot.press("enter")
+            await pilot.pause()
+            return [t.description for t in app._txns]
+
+    descriptions = asyncio.run(run())
+    # Groceries' own transaction, not "Big meal"/"Fast food" from Dining's hidden rows.
+    assert descriptions == ["Groceries"]
+
+
+def test_left_arrow_after_a_collapsed_drill_down_lands_back_on_the_row_clicked(
+    tmp_path, monkeypatch
+):
+    _seed_category_hierarchy(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command("stats 2025-01-01..2025-12-31")
+            await pilot.pause()
+            table = app.query_one("#stats_table", DataTable)
+            table.focus()
+            table.move_cursor(row=1)  # Dining
+            await pilot.press("space")  # collapse
+            await pilot.pause()
+
+            table.move_cursor(row=2)  # Groceries, directly below the collapsed group
+            await pilot.press("right")  # drill down
+            await pilot.pause()
+            await pilot.press("left")  # back
+            await pilot.pause()
+
+            rows = _stats_rows(app)
+            cursor_row = app.query_one("#stats_table", DataTable).cursor_row
+            return rows, cursor_row, app._panel
+
+    rows, cursor_row, panel = asyncio.run(run())
+    assert panel == "stats"
+    assert cursor_row == 2  # back on Groceries, not shifted by the still-collapsed group
+    assert [row[0] for row in rows] == [
+        "Food",
+        f"  {FOLD_INDICATOR} Dining",
+        "  Groceries",
+        "TOTAL",
+    ]
+
+
+def test_space_does_nothing_outside_the_stats_table(tmp_path, monkeypatch):
+    _setup_recent(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            txns = app.query_one("#txns", DataTable)
+            txns.focus()
+            before_txns = _rows_of(app, "txns")
+            await pilot.press("space")
+            await pilot.pause()
+            after_txns = _rows_of(app, "txns")
+            txns_panel = app._panel
+
+            app._run_command("rules")
+            await pilot.pause()
+            rules = app.query_one("#rules", DataTable)
+            rules.focus()
+            before_rules = _rows_of(app, "rules")
+            await pilot.press("space")
+            await pilot.pause()
+            after_rules = _rows_of(app, "rules")
+            rules_panel = app._panel
+
+            return (
+                before_txns,
+                after_txns,
+                txns_panel,
+                before_rules,
+                after_rules,
+                rules_panel,
+            )
+
+    (
+        before_txns,
+        after_txns,
+        txns_panel,
+        before_rules,
+        after_rules,
+        rules_panel,
+    ) = asyncio.run(run())
+    assert before_txns == after_txns
+    assert txns_panel == "txns"
+    assert before_rules == after_rules
+    assert rules_panel == "rules"
+
+
+def test_space_still_types_a_literal_space_in_the_command_bar(tmp_path, monkeypatch):
+    """The fold binding is deliberately not priority=True, so it must never steal a
+    space bar press from the Input that holds focus most of the app's life."""
+    _setup_recent(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            text = "filter multi word search"
+            keys = [char if char != " " else "space" for char in text]
+            await pilot.press(*keys)
+            return app.query_one("#command", Input).value
+
+    assert asyncio.run(run()) == "filter multi word search"
+
+
+def test_stats_table_fold_indicator_fits_the_main_panel_on_a_deep_row(
+    tmp_path, monkeypatch
+):
+    """Extends test_stats_table_fits_the_main_panel_with_a_deep_hierarchy: the fold
+    indicator's two extra characters must not push a deep, long-named, collapsed row
+    past the Category column's 26-character budget.
+    """
+    _seed_deep_foldable_hierarchy(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            app._run_command("stats 2025-01-01..2025-12-31")
+            await pilot.pause()
+            table = app.query_one("#stats_table", DataTable)
+            table.focus()
+            table.move_cursor(row=2)  # "Casual and Fast Dining Establishments", depth 2
+            await pilot.press("space")
+            await pilot.pause()
+            widths = {str(column.label): column.width for column in table.columns.values()}
+            panel_width = table.size.width
+            return widths, panel_width, _stats_rows(app)
+
+    widths, panel_width, rows = asyncio.run(run())
+    padding = 2 * len(widths)
+    assert sum(widths.values()) + padding <= panel_width
+    collapsed_row = rows[2]
+    assert collapsed_row[0].startswith(f"    {FOLD_INDICATOR} ")
+    for label, width in widths.items():
+        assert len(label) <= width, f"{label!r} does not fit in width {width}"
+    assert all(len(row[0]) <= widths["Category"] for row in rows)

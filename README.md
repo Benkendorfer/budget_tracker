@@ -94,8 +94,9 @@ the bottom:
 Keyboard shortcuts: `ctrl+l` clears filters, `ctrl+r` refreshes, `escape` returns to the
 transactions from the rules panel, and `ctrl+c` quits. On a statistics row, the right
 arrow drills into that category's transactions (same as `enter`); the left arrow goes
-back to the breakdown it came from, once you have drilled into one — see "Statistics"
-below. The footer shows both only while they do something.
+back to the breakdown it came from, once you have drilled into one; and `space` folds or
+unfolds a category's subtree — see "Statistics" below. The footer shows the arrows only
+while they do something.
 
 `ctrl+n` prefills a `rename` command for whichever vendor you are pointing at, and
 `ctrl+t` prefills a `categorize` command for the same vendor. With the transaction table
@@ -402,6 +403,14 @@ already measured out to their 92-column budget with a real year of five-figure t
 The `Uncategorised` row drills in like any other, which is the quickest way to find what
 still needs a rule. `ctrl+l`, or `all`, clears the window again along with the rest of the
 filters — a drill-down is not sticky.
+
+Press `space` on a category row that has children to fold its subtree away — handy for a
+deep hierarchy where you only want the top-level picture. A collapsed row shows a `▸`
+before its name; press `space` again to unfold it. Folding never changes a number: a
+collapsed `Food` still shows the same total it showed expanded, since every row already
+rolls up its descendants. `space` does nothing on a leaf row or the closing `TOTAL` row.
+Folded categories stay folded across a new window, a filter change, and drilling into a
+row and back out.
 
 The panel is scoped by whatever filters are already active: click an account in the
 sidebar, or run `filter`, and the statistics narrow to match. Transfers are left out of
