@@ -56,17 +56,20 @@ def _cmd_list(args: argparse.Namespace) -> int:
         text_filter = (
 queries.TextFilter(args.search, args.search_in) if args.search else None
         )
-        txns = queries.get_transactions(
-            session,
-            account_id,
-            category_id,
-            vendor_filter,
-            limit=args.limit,
+        # One value for both calls: the table and the totals under it must be scoped
+        # identically or the figures will not describe the rows above them.
+        filters = queries.Filters(
+            account_id=account_id,
+            category_id=category_id,
+            vendor_filter=vendor_filter,
             text_filter=text_filter,
         )
-        totals = queries.get_totals(
-            session, account_id, category_id, vendor_filter, text_filter=text_filter
+        txns = queries.get_transactions(
+            session,
+            limit=args.limit,
+            filters=filters,
         )
+        totals = queries.get_totals(session, filters=filters)
 
     console = Console()
     table = Table(box=None, pad_edge=False)
