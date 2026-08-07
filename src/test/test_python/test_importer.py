@@ -146,6 +146,46 @@ COMPACT_LEDGER_CSV = """Posting Date,Description,Debit,Credit,,
 20260804,FEE,25,,,
 """
 
+# A semicolon-delimited export with a metadata preamble (narrower than the real data)
+# and a blank separator line before the real header -- the shape a European bank
+# export takes. Modal field count alone is enough to find the header once delimiter
+# sniffing gets ';' right: the preamble rows are 3 fields wide, the header and the six
+# data rows are 4, so width already outvotes them. The one quoted description
+# containing a literal ';' is not decoration -- csv.Sniffer's reliable path looks for a
+# quoted field with a consistent character just outside it, same as a real address or
+# memo field quoted for holding the delimiter would give it.
+SEMICOLON_PREAMBLE_CSV = (
+    "Account number:;0215 00194150.40;\n"
+    "Account holder:;Jane Doe;\n"
+    "Currency:;CHF;\n"
+    "Opening balance:;1000.00;\n"
+    "\n"
+    "Date;Description;Amount;Currency\n"
+    '2026-07-01;"Coffee Shop; Main St";-6.50;CHF\n'
+    "2026-07-02;GROCERY STORE;-42.10;CHF\n"
+    "2026-07-03;PAYMENT RECEIVED;100.00;CHF\n"
+    "2026-07-04;BOOKSTORE;-18.25;CHF\n"
+    "2026-07-05;PHARMACY;-9.90;CHF\n"
+    "2026-07-06;REFUND;25.00;CHF\n"
+)
+
+# A comma export padded to one width throughout, title rows included -- the shape a
+# payments app takes. Modal count alone would pick line 0: every row, titles included,
+# is 7 fields wide. Only the "looks like column names" test tells the title rows (one
+# non-empty cell) apart from the real header (six, all distinct, none numeric).
+PADDED_TITLE_CSV = (
+    "Account Statement,,,,,,\n"
+    "Account Activity,,,,,,\n"
+    ",ID,Date,Description,Amount,Currency,Status\n"
+    "1,T001,2026-07-01,COFFEE SHOP,-6.50,USD,Complete\n"
+    "2,T002,2026-07-02,GROCERY STORE,-42.10,USD,Complete\n"
+    "3,T003,2026-07-03,PAYMENT RECEIVED,100.00,USD,Complete\n"
+)
+
+# Nothing here looks like column names: every row is bare numbers, so every row fails
+# the numeric-majority test. Detection has to give up gracefully rather than raise.
+NO_HEADER_CSV = "1,2,3\n4,5,6\n7,8,9\n"
+
 # Two legs of one transfer, in separate files as separate accounts would export them.
 XFER_OUT_CSV = """Transaction Date,Posted Date,Card No.,Description,Amount
 2026-07-01,2026-07-02,CHK,TRANSFER TO CARD,-100.00
@@ -171,8 +211,11 @@ def _learn(session, path, name, invert_amount=False):
     """Infer a format and save it, answering the polarity question explicitly.
 
     Every fixture here is a single signed amount column, so inference always leaves
-    exactly one question (invert_amount); this settles it deliberately rather than by
-    relying on its default, since these tests need to exercise both settings.
+    exactly one question of substance (invert_amount); this settles it deliberately
+    rather than by relying on its default, since these tests need to exercise both
+    settings. Any other question left over (currency, always asked with a "USD"
+    default) is resolved by accepting its default, the same as a real walkthrough
+    pressing enter would.
     """
     fieldnames, rows = read_header_and_rows(path)
     inference = formats.infer(name, fieldnames, rows)
@@ -182,7 +225,12 @@ def _learn(session, path, name, invert_amount=False):
         fieldnames,
         rows,
     )
-    assert not formats.remaining_questions(values, rows, fieldnames)
+    questions = formats.remaining_questions(values, rows, fieldnames)
+    while questions:
+        answers = {q.field: q.default for q in questions if q.default is not None}
+        assert answers, f"_learn cannot answer {[q.field for q in questions]}"
+        values = formats.apply_answers(values, answers, fieldnames, rows)
+        questions = formats.remaining_questions(values, rows, fieldnames)
     spec = formats.spec_from_values(values)
     formats.save_format(session, spec)
     session.commit()
@@ -282,6 +330,112 @@ def test_header_is_found_below_blank_leading_rows(tmp_path):
     assert amounts == {"TRANSFER IN": 20000, "TRANSFER OUT": -10000}
 
 
+# ---------------------------------------------------------- delimiter + header sniffing
+
+def test_ordinary_header_on_line_one_is_unaffected(tmp_path):
+    """A plain comma file with the header already on line 1 -- the common case -- must
+    resolve exactly as before: sniffing must not go looking for trouble that isn't
+    there."""
+    path = _write(tmp_path, "card.csv", CARD_CSV)
+    fieldnames, rows = read_header_and_rows(path)
+    assert fieldnames == ["Transaction Date", "Posted Date", "Card No.", "Description", "Amount"]
+    assert len(rows) == 2
+
+
+def test_semicolon_delimiter_and_header_are_found_past_a_metadata_preamble(tmp_path):
+    """A European-style export: semicolon-delimited, an 8-ish-line metadata preamble
+    three fields wide, a blank line, then the real header. _dict_reader assumed commas,
+    so the whole preamble used to collapse into one bogus column."""
+    path = _write(tmp_path, "preamble.csv", SEMICOLON_PREAMBLE_CSV)
+    fieldnames, rows = read_header_and_rows(path)
+    assert fieldnames == ["Date", "Description", "Amount", "Currency"]
+    assert len(rows) == 6
+    # The delimiter inside the quoted description survived, not just the one outside it.
+    assert rows[0]["Description"] == "Coffee Shop; Main St"
+
+
+def test_header_is_found_among_uniformly_padded_title_rows(tmp_path):
+    """A payments-app-style export: every line, title rows included, padded to the same
+    field count. Modal count alone picks line 0 (a title); only the plausibility check
+    -- more than one non-empty cell, all distinct, not mostly numeric -- rejects it."""
+    path = _write(tmp_path, "padded.csv", PADDED_TITLE_CSV)
+    fieldnames, rows = read_header_and_rows(path)
+    assert fieldnames == ["", "ID", "Date", "Description", "Amount", "Currency", "Status"]
+    assert len(rows) == 3
+    assert rows[0]["Description"] == "COFFEE SHOP"
+
+
+def test_no_plausible_header_falls_back_to_the_first_non_blank_line(tmp_path):
+    """Nothing in this file reads as column names -- every row is bare numbers -- so
+    detection has to degrade to the old behavior (first non-blank line as header)
+    instead of raising or picking a data row at random."""
+    path = _write(tmp_path, "numbers.csv", NO_HEADER_CSV)
+    fieldnames, rows = read_header_and_rows(path)
+    assert fieldnames == ["1", "2", "3"]
+    assert len(rows) == 2
+
+
+def test_inference_and_import_agree_on_a_semicolon_header(tmp_path):
+    """Inference and import both go through the same reader, so a format learned from
+    this file must describe columns import_csv can actually find in it."""
+    session_factory = _session_factory(tmp_path)
+    path = _write(tmp_path, "preamble.csv", SEMICOLON_PREAMBLE_CSV)
+    with session_factory() as session:
+        _learn(session, path, "semicolon", invert_amount=False)
+        # No fmt= : detect() must see the same fieldnames inference was shown.
+        result = import_csv(session, path, account_name="Checking")
+    assert result.inserted == 6
+    assert result.skipped_duplicates == 0
+
+    with session_factory() as session:
+        amounts = {t.description: t.amount_minor for t in queries.get_transactions(session)}
+    assert amounts["Coffee Shop; Main St"] == -650
+    assert amounts["PAYMENT RECEIVED"] == 10000
+
+
+def test_reimporting_a_semicolon_file_still_deduplicates(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    path = _write(tmp_path, "preamble.csv", SEMICOLON_PREAMBLE_CSV)
+    with session_factory() as session:
+        _learn(session, path, "semicolon")
+        first = import_csv(session, path, account_name="Checking")
+        second = import_csv(session, path, account_name="Checking")
+    assert first.inserted == 6
+    assert second.inserted == 0
+    assert second.skipped_duplicates == 6
+
+
+def test_inference_and_import_agree_on_a_padded_title_header(tmp_path):
+    """Same guarantee, for the other shape: uniform padding rather than a preamble."""
+    session_factory = _session_factory(tmp_path)
+    path = _write(tmp_path, "padded.csv", PADDED_TITLE_CSV)
+    with session_factory() as session:
+        _learn(session, path, "padded", invert_amount=False)
+        result = import_csv(session, path, account_name="Card1")
+    assert result.inserted == 3
+    assert result.skipped_duplicates == 0
+
+    with session_factory() as session:
+        amounts = {t.description: t.amount_minor for t in queries.get_transactions(session)}
+    assert amounts == {
+        "COFFEE SHOP": -650,
+        "GROCERY STORE": -4210,
+        "PAYMENT RECEIVED": 10000,
+    }
+
+
+def test_reimporting_a_padded_title_file_still_deduplicates(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    path = _write(tmp_path, "padded.csv", PADDED_TITLE_CSV)
+    with session_factory() as session:
+        _learn(session, path, "padded")
+        first = import_csv(session, path, account_name="Card1")
+        second = import_csv(session, path, account_name="Card1")
+    assert first.inserted == 3
+    assert second.inserted == 0
+    assert second.skipped_duplicates == 3
+
+
 def test_import_skips_blank_rows_and_reads_a_signed_debit_column(tmp_path):
     """Three things a real broker export brought at once.
 
@@ -295,9 +449,14 @@ def test_import_skips_blank_rows_and_reads_a_signed_debit_column(tmp_path):
     path = _write(tmp_path, "ledger.csv", COMPACT_LEDGER_CSV)
     fieldnames, rows = read_header_and_rows(path)
     inference = formats.infer("ledger", fieldnames, rows)
-    # Nothing to ask: a debit/credit pair settles polarity, and %Y%m%d now infers.
+    # Nothing to ask about polarity or dates: a debit/credit pair settles polarity, and
+    # %Y%m%d now infers. currency is always left over -- nothing in a CSV states it --
+    # and its "USD" default is what from_dict below relies on to build a usable spec
+    # without answering it.
     assert inference.values["date_formats"] == ["%Y%m%d"]
-    assert formats.remaining_questions(inference.values, rows, fieldnames) == []
+    assert [q.field for q in formats.remaining_questions(inference.values, rows, fieldnames)] == [
+        "currency"
+    ]
 
     with session_factory() as session:
         formats.save_format(
@@ -556,3 +715,57 @@ def test_entries_are_sorted_case_insensitively(tmp_path):
     assert [path.name for path in listing.files] == [
         "apple.csv", "Mango.csv", "Zebra.csv"
     ]
+
+
+def test_a_semicolon_file_is_recognized_without_a_quoted_delimiter(tmp_path):
+    """csv.Sniffer resolves a semicolon confidently only when the sample happens to
+    contain a *quoted* field with one inside it. A plainly separated file raises and
+    falls back to comma, collapsing the whole header into a single column -- which is
+    the original bug, surviving in a file that merely lacks a quoted address.
+    """
+    path = tmp_path / "plain.csv"
+    path.write_text(
+        "Account number:;0000 000;\n"
+        "Valued in:;CHF;\n"
+        "\n"
+        "Trade date;Currency;Debit;Credit;Description\n"
+        "2026-01-05;CHF;42.50;;Groceries\n"
+        "2026-01-06;CHF;;100.00;Salary\n",
+        encoding="utf-8",
+    )
+    fieldnames, rows = read_header_and_rows(path)
+    assert fieldnames[:2] == ["Trade date", "Currency"]
+    assert len(rows) == 2
+    assert rows[0]["Debit"] == "42.50"
+
+
+def test_a_tab_separated_file_is_recognized_too(tmp_path):
+    path = tmp_path / "tabs.csv"
+    path.write_text(
+        "Date\tDescription\tAmount\n2026-01-05\tA SHOP\t-5.00\n", encoding="utf-8"
+    )
+    fieldnames, rows = read_header_and_rows(path)
+    assert fieldnames == ["Date", "Description", "Amount"]
+    assert rows[0]["Amount"] == "-5.00"
+
+
+def test_a_comma_file_containing_semicolons_still_reads_as_commas(tmp_path):
+    """Scoring picks whichever separator actually makes the file tabular, so stray
+    semicolons inside descriptions must not win over the real delimiter."""
+    path = tmp_path / "commas.csv"
+    path.write_text(
+        "Date,Description,Amount\n"
+        "2026-01-05,\"A SHOP; MAIN ST\",-5.00\n"
+        "2026-01-06,\"ANOTHER; PLACE; HERE\",-6.00\n",
+        encoding="utf-8",
+    )
+    fieldnames, rows = read_header_and_rows(path)
+    assert fieldnames == ["Date", "Description", "Amount"]
+    assert rows[1]["Description"] == "ANOTHER; PLACE; HERE"
+
+
+def test_comma_wins_a_tie_so_existing_layouts_are_untouched(tmp_path):
+    """A file tabular under more than one candidate must keep reading as it always did."""
+    path = tmp_path / "tie.csv"
+    path.write_text("a,b\n1,2\n", encoding="utf-8")
+    assert read_header_and_rows(path)[0] == ["a", "b"]

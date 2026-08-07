@@ -56,7 +56,12 @@ def get_engine(db_path: Optional[Path] = None) -> Engine:
 # missing *tables*, so these are applied by hand; SQLite ADD COLUMN is cheap and safe.
 _ADDED_COLUMNS = {
     "vendor": {"vendor_name_source": "VARCHAR"},
-    "csv_format": {"invert_amount": "BOOLEAN NOT NULL DEFAULT 0"},
+    "csv_format": {
+        "invert_amount": "BOOLEAN NOT NULL DEFAULT 0",
+        # A format that predates this column carried no currency of its own, and every
+        # one defined before now was USD, so that is the correct value to backfill.
+        "currency": "VARCHAR NOT NULL DEFAULT 'USD'",
+    },
 }
 
 

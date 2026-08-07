@@ -328,6 +328,7 @@ from budget_tracker.db import get_engine, get_sessionmaker, init_db
 from budget_tracker.formats import UnknownFormat
 from budget_tracker.importer import import_wise_csv
 from budget_tracker.models import Account, Category, Currency, Transaction
+from helpers import learn_format
 
 
 def _write_csv(path, rows):
@@ -656,3 +657,51 @@ def test_reimporting_a_conversion_does_not_duplicate_its_observed_rate(tmp_path)
         ).all()
         assert len(rows) == 1
         assert Decimal(rows[0].rate) == Decimal("0.8")
+
+
+def test_the_cli_imports_a_wise_file_without_asking_layout_questions(tmp_path, monkeypatch, capsys):
+    """The regression this exists for: routing lived in import_csv but was only reached
+    when no format had been resolved, and both real entry points resolve one first. The
+    CLI therefore fell into the layout walkthrough for a file none of its questions can
+    describe, and the app crashed looking up a format that was never a real row.
+
+    Driving cli.main is the point -- testing import_csv directly is what missed it.
+    """
+    from budget_tracker import cli
+
+    db = tmp_path / "t.db"
+    init_db(get_engine(db))
+    monkeypatch.setenv("BUDGET_DB", str(db))
+    path = _write_csv(tmp_path / "wise.csv", [_row(ID="A"), _conversion()])
+
+    # Any prompt at all means it went into the walkthrough, which is the bug.
+    def no_prompting(_prompt=""):
+        raise AssertionError("the CLI asked a layout question for a built-in reader")
+
+    monkeypatch.setattr("builtins.input", no_prompting)
+    assert cli.main(["import", str(path)]) == 0
+
+    out = capsys.readouterr().out
+    assert "3 added" in out
+    factory = get_sessionmaker(get_engine(db))
+    with factory() as session:
+        assert sorted(a.name for a in session.query(Account).all()) == ["Wise USD"]
+
+
+def test_a_resolved_format_never_overrides_the_built_in_reader(tmp_path):
+    """No format can describe this layout -- a row carries two currencies and has no
+    single amount column -- so a format argument must not outrank the signature."""
+    from budget_tracker.importer import import_csv
+
+    path = _write_csv(tmp_path / "wise.csv", [_conversion()])
+    other = tmp_path / "bank.csv"
+    other.write_text("Date,Description,Amount\n2026-01-01,A SHOP,-5.00\n", encoding="utf-8")
+    factory = _factory(tmp_path)
+    with factory() as session:
+        learned = learn_format(session, other)
+    with factory() as session:
+        result = import_csv(session, path, fmt=learned)
+
+    assert result.inserted == 2  # the conversion and its fee, read by the Wise reader
+    with factory() as session:
+        assert [a.name for a in session.query(Account).all()] == ["Wise USD"]

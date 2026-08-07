@@ -77,7 +77,10 @@ def test_infers_a_debit_credit_layout(tmp_path):
     path = _write(tmp_path, "pair.csv", PAIR_CSV)
     fieldnames, rows = read_header_and_rows(path)
     inference = formats.infer("pair", fieldnames, rows)
-    assert inference.complete
+    # Everything is inferred from the header except currency, which nothing in a CSV
+    # ever states and so is always asked (with a "USD" default -- see
+    # test_currency_is_always_asked_with_a_usd_default).
+    assert [q.field for q in inference.questions] == ["currency"]
     values = inference.values
     assert values["amount_style"] == formats.DEBIT_CREDIT
     assert (values["debit_column"], values["credit_column"]) == ("Debit", "Credit")
@@ -94,8 +97,10 @@ def test_infers_a_signed_layout_with_an_id_column(tmp_path):
     fieldnames, rows = read_header_and_rows(path)
     inference = formats.infer("signed", fieldnames, rows)
     # Everything is inferred except the amount's polarity, which nothing in a single
-    # signed column can settle on its own (see test_signed_layout_asks_about_polarity).
-    assert [q.field for q in inference.questions] == ["invert_amount"]
+    # signed column can settle on its own (see test_signed_layout_asks_about_polarity),
+    # and currency, which nothing in any CSV states (see
+    # test_currency_is_always_asked_with_a_usd_default).
+    assert [q.field for q in inference.questions] == ["invert_amount", "currency"]
     values = inference.values
     assert values["amount_style"] == formats.SIGNED
     assert values["amount_column"] == "Amount"
@@ -126,7 +131,7 @@ def test_signed_layout_asks_about_polarity(tmp_path):
     assert question.default == "no"
 
     values = formats.apply_answers(
-        inference.values, {"invert_amount": "yes"}, fieldnames, rows
+        inference.values, {"invert_amount": "yes", "currency": "USD"}, fieldnames, rows
     )
     assert not formats.remaining_questions(values, rows, fieldnames)
     assert formats.spec_from_values(values).invert_amount is True
@@ -219,10 +224,14 @@ def test_date_question_appears_only_once_the_date_column_is_known():
     followups = formats.remaining_questions(values, rows, fieldnames)
     # Naming the amount column also settles amount_style as signed, which is what
     # makes the invert-amount question askable in the same pass as the date one.
-    assert {q.field for q in followups} == {"date_formats", "invert_amount"}
+    # currency is always among the followups: nothing in a CSV ever states it.
+    assert {q.field for q in followups} == {"date_formats", "invert_amount", "currency"}
 
     values = formats.apply_answers(
-        values, {"date_formats": "day", "invert_amount": "no"}, fieldnames, rows
+        values,
+        {"date_formats": "day", "invert_amount": "no", "currency": "USD"},
+        fieldnames,
+        rows,
     )
     assert not formats.remaining_questions(values, rows, fieldnames)
     spec = formats.spec_from_values(values)
@@ -355,6 +364,116 @@ def test_account_name_overrides_the_derived_one(tmp_path):
         import_csv(session, path, account_name="Everyday Card")
     with session_factory() as session:
         assert [a.name for a in queries.get_accounts(session)] == ["Everyday Card"]
+
+
+# ------------------------------------------------------------------------- currency
+
+def test_currency_question_offers_a_usd_default(tmp_path):
+    """Nothing in a CSV header or its rows says what currency the amounts are in, so
+    this is always asked -- but with a default that lets a walkthrough or
+    learn_format's answer-with-the-default keep working unattended."""
+    path = _write(tmp_path, "pair.csv", PAIR_CSV)
+    fieldnames, rows = read_header_and_rows(path)
+    inference = formats.infer("pair", fieldnames, rows)
+    question = next(q for q in inference.questions if q.field == "currency")
+    assert question.default == "USD"
+
+    values = formats.apply_answers(
+        inference.values, {"currency": question.default}, fieldnames, rows
+    )
+    assert not formats.remaining_questions(values, rows, fieldnames)
+    assert formats.spec_from_values(values).currency == "USD"
+
+
+def test_currency_round_trips_through_save_and_load(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    path = _write(tmp_path, "pair.csv", PAIR_CSV)
+    with session_factory() as session:
+        spec = _learn(session, path, "swiss")  # settles to USD by default
+        chf_spec = formats.save_format(
+            session, formats.FormatSpec(**{**formats.to_dict(spec), "currency": "CHF"})
+        )
+        session.commit()
+    assert chf_spec.currency == "CHF"
+    with session_factory() as session:
+        assert formats.get_format(session, "swiss").currency == "CHF"
+
+
+def test_import_uses_the_formats_own_currency_with_no_currency_argument(tmp_path):
+    """The bug this fixes: a franc statement used to come out USD unless --currency
+    was retyped on every single import of that layout. Teaching the format its
+    currency once must be enough, with no argument passed at import time at all."""
+    session_factory = _session_factory(tmp_path)
+    path = _write(tmp_path, "pair.csv", PAIR_CSV)
+    with session_factory() as session:
+        spec = _learn(session, path, "swiss")
+        formats.save_format(
+            session, formats.FormatSpec(**{**formats.to_dict(spec), "currency": "CHF"})
+        )
+        session.commit()
+        import_csv(session, path)  # no currency_code passed
+    with session_factory() as session:
+        assert [a.currency for a in queries.get_accounts(session)] == ["CHF"]
+        assert {t.currency for t in queries.get_transactions(session)} == {"CHF"}
+
+
+def test_an_explicit_currency_argument_still_overrides_the_format(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    path = _write(tmp_path, "pair.csv", PAIR_CSV)
+    with session_factory() as session:
+        spec = _learn(session, path, "swiss")
+        formats.save_format(
+            session, formats.FormatSpec(**{**formats.to_dict(spec), "currency": "CHF"})
+        )
+        session.commit()
+        import_csv(session, path, currency_code="EUR")
+    with session_factory() as session:
+        assert [a.currency for a in queries.get_accounts(session)] == ["EUR"]
+
+
+def test_mismatched_currency_against_an_existing_account_is_refused(tmp_path):
+    """An account holds one currency. Importing a second currency into an account that
+    already exists must be refused, naming both currencies and the account, rather than
+    silently posting a francs figure as dollars (or vice versa).
+
+    The second file has different rows from the first (not just a re-import of the
+    same one), so the mismatch is what stops it, not ordinary dedup.
+    """
+    session_factory = _session_factory(tmp_path)
+    path = _write(tmp_path, "pair.csv", PAIR_CSV)
+    other_path = _write(
+        tmp_path,
+        "other.csv",
+        "Transaction Date,Posted Date,Card No.,Description,Category,Debit,Credit\n"
+        "2026-07-21,2026-07-22,8207,GROCERIES,Food,10.00,\n",
+    )
+    with session_factory() as session:
+        _learn(session, path, "cards")
+        import_csv(session, path, account_name="Shared Account")  # USD, by default
+        with pytest.raises(formats.AccountCurrencyMismatch) as excinfo:
+            import_csv(
+                session, other_path, account_name="Shared Account", currency_code="CHF"
+            )
+    message = str(excinfo.value)
+    assert "Shared Account" in message and "USD" in message and "CHF" in message
+    with session_factory() as session:
+        # Refused before anything from the second file was written.
+        assert len(queries.get_transactions(session)) == 2
+
+
+def test_reimport_after_learning_the_currency_still_deduplicates(tmp_path):
+    """currency must not feed the dedup hash: every row already imported before this
+    field existed has to keep being recognized as already-seen."""
+    session_factory = _session_factory(tmp_path)
+    path = _write(tmp_path, "pair.csv", PAIR_CSV)
+    with session_factory() as session:
+        _learn(session, path, "cards")  # currency defaults to USD
+        first = import_csv(session, path)
+    assert first.inserted == 2
+    with session_factory() as session:
+        again = import_csv(session, path)
+    assert again.inserted == 0
+    assert again.skipped_duplicates == 2
 
 
 # ---------------------------------------------------------------------- import rows
@@ -530,3 +649,46 @@ def test_init_db_adds_invert_amount_to_a_preexisting_csv_format_table(tmp_path):
     session_factory = get_sessionmaker(engine)
     with session_factory() as session:
         assert formats.get_format(session, "old").invert_amount is False
+
+
+def test_init_db_adds_currency_to_a_preexisting_csv_format_table(tmp_path):
+    """Databases created before this column existed must survive init_db(), and their
+    formats must read back as USD -- correct, since every format defined before now
+    was priced in dollars."""
+    import sqlalchemy
+
+    db_path = tmp_path / "old.db"
+    engine = get_engine(db_path)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.text(
+                "CREATE TABLE csv_format (id INTEGER PRIMARY KEY, name VARCHAR UNIQUE, "
+                "signature VARCHAR, posted_date_column VARCHAR, description_column "
+                "VARCHAR, date_formats VARCHAR, amount_style VARCHAR, dedup_columns "
+                "VARCHAR, txn_date_column VARCHAR, category_column VARCHAR, "
+                "debit_column VARCHAR, credit_column VARCHAR, amount_column VARCHAR, "
+                "account_column VARCHAR, account_prefix VARCHAR, "
+                "invert_amount BOOLEAN NOT NULL DEFAULT 0, created_at DATETIME)"
+            )
+        )
+        connection.execute(
+            sqlalchemy.text(
+                "INSERT INTO csv_format (name, signature, posted_date_column, "
+                "description_column, date_formats, amount_style, dedup_columns, "
+                "account_prefix) VALUES ('old', '[]', 'Date', 'Desc', '[]', 'signed', "
+                "'[]', '')"
+            )
+        )
+
+    init_db(engine)
+
+    with engine.begin() as connection:
+        columns = {
+            row[1]
+            for row in connection.execute(sqlalchemy.text("PRAGMA table_info(csv_format)"))
+        }
+    assert "currency" in columns
+
+    session_factory = get_sessionmaker(engine)
+    with session_factory() as session:
+        assert formats.get_format(session, "old").currency == "USD"

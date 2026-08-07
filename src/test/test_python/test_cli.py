@@ -670,6 +670,79 @@ def test_the_import_summary_names_the_database_it_actually_wrote(tmp_path, monke
     assert "data/budget.db" not in printed
 
 
+def _empty_db(tmp_path, monkeypatch):
+    """A database with no transactions yet, for tests that need a clean account."""
+    db_path = tmp_path / "t.db"
+    engine = get_engine(db_path)
+    init_db(engine)
+    session_factory = get_sessionmaker(engine)
+    monkeypatch.setenv("BUDGET_DB", str(db_path))
+    return session_factory
+
+
+def test_import_command_uses_the_formats_currency_with_no_currency_flag(
+    tmp_path, monkeypatch, capsys
+):
+    """The bug this fixes: ``--currency`` used to default to USD and was passed on
+    every import regardless, silently overriding whatever currency the format itself
+    was in."""
+    session_factory = _empty_db(tmp_path, monkeypatch)
+    csv_path = tmp_path / "swiss.csv"
+    csv_path.write_text(CSV, encoding="utf-8")
+    with session_factory() as session:
+        spec = learn_format(session, csv_path, name="swiss")
+        formats.save_format(
+            session, formats.FormatSpec(**{**formats.to_dict(spec), "currency": "CHF"})
+        )
+        session.commit()
+
+    assert cli.main(["import", str(csv_path)]) == 0
+    with session_factory() as session:
+        assert {a.currency for a in queries.get_accounts(session)} == {"CHF"}
+
+
+def test_import_command_currency_flag_still_overrides_the_format(
+    tmp_path, monkeypatch, capsys
+):
+    session_factory = _empty_db(tmp_path, monkeypatch)
+    csv_path = tmp_path / "swiss.csv"
+    csv_path.write_text(CSV, encoding="utf-8")
+    with session_factory() as session:
+        spec = learn_format(session, csv_path, name="swiss")
+        formats.save_format(
+            session, formats.FormatSpec(**{**formats.to_dict(spec), "currency": "CHF"})
+        )
+        session.commit()
+
+    assert cli.main(["import", str(csv_path), "--currency", "EUR"]) == 0
+    with session_factory() as session:
+        assert {a.currency for a in queries.get_accounts(session)} == {"EUR"}
+
+
+def test_import_command_reports_a_currency_mismatch(tmp_path, monkeypatch, capsys):
+    """Caught alongside AccountRequired/UnknownFormat: a clear message and exit 1,
+    not a traceback, and nothing from the second file is written."""
+    session_factory = _empty_db(tmp_path, monkeypatch)
+    csv_path = tmp_path / "in.csv"
+    csv_path.write_text(CSV, encoding="utf-8")
+    with session_factory() as session:
+        learn_format(session, csv_path, name="cards")
+        import_csv(session, csv_path)  # USD, the format's default
+
+    other_path = tmp_path / "other.csv"
+    other_path.write_text(
+        "Transaction Date,Posted Date,Card No.,Description,Category,Debit,Credit\n"
+        "2025-07-05,2025-07-06,8207,GROCERIES,Food,10.00,\n",
+        encoding="utf-8",
+    )
+
+    assert cli.main(["import", str(other_path), "--currency", "CHF"]) == 1
+    printed = capsys.readouterr().out
+    assert "8207" in printed and "USD" in printed and "CHF" in printed
+    with session_factory() as session:
+        assert len(queries.get_transactions(session)) == 3  # only the first file's rows
+
+
 def test_rates_fetch_bases_on_the_reporting_currency(tmp_path, monkeypatch, capsys):
     """Every conversion the aggregates perform is X -> home, and rate_on can invert a
     cached pair but cannot chain two together. Basing the fetch on anything other than

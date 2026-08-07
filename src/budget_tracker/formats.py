@@ -40,6 +40,7 @@ _SCALAR_FIELDS = (
     "account_column",
     "account_prefix",
     "invert_amount",
+    "currency",
 )
 
 
@@ -49,6 +50,13 @@ class UnknownFormat(ValueError):
 
 class AccountRequired(ValueError):
     """The format carries no account column, so the caller must name the account."""
+
+
+class AccountCurrencyMismatch(ValueError):
+    """An import's currency does not match the currency an existing account already
+    holds. Raised rather than attaching silently, since a wrong first import leaves an
+    account permanently mis-denominated with nothing to notice.
+    """
 
 
 class InvalidFormat(ValueError):
@@ -75,6 +83,11 @@ class FormatSpec:
     # opposite of our convention). Only meaningful for amount_style == SIGNED; a
     # debit/credit pair already says which side is an outflow.
     invert_amount: bool = False
+    # ISO code every row's amount is in. One per format, not per row: no layout in hand
+    # carries a currency column of its own (Wise transfer logs do, but bypass FormatSpec
+    # entirely — see wise.py). Existing formats predate this field and come out "USD",
+    # which is correct: every one defined so far was in dollars.
+    currency: str = "USD"
 
     @property
     def needs_account(self) -> bool:
@@ -408,6 +421,18 @@ def remaining_questions(values, rows, fieldnames):
     invert_question = _invert_amount_question(values, rows)
     if invert_question is not None:
         questions.append(invert_question)
+    if "currency" not in values:
+        # Nothing in a CSV header or its rows says what currency the amounts are in, so
+        # this is always asked rather than inferred — but a default of "USD" means
+        # pressing enter (or learn_format's answer-with-the-default) keeps every format
+        # defined before this question existed working unchanged.
+        questions.append(
+            Question(
+                field="currency",
+                prompt="What currency are these amounts in? (ISO code, e.g. USD, EUR, CHF)",
+                default="USD",
+            )
+        )
     return questions
 
 

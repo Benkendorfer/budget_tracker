@@ -169,6 +169,10 @@ class CsvFormat(Base):
     # negative-means-outflow convention). Flipping this per-format, rather than in the
     # importer, is what lets one database hold layouts with either convention.
     invert_amount: Mapped[bool] = mapped_column(default=False)
+    # ISO code every row's amount is in. A format predating this column is backfilled to
+    # "USD" by db.py's _ADDED_COLUMNS migration, which is correct: every format defined
+    # before this existed was in dollars.
+    currency: Mapped[str] = mapped_column(String, default="USD")
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 

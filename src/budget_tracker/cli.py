@@ -13,12 +13,7 @@ from . import categories as categories_module
 from . import formats, queries
 from . import transfers as transfers_module
 from .db import get_engine, get_sessionmaker, init_db, resolve_db_path
-from .importer import (
-    DEFAULT_CURRENCY_CODE,
-    import_csv,
-    list_inbox,
-    read_header_and_rows,
-)
+from .importer import import_csv, list_inbox, read_header_and_rows
 
 # cli.py -> budget_tracker -> src -> <repo root>
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -71,8 +66,20 @@ def _select_csv_interactively() -> Optional[Path]:
         directory = path
 
 
+def _has_builtin_reader(path: Path) -> bool:
+    """Whether this file is a layout the code reads directly, with no learned format."""
+    from . import wise
+
+    fieldnames, _rows = read_header_and_rows(path)
+    return wise.looks_like_wise(fieldnames)
+
+
 def _resolve_format(session, path: Path):
-    """Detect the file's format, falling back to interactive setup."""
+    """Detect the file's format, falling back to interactive setup.
+
+    ``None`` means the user abandoned the walkthrough, and nothing else -- see the
+    caller, which treats it as a cancellation.
+    """
     fieldnames, rows = read_header_and_rows(path)
     try:
         return formats.detect(session, fieldnames)
@@ -121,10 +128,15 @@ def _cmd_import(args: argparse.Namespace) -> int:
     try:
         with session_factory() as session:
             fmt = formats.get_format(session, args.format) if args.format else None
-            if fmt is None:
+            # A layout with a built-in reader is recognized from its own columns rather
+            # than learned, and none of the setup questions -- which column holds the
+            # amount, does a positive number mean money out -- has an answer for a file
+            # whose every row carries two currencies. Skipping resolution entirely lets
+            # import_csv route on the signature.
+            if fmt is None and not _has_builtin_reader(path):
                 fmt = _resolve_format(session, path)
                 if fmt is None:
-                    return 1
+                    return 1  # the user abandoned the walkthrough
             result = import_csv(
                 session,
                 path,
@@ -132,7 +144,11 @@ def _cmd_import(args: argparse.Namespace) -> int:
                 account_name=args.account,
                 fmt=fmt,
             )
-    except (formats.AccountRequired, formats.UnknownFormat) as error:
+    except (
+        formats.AccountRequired,
+        formats.UnknownFormat,
+        formats.AccountCurrencyMismatch,
+    ) as error:
         print(error)
         return 1
 
@@ -858,8 +874,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     import_parser.add_argument(
         "--currency",
-        default=DEFAULT_CURRENCY_CODE,
-        help="ISO currency code for the transactions (default: %(default)s).",
+        default=None,
+        help=(
+            "ISO currency code for the transactions. Defaults to the CSV format's own "
+            "currency (USD unless set otherwise); passing this overrides it."
+        ),
     )
     import_parser.add_argument(
         "--account",

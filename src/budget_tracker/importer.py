@@ -14,11 +14,12 @@ import csv
 import hashlib
 import io
 import re
+from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 # Bank exports are commonly UTF-8 or Windows-1252 (cp1252). Try them in order;
 # cp1252 handles accented European merchant names ("Genève") that break UTF-8.
@@ -27,7 +28,14 @@ _ENCODINGS = ("utf-8-sig", "cp1252")
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .formats import SIGNED, AccountRequired, FormatSpec, UnknownFormat, detect
+from .formats import (
+    SIGNED,
+    AccountCurrencyMismatch,
+    AccountRequired,
+    FormatSpec,
+    UnknownFormat,
+    detect,
+)
 from .models import Account, Category, Currency, Import, Transaction, Vendor
 
 DEFAULT_CURRENCY_CODE = "USD"
@@ -65,11 +73,27 @@ def _get_or_create_currency(session: Session, code: str) -> Currency:
 
 
 def _get_or_create_account(session: Session, name: str, currency: Currency) -> Account:
+    """Look up ``name``, creating it in ``currency`` if it does not exist yet.
+
+    Refuses to attach a transaction in a different currency to an account that already
+    exists, rather than posting it anyway: an account holds one currency, so accepting
+    a mismatched one would either mis-record the amount or leave a home-currency total
+    silently wrong wherever it isn't converted.
+    """
     account = session.scalar(select(Account).where(Account.name == name))
     if account is None:
         account = Account(name=name, currency_id=currency.id)
         session.add(account)
         session.flush()
+        return account
+    if account.currency_id != currency.id:
+        existing = session.get(Currency, account.currency_id)
+        existing_code = existing.value if existing else "unknown"
+        raise AccountCurrencyMismatch(
+            f"Account {name!r} is {existing_code}, but this import is "
+            f"{currency.value}. Pass --account to use a different account, or fix "
+            "the CSV format's currency if this was a setup mistake."
+        )
     return account
 
 
@@ -347,21 +371,138 @@ def inspect_csv(session: Session, path: Path) -> ImportCandidate:
     return ImportCandidate(path=path, row_count=len(rows), format_name=fmt.name)
 
 
-def _dict_reader(text: str) -> "csv.DictReader":
-    """A reader whose header is the first line that actually names any column.
+CANDIDATE_DELIMITERS = (",", ";", "\t", "|")
 
-    An export edited in a spreadsheet can carry blank leading rows — lines of bare
-    commas. csv would take the first of those as the header, name every column "", and
-    leave the setup wizard asking which of ten empty strings holds the amount.
 
-    Lines are dropped whole and the remainder rejoined untouched, so a quoted field
-    containing a newline further down the file survives.
+def _delimiter_score(text: str, delimiter: str) -> Tuple[int, int, int]:
+    """How much like a table ``text`` reads when split on ``delimiter``.
+
+    ``(is_tabular, rows_agreeing, columns)`` -- bigger is better. The right separator
+    turns a file into many rows that all have the same number of columns; a wrong one
+    leaves nearly every line as a single field. That difference is what is measured,
+    rather than any property of the punctuation itself.
     """
+    try:
+        rows = [row for row in csv.reader(io.StringIO(text), delimiter=delimiter) if row]
+    except csv.Error:
+        return (0, 0, 0)
+    widths = Counter(len(row) for row in rows if any(cell.strip() for cell in row))
+    if not widths:
+        return (0, 0, 0)
+    columns, agreeing = widths.most_common(1)[0]
+    # A single column means the separator never appeared; that is the losing case.
+    return (1 if columns > 1 else 0, agreeing, columns)
+
+
+def _sniff_delimiter(text: str) -> str:
+    """The field separator, chosen by which one actually makes the file tabular.
+
+    csv.Sniffer is deliberately not trusted on its own here. It resolves a semicolon
+    confidently only when the sample happens to contain a *quoted* field with a
+    semicolon inside it; a plainly separated file with no such field raises csv.Error
+    and falls back to comma, which silently reproduces the bug this replaced -- the
+    whole header collapsing into one column. A real export only avoided that by
+    happening to contain a quoted address.
+
+    Scoring every candidate has no such blind spot and is deterministic: the delimiter
+    that yields the most rows of equal, greater-than-one width wins. Comma breaks ties,
+    so a file that is tabular under more than one candidate keeps reading as it always
+    did.
+    """
+    best = ","
+    best_score = _delimiter_score(text, ",")
+    for delimiter in CANDIDATE_DELIMITERS:
+        if delimiter == ",":
+            continue
+        score = _delimiter_score(text, delimiter)
+        if score > best_score:
+            best, best_score = delimiter, score
+    return best
+
+
+# What a data cell -- a date, an amount, an account or reference number -- is made of:
+# digits plus the separators those shapes use. A column name essentially never matches
+# this on its own, which is what makes it useful for telling the two apart below.
+_NUMERIC_CELL_RE = re.compile(r"^[+-]?[$€£]?[\d.,:/\s-]+$")
+
+
+def _looks_numeric(cell: str) -> bool:
+    return bool(cell) and bool(_NUMERIC_CELL_RE.match(cell))
+
+
+def _looks_like_header(cells: Sequence[str]) -> bool:
+    """True when a row of cells reads as column names, not data or a padded title.
+
+    At least two non-empty cells, all of them distinct, and not more than half
+    numeric-looking. A title row padded to the file's column count ("Account
+    Statement,,,,,,,") has exactly one non-empty cell and fails the first test; an
+    ordinary data row fails the last.
+    """
+    values = [cell.strip() for cell in cells if (cell or "").strip()]
+    if len(values) < 2 or len(set(values)) != len(values):
+        return False
+    numeric = sum(1 for value in values if _looks_numeric(value))
+    return numeric * 2 <= len(values)
+
+
+def _find_header_index(lines: Sequence[str], delimiter: str) -> int:
+    """Index into ``lines`` of the physical line the real header starts on.
+
+    Rows are parsed with a real csv.reader over the whole file, not line by line -- a
+    quoted field spanning several physical lines (a legal disclaimer, an address with
+    embedded newlines, both seen in real exports) would otherwise fragment into many
+    single-cell "rows" on a naive per-line parse and swamp the modal field count with
+    noise. The counting wrapper below is how each logical row's *starting* physical line
+    is recovered even though csv.reader itself only yields the joined-up row -- the
+    caller needs that line number to slice the original, untouched text.
+
+    The header is the first row whose field count equals the file's modal count and
+    that looks like column names (see _looks_like_header). Modal count alone is not
+    enough: an export that pads every line -- title rows included -- to one width would
+    match on the first line, which is a title, not a header. Falls back to the first
+    non-blank row when nothing satisfies both, so a file neither test likes degrades to
+    the old behavior (skip blank rows, take what's left) instead of failing outright.
+    """
+    consumed = 0
+
+    def _counting_lines():
+        nonlocal consumed
+        for line in lines:
+            consumed += 1
+            yield line
+
+    records: List[Tuple[int, List[str]]] = []
+    start = 0
+    for cells in csv.reader(_counting_lines(), delimiter=delimiter):
+        records.append((start, cells))
+        start = consumed
+
+    counts = [len(cells) for _, cells in records if any((c or "").strip() for c in cells)]
+    if counts:
+        modal_count = Counter(counts).most_common(1)[0][0]
+        for line_index, cells in records:
+            if len(cells) == modal_count and _looks_like_header(cells):
+                return line_index
+    for line_index, cells in records:
+        if any((c or "").strip() for c in cells):
+            return line_index
+    return 0  # nothing but blanks; let csv report it
+
+
+def _dict_reader(text: str) -> "csv.DictReader":
+    """A reader whose delimiter and header line are sniffed rather than assumed.
+
+    Both :func:`read_header_and_rows` (inference, ``inspect_csv``) and
+    :func:`import_csv` route through this one function on the same file text, which is
+    what keeps them agreeing on where the header is: neither could compute it
+    differently even if it wanted to. The header line and everything after it is
+    rejoined untouched, so a quoted field containing a newline further down the file
+    survives.
+    """
+    delimiter = _sniff_delimiter(text)
     lines = text.splitlines(keepends=True)
-    for index, line in enumerate(lines):
-        if any((cell or "").strip() for cell in next(csv.reader([line]), [])):
-            return csv.DictReader(io.StringIO("".join(lines[index:])))
-    return csv.DictReader(io.StringIO(text))  # nothing but blanks; let csv report it
+    index = _find_header_index(lines, delimiter)
+    return csv.DictReader(io.StringIO("".join(lines[index:])), delimiter=delimiter)
 
 
 def read_header_and_rows(path: Path):
@@ -373,7 +514,7 @@ def read_header_and_rows(path: Path):
 def import_csv(
     session: Session,
     path: Path,
-    currency_code: str = DEFAULT_CURRENCY_CODE,
+    currency_code: Optional[str] = None,
     account_name: Optional[str] = None,
     fmt: Optional[FormatSpec] = None,
 ) -> ImportResult:
@@ -381,6 +522,11 @@ def import_csv(
 
     Formats come from the database (see :mod:`.formats`), so which banks you use is not
     recorded anywhere in the source tree.
+
+    ``currency_code`` wins if given; otherwise the format's own ``currency`` is used
+    (every format has one, defaulting to USD), falling back to :data:`DEFAULT_CURRENCY_CODE`
+    only in the case -- unreachable in practice, since every ``FormatSpec`` carries a
+    currency -- where no format is available to ask.
 
     ``account_name`` names the account for formats whose files carry no account column;
     passing it for other formats overrides the account they would have derived.
@@ -399,7 +545,13 @@ def import_csv(
 
     from . import wise
 
-    if fmt is None and wise.looks_like_wise(fieldnames):
+    # Checked before `fmt`, not only when it is absent. A caller that resolved a format
+    # first -- which is what both the app's import panel and the CLI do -- would
+    # otherwise hand this layout to the generic parser, and a row carrying two
+    # currencies has no single amount column for it to read. There is no format that
+    # could correctly describe this file, so a format argument cannot outrank the
+    # signature.
+    if wise.looks_like_wise(fieldnames):
         return import_wise_csv(session, path)
 
     if fmt is None:
@@ -417,7 +569,8 @@ def import_csv(
         )
     rows = list(reader)
 
-    currency = _get_or_create_currency(session, currency_code)
+    resolved_currency_code = currency_code or fmt.currency or DEFAULT_CURRENCY_CODE
+    currency = _get_or_create_currency(session, resolved_currency_code)
 
     import_record = Import(source_file=path.name, row_count=len(rows))
     session.add(import_record)
