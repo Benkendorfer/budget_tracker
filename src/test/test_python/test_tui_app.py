@@ -20,10 +20,12 @@ from textual.widgets import DataTable, Input, ListView, Static
 
 from budget_tracker import categories, queries, rates, stats, transfers, vendors
 from budget_tracker.db import DuplicateCategoryNamesError, get_engine, get_sessionmaker, init_db
+from budget_tracker.importer import import_csv
 from budget_tracker.models import Account, Currency, Transaction
 from budget_tracker.tui import BudgetApp
 
 from conftest import CSV, _category_of, _panel_state, _seed_category_hierarchy, _setup, _setup_recent
+from helpers import learn_format
 
 
 def test_shortcut_prefills_highlighted_raw_vendor(tmp_path, monkeypatch):
@@ -143,6 +145,199 @@ def test_shortcut_with_no_vendor_selected_does_nothing(tmp_path, monkeypatch):
             return app.query_one("#command", Input).value
 
     assert asyncio.run(run()) == ""
+
+
+# ------------------------------------------------------------- vendor sidebar cap
+
+
+def _setup_many_vendors(tmp_path, monkeypatch, count):
+    """A database with ``count`` distinct one-off vendors, "VENDOR 0000".."VENDOR NNNN".
+
+    Every vendor has exactly one transaction, so queries.get_vendors' (-count,
+    name.lower()) sort falls back to name order, and the zero-padding keeps that the
+    same as numeric order -- a test can predict exactly which vendor sits at which
+    sidebar row. Dated today so a ``stats 1m`` window (built relative to
+    ``datetime.date.today()``, never hardcoded) picks all of them up.
+    """
+    db_path = tmp_path / "many_vendors.db"
+    engine = get_engine(db_path)
+    init_db(engine)
+    session_factory = get_sessionmaker(engine)
+    today = datetime.date.today().isoformat()
+    lines = ["Transaction Date,Posted Date,Card No.,Description,Category,Debit,Credit"]
+    for i in range(count):
+        lines.append(f"{today},{today},1234,VENDOR {i:04d},Dining,1.00,")
+    csv_path = tmp_path / "many_vendors.csv"
+    csv_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    with session_factory() as session:
+        learn_format(session, csv_path)
+        import_csv(session, csv_path)
+    monkeypatch.setenv("BUDGET_DB", str(db_path))
+    return session_factory
+
+
+def _vendor_sidebar_labels(app):
+    return [
+        str(item.children[0].content)
+        for item in app.query_one("#vendors", ListView).children
+    ]
+
+
+def test_vendor_sidebar_below_the_cap_shows_every_vendor(tmp_path, monkeypatch):
+    """Right at BudgetApp.VENDOR_SIDEBAR_CAP, nothing is hidden and there is no "more" row."""
+    _setup_many_vendors(tmp_path, monkeypatch, BudgetApp.VENDOR_SIDEBAR_CAP)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            return _vendor_sidebar_labels(app)
+
+    labels = asyncio.run(run())
+    # "— All —" plus one row per vendor, and nothing else.
+    assert len(labels) == BudgetApp.VENDOR_SIDEBAR_CAP + 1
+    assert labels[1] == "VENDOR 0000 (1)"
+    assert labels[-1] == f"VENDOR {BudgetApp.VENDOR_SIDEBAR_CAP - 1:04d} (1)"
+    assert not any("more" in label for label in labels)
+
+
+def test_vendor_sidebar_over_the_cap_truncates_and_notes_the_rest(tmp_path, monkeypatch):
+    total = BudgetApp.VENDOR_SIDEBAR_CAP + 21
+    _setup_many_vendors(tmp_path, monkeypatch, total)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            return _vendor_sidebar_labels(app), len(app._vendors)
+
+    labels, vendor_count = asyncio.run(run())
+    assert vendor_count == total
+    # "— All —" plus the capped vendors plus one trailing summary row.
+    assert len(labels) == BudgetApp.VENDOR_SIDEBAR_CAP + 2
+    # The highest-traffic (here: alphabetically first, since all counts tie) vendors
+    # are the ones kept, not an arbitrary or reshuffled subset.
+    assert labels[1] == "VENDOR 0000 (1)"
+    assert labels[BudgetApp.VENDOR_SIDEBAR_CAP] == (
+        f"VENDOR {BudgetApp.VENDOR_SIDEBAR_CAP - 1:04d} (1)"
+    )
+    last = labels[-1]
+    assert "21 more" in last
+    assert "filter vendor:" in last
+
+
+def test_vendor_sidebar_more_row_fits_the_sidebar_width(tmp_path, monkeypatch):
+    """The summary row must not run past the sidebar's own item width, or Textual
+    hard-clips it mid-word with no ellipsis -- see formatting._truncate."""
+    _setup_many_vendors(tmp_path, monkeypatch, BudgetApp.VENDOR_SIDEBAR_CAP + 8000)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            await pilot.pause()
+            item = app.query_one("#vendors", ListView).children[-1]
+            label = str(item.children[0].content)
+            width = item.content_size.width
+            return label, width
+
+    label, width = asyncio.run(run())
+    assert "8000 more" in label
+    assert len(label) <= width
+
+
+def test_clicking_the_vendor_sidebar_more_row_does_not_filter(tmp_path, monkeypatch):
+    _setup_many_vendors(tmp_path, monkeypatch, BudgetApp.VENDOR_SIDEBAR_CAP + 5)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            vendors_list = app.query_one("#vendors", ListView)
+            vendors_list.focus()
+            vendors_list.index = len(vendors_list.children) - 1  # the "N more" row
+            await pilot.press("enter")
+            await pilot.pause()
+            return app.vendor_filter, [n.message for n in app._notifications]
+
+    vendor_filter, messages = asyncio.run(run())
+    assert vendor_filter is None
+    assert any("filter vendor:" in message for message in messages)
+
+
+def test_shortcut_on_the_vendor_sidebar_more_row_falls_back(tmp_path, monkeypatch):
+    """ctrl+n on the summary row must not resolve to whatever real vendor happens to
+    sit at that row's index -- see BudgetApp._selected_vendor."""
+    _setup_many_vendors(tmp_path, monkeypatch, BudgetApp.VENDOR_SIDEBAR_CAP + 5)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            vendors_list = app.query_one("#vendors", ListView)
+            vendors_list.index = len(vendors_list.children) - 1  # the "N more" row
+            await pilot.press("ctrl+n")
+            return app.query_one("#command", Input).value
+
+    assert asyncio.run(run()) == ""
+
+
+def test_vendor_sidebar_survives_a_drill_round_trip_over_the_cap(tmp_path, monkeypatch):
+    """A statistics drill-down and return must leave the capped list exactly as it
+    was, not stale and not rebuilt into something wrong."""
+    _setup_many_vendors(tmp_path, monkeypatch, BudgetApp.VENDOR_SIDEBAR_CAP + 5)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._run_command("stats 1m")
+            await pilot.pause()
+            table = app.query_one("#stats_table", DataTable)
+            table.move_cursor(row=0)
+            before = _vendor_sidebar_labels(app)
+            await pilot.press("right")
+            await pilot.pause()
+            await pilot.press("left")
+            await pilot.pause()
+            after = _vendor_sidebar_labels(app)
+            return before, after
+
+    before, after = asyncio.run(run())
+    assert before == after
+    assert len(after) == BudgetApp.VENDOR_SIDEBAR_CAP + 2
+    assert "5 more" in after[-1]
+
+
+def test_vendor_sidebar_more_count_updates_when_new_vendors_cross_the_cap(
+    tmp_path, monkeypatch
+):
+    """The trailing row's own count depends on the hidden total, so a real change in
+    that total (a fresh import, here) must still reach the screen -- _fill_list's
+    cache guard compares the *rendered* labels, and the summary text is one of them."""
+    session_factory = _setup_many_vendors(tmp_path, monkeypatch, BudgetApp.VENDOR_SIDEBAR_CAP)
+    today = datetime.date.today().isoformat()
+    extra_csv = tmp_path / "extra.csv"
+    extra_csv.write_text(
+        "Transaction Date,Posted Date,Card No.,Description,Category,Debit,Credit\n"
+        f"{today},{today},1234,VENDOR EXTRA,Dining,1.00,\n",
+        encoding="utf-8",
+    )
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            before = _vendor_sidebar_labels(app)
+            with session_factory() as session:
+                import_csv(session, extra_csv)
+                session.commit()
+            app.reload()
+            await pilot.pause()
+            after = _vendor_sidebar_labels(app)
+            return before, after
+
+    before, after = asyncio.run(run())
+    assert not any("more" in label for label in before)
+    assert "1 more" in after[-1]
 
 
 def _seed_same_account_transfer_candidates(tmp_path, monkeypatch):

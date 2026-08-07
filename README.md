@@ -61,8 +61,11 @@ budget          # equivalent to: budget tui
 ```
 
 The sidebar lists accounts, vendors, and categories — click any row to filter the
-transaction table, and the totals line updates to match. Type commands into the bar at
-the bottom:
+transaction table, and the totals line updates to match. The vendor list shows your 200
+most active vendors (already sorted by transaction count); past that it shows a count of
+how many more there are rather than mounting one row per vendor, which is what keeps a
+years-long history feeling instant — `filter vendor:<text>` still reaches any vendor not
+listed. Type commands into the bar at the bottom:
 
 | Command | Effect |
 | --- | --- |

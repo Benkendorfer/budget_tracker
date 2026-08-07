@@ -92,6 +92,19 @@ class BudgetApp(App):
     # Panels whose widget is not itself focusable name the child that takes focus.
     PANEL_FOCUS = {"stats": "#stats_table"}
 
+    # The vendor sidebar mounts one ListItem per row, and a real history runs to
+    # hundreds of distinct merchants. _fill_list's cache guard already skips rebuilding
+    # it when nothing changed, but Textual's full (non-scroll) reflow walks *every*
+    # mounted widget regardless of whether it changed -- see
+    # src/profiling/sidebar_isolation.py, where merely having ~1,000 vendor widgets
+    # mounted cost ~400ms on every reload() no matter how little of the app actually
+    # changed. Capping the list is the only lever that touches that: the vendors are
+    # already sorted by transaction count (queries.get_vendors), so the cap only hides
+    # the long tail of one-off merchants, and `filter vendor:<text>` still reaches any
+    # of them. Chosen from the same profile: 200 keeps the round trip close to the
+    # floor of never rebuilding the sidebar at all, while 300 was already visibly worse.
+    VENDOR_SIDEBAR_CAP = 200
+
     # Footer labels are terse on purpose. Textual's Footer truncates mid-word rather than
     # dropping whole entries, so a verbose label does not cost itself — it costs every
     # binding after it, silently. At 130 columns the descriptive originals ran to ~160
@@ -388,6 +401,26 @@ class BudgetApp(App):
         self.query_one("#command", Input).focus()
 
     # ------------------------------------------------------------------ data
+    def _active_filters(self) -> queries.Filters:
+        """The app's active filters as one value.
+
+        These five always travel together and always mean the same thing; passing them
+        one at a time is what made adding a sixth touch every signature. Named
+        ``_active_filters`` rather than the obvious ``_filters`` because Textual's own
+        ``App`` already owns that attribute -- a list of line filters -- and shadowing it
+        replaces the method with a list the moment the app initialises. A caller that
+        needs a different range says so with ``.replace(date_range=...)`` -- the
+        statistics and chart panels do, because their window is the range, not whatever
+        a drill-down happened to leave on ``self.date_filter``.
+        """
+        return queries.Filters(
+            account_id=self.account_filter,
+            category_id=self.category_filter,
+            vendor_filter=self.vendor_filter,
+            text_filter=self.text_filter,
+            date_range=self.date_filter,
+        )
+
     def reload(self) -> None:
         with self.session_factory() as session:
             self._accounts = queries.get_accounts(session)
@@ -398,22 +431,14 @@ class BudgetApp(App):
             self._category_rules = queries.get_category_rules(session)
             txns = queries.get_transactions(
                 session,
-                self.account_filter,
-                self.category_filter,
-                self.vendor_filter,
-                text_filter=self.text_filter,
-                date_range=self.date_filter,
+                filters=self._active_filters(),
             )
             totals = queries.get_totals(
                 session,
-                self.account_filter,
-                self.category_filter,
-                self.vendor_filter,
-                text_filter=self.text_filter,
-                date_range=self.date_filter,
+                filters=self._active_filters(),
             )
         self._fill_list("#accounts", [f"{a.name} ({a.count})" for a in self._accounts])
-        self._fill_list("#vendors", [f"{v.name} ({v.count})" for v in self._vendors])
+        self._fill_list("#vendors", self._vendor_labels())
         self._fill_list(
             "#categories",
             [
@@ -470,6 +495,28 @@ class BudgetApp(App):
             [ListItem(Label("— All —"))] + [ListItem(Label(label)) for label in labels]
         )
 
+    def _vendor_shown_count(self) -> int:
+        """How many real vendor rows the sidebar has mounted -- see VENDOR_SIDEBAR_CAP."""
+        return min(len(self._vendors), self.VENDOR_SIDEBAR_CAP)
+
+    def _vendor_labels(self) -> List[str]:
+        """Labels for the vendor sidebar, capped at VENDOR_SIDEBAR_CAP.
+
+        self._vendors is already sorted by transaction count (queries.get_vendors), so
+        truncating here only drops the long tail of one-off merchants, and the trailing
+        row says how many and how to still reach them.
+        """
+        labels = [f"{v.name} ({v.count})" for v in self._vendors]
+        shown = self._vendor_shown_count()
+        if shown < len(labels):
+            hidden = len(labels) - shown
+            # 34: the sidebar's item content width (36 minus the ListView's own
+            # padding) -- see test_vendor_sidebar_more_row_fits_the_sidebar_width.
+            labels = labels[:shown] + [
+                _truncate(f"… {hidden} more, try 'filter vendor:'", 34)
+            ]
+        return labels
+
     def _fill_txns(self, txns: List[queries.TxnRow]) -> None:
         table = self.query_one("#txns", DataTable)
         self._txns = txns
@@ -494,10 +541,7 @@ class BudgetApp(App):
             self._report = stats.build_report(
                 session,
                 self.window,
-                self.account_filter,
-                self.category_filter,
-                self.vendor_filter,
-                text_filter=self.text_filter,
+                filters=self._active_filters().replace(date_range=None),
             )
 
     def _fill_stats(self) -> None:
@@ -554,18 +598,13 @@ class BudgetApp(App):
                 session,
                 self.window,
                 self._bucket,
-                self.account_filter,
-                self.category_filter,
-                self.vendor_filter,
-                text_filter=self.text_filter,
+                filters=self._active_filters().replace(date_range=None),
             )
             totals = queries.get_totals(
                 session,
-                self.account_filter,
-                self.category_filter,
-                self.vendor_filter,
-                text_filter=self.text_filter,
-                date_range=(self.window.start, self.window.end),
+                filters=self._active_filters().replace(
+                    date_range=(self.window.start, self.window.end)
+                ),
             )
         self._chart = charts.build(series, measure=self._measure, width=CHART_WIDTH)
         self._chart_transfers = totals.transfer_count
@@ -706,11 +745,21 @@ class BudgetApp(App):
 
     # ---------------------------------------------------------------- events
     def on_list_view_selected(self, event: ListView.Selected) -> None:
+        index = event.list_view.index or 0
+        list_id = event.list_view.id
+        if list_id == "vendors" and index > self._vendor_shown_count():
+            # The trailing "N more" row: not a vendor, just a count. See
+            # VENDOR_SIDEBAR_CAP -- clicking it should not silently filter by whatever
+            # real vendor happens to sit at that row index.
+            self.notify(
+                "That row is just a count, not a vendor. "
+                "Use 'filter vendor:<text>' to find one further down the list.",
+                severity="warning",
+            )
+            return
         # A sidebar filter is a new view; the flag it might invalidate is checked in
         # _set_drilled_from() (no-op if it was already clear).
         self._set_drilled_from(None)
-        index = event.list_view.index or 0
-        list_id = event.list_view.id
         if list_id == "accounts":
             self.account_filter = None if index == 0 else self._accounts[index - 1].id
         elif list_id == "vendors":
@@ -2003,9 +2052,12 @@ class BudgetApp(App):
                 if (vendor.kind, vendor.id) == (kind, vendor_id):
                     return vendor
             return None
-        # Index 0 is the "— All —" row, so the list is offset by one.
+        # Index 0 is the "— All —" row, so the list is offset by one. Bounded by what is
+        # actually mounted (see VENDOR_SIDEBAR_CAP), not the full vendor count, or this
+        # would resolve the trailing "N more" row to whatever real vendor happens to sit
+        # at that index.
         index = self.query_one("#vendors", ListView).index or 0
-        if not 1 <= index <= len(self._vendors):
+        if not 1 <= index <= self._vendor_shown_count():
             return None
         return self._vendors[index - 1]
 
