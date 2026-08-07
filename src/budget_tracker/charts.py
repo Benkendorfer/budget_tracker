@@ -302,100 +302,6 @@ PIE_WIDTH = 40
 PIE_HEIGHT = 20
 
 
-@dataclass(frozen=True)
-class PieSlice:
-    """One depth-0 category's wedge, in the clockwise-from-the-top order it is drawn."""
-
-    name: str
-    category_id: int
-    share: float  # of the window's net spend; sums to ~1.0 across every slice
-    amount_minor: int  # this category's own net spend, as a positive magnitude
-
-
-@dataclass(frozen=True)
-class Pie:
-    slices: List[PieSlice]
-    width: int
-    height: int
-    # mask[row][col] is the index into `slices` that cell belongs to, or None outside the
-    # circle. No colour and no characters here, on purpose: charts.py only knows
-    # geometry, and the TUI turns an index into a colour and a block character.
-    mask: List[List[Optional[int]]]
-
-
-def build_pie(
-    categories: List[CategoryStat], width: int = PIE_WIDTH, height: int = PIE_HEIGHT
-) -> Pie:
-    """Depth-0 category shares laid out as a circle, ``width`` x ``height`` cells.
-
-    Only ``depth == 0`` rows with a nonzero ``share`` take part. Summing every depth
-    would double-count a parent with its children (see stats.Report.categories), and a
-    net-positive row — all refund, no real spend — has ``share == 0.0`` by construction
-    (see CategoryStat.share) and is left out rather than drawn as a slice with no width.
-    A category list with nothing left after that filter (an empty report, or one that
-    was all income) produces an empty pie: no slices, and a mask that is ``None``
-    everywhere, which the TUI reads as "nothing to draw" rather than trying to render a
-    circle with no wedges in it.
-
-    Slices are laid out clockwise from twelve o'clock in the order given, each claiming
-    the angular wedge its own share earns. A cell belongs to whichever slice's wedge
-    contains the angle from the pie's centre to that cell; a cell outside the circle
-    belongs to none.
-    """
-    if width < 1 or height < 1:
-        raise ValueError(f"Pie width and height must be at least 1, got {width}x{height}.")
-    slices = [
-        PieSlice(
-            name=cat.name,
-            category_id=cat.category_id,
-            share=cat.share,
-            amount_minor=-cat.total_minor,
-        )
-        for cat in categories
-        if cat.depth == 0 and cat.share > 0
-    ]
-    mask: List[List[Optional[int]]] = [[None] * width for _ in range(height)]
-    if slices:
-        boundaries: List[float] = []
-        cumulative = 0.0
-        for one_slice in slices:
-            cumulative += one_slice.share
-            boundaries.append(cumulative)
-        cx, cy = width / 2, height / 2
-        for row in range(height):
-            # Normalised to the box's own half-height/half-width, so the same loop draws
-            # a circle in any box the caller hands it — an ellipse is exactly what a
-            # circle looks like once you stop assuming the box is square.
-            ny = (row + 0.5 - cy) / cy
-            for col in range(width):
-                nx = (col + 0.5 - cx) / cx
-                if nx * nx + ny * ny > 1.0:
-                    continue
-                mask[row][col] = _slice_at_angle(nx, ny, boundaries)
-    return Pie(slices=slices, width=width, height=height, mask=mask)
-
-
-def _slice_at_angle(nx: float, ny: float, boundaries: List[float]) -> int:
-    """The slice whose wedge contains the cell at normalised offset ``(nx, ny)``.
-
-    Angle is measured clockwise from twelve o'clock (``nx=0, ny=-1``), which is why the
-    arguments to ``atan2`` are swapped and negated from the usual "counterclockwise from
-    three o'clock" convention — that is what makes 0.0 land at the top and 0.5 at the
-    bottom, matching how the slices are listed and legended.
-    """
-    angle = math.atan2(nx, -ny)
-    if angle < 0:
-        angle += 2 * math.pi
-    fraction = angle / (2 * math.pi)
-    for index, upper in enumerate(boundaries):
-        if fraction < upper:
-            return index
-    # Floating-point drift in the running sum of shares can leave the last boundary a
-    # hair under 1.0; the last slice claims whatever is left rather than a cell going
-    # unassigned over a rounding error.
-    return len(boundaries) - 1
-
-
 # ------------------------------------------------------------------ the share bar
 
 # One row, one cell per percent. A circle drawn in character cells is coarse — at the
@@ -473,7 +379,7 @@ def build_share_bar(
 ) -> ShareBar:
     """Depth-0 category shares as a single proportional bar ``width`` cells long.
 
-    The same input rule as :func:`build_pie`: only ``depth == 0`` rows with a nonzero
+    Only ``depth == 0`` rows with a nonzero
     share, because summing every depth would count a parent with its children (see
     stats.Report.categories), and a net-positive row is already 0.0 by construction.
 

@@ -46,13 +46,31 @@ CHART_COLUMNS = {
     "income": (("In", "inflow"), ("Net", "net")),
 }
 
-# Cycled by slice index. charts.build_pie() only knows which cell belongs to which
-# slice — this is the styling half of that split, and the only place a color is chosen.
+# Cycled by segment index. charts.build_stacked_share() only knows which cell belongs
+# to which category — this is the styling half of that split, and the only place a
+# color is chosen; the pie panel assigns one of these per StackedShareChart.segments
+# entry and reuses it for the top bar and every bucket bar (see tui/pie.py).
+#
+# Explicit hex, not the named terminal colors this replaced: a name like "red" or
+# "magenta" resolves however the user's own terminal theme decides, and on a real
+# theme two names can land on nearly the same crimson — invisible exactly where a
+# stacked bar puts them, side by side. Okabe–Ito, chosen to stay distinct under the
+# common forms of color blindness as well as under an ordinary theme.
 PIE_COLORS = (
-    "red", "green", "yellow", "blue", "magenta", "cyan",
-    "bright_red", "bright_green", "bright_yellow", "bright_blue",
-    "bright_magenta", "bright_cyan",
+    "#E69F00",  # orange
+    "#56B4E9",  # sky blue
+    "#009E73",  # bluish green
+    "#F0E442",  # yellow
+    "#0072B2",  # blue
+    "#D55E00",  # vermillion
+    "#CC79A7",  # reddish purple
 )
+
+# Other is a catch-all standing in for several categories, not a category itself (see
+# ShareSegment.is_other) — a fixed neutral gray says so at a glance, rather than
+# letting it take whichever hue the cycle would otherwise have handed the next real
+# segment, which is one fewer hue available to tell two real categories apart.
+OTHER_COLOR = "#999999"
 
 
 def _fmt_amount(minor: int, decimal_places: int = 2) -> str:

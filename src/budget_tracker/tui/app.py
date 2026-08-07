@@ -73,6 +73,16 @@ IMPORT_PROBLEMS = (
     formats.AccountCurrencyMismatch,
 )
 
+# The chart panel's own 'b' cycle, kept separate from queries.BUCKETS now that the
+# latter also offers "year" — daily bars are only useful on the chart, over a window
+# short enough to read, so adding "year" there must not change what 'b' cycles through.
+_CHART_BUCKETS = ("day", "week", "month")
+
+# The pie panel's own 'b' cycle: no daily bucket (a year by day is 365 rows), but a
+# yearly one, since a multi-year window benefits from it in a way the chart's shorter
+# windows rarely do.
+_SHARE_BUCKETS = ("week", "month", "year")
+
 
 class BudgetApp(App):
     CSS = """
@@ -217,9 +227,14 @@ class BudgetApp(App):
         # Same idea for rows a missing exchange rate left out of the bars entirely --
         # see queries.Totals.unconverted_count and UNCONVERTED_MARK.
         self._chart_unconverted = 0
-        # The pie's last-built wedges, drawn from the same report the statistics panel
-        # uses (see reload()'s guard) — there is no separate query for it.
-        self._pie: Optional[charts.Pie] = None
+        # The pie panel's last-built stacked share chart: one bar for the whole window
+        # plus one per bucket, drawn from the same report the statistics panel uses
+        # (see reload()'s guard) plus its own per-bucket query (see _build_pie()).
+        self._pie: Optional[charts.StackedShareChart] = None
+        # The pie panel's own bucket, cycled by 'b' independently of the chart's — see
+        # _SHARE_BUCKETS. Monthly by default; sticky across a new period the same way
+        # the chart's measure is, not re-derived from the window's length.
+        self._pie_bucket = "month"
         self._range_pending = False  # awaiting a typed date range for the picker
         # Which panel the period picker is choosing for: "stats", "chart", or "pie". All
         # three open the same picker, and it has to know where the answer goes.
@@ -307,7 +322,12 @@ class BudgetApp(App):
                 and self.focused is not None
                 and self.focused.id == "stats_table"
             )
-        if action in ("cycle_bucket", "cycle_measure"):
+        if action == "cycle_bucket":
+            return self.focused is not None and (
+                (self._panel == "chart" and self.focused.id == "chart")
+                or (self._panel == "pie" and self.focused.id == "pie")
+            )
+        if action == "cycle_measure":
             return (
                 self._panel == "chart"
                 and self.focused is not None
@@ -394,7 +414,12 @@ class BudgetApp(App):
 
         self.query_one("#stats", Vertical).display = False
         chart.display = False
-        self.query_one("#pie", Static).display = False
+        pie = self.query_one("#pie", Static)
+        pie.display = False
+        # A plain Static cannot take focus by default; it needs to here so 'b' reaches
+        # action_cycle_bucket instead of being typed into the command bar (see
+        # _set_panel()).
+        pie.can_focus = True
         self.query_one("#prompt", Static).display = False
 
         self.reload()
@@ -463,9 +488,9 @@ class BudgetApp(App):
         if self._panel == "chart" and self.window is not None:
             self._build_chart()
             self._fill_chart()
-        # And the pie: it draws from the same report the statistics panel does, so a
-        # filter change has to rebuild that too, or the wedges would keep showing the
-        # scope that was active when the panel was opened.
+        # And the pie: it draws from the same report the statistics panel does, plus
+        # its own per-bucket series, so a filter change has to rebuild both or the bars
+        # would keep showing the scope that was active when the panel was opened.
         if self._panel == "pie" and self.window is not None:
             self._build_report()
             self._build_pie()
@@ -633,16 +658,28 @@ class BudgetApp(App):
 
     # ------------------------------------------------------------------- pie
     def _build_pie(self) -> None:
-        """Turn the already-built report into wedges. See pie_panel.build_pie()."""
-        self._pie = pie_panel.build_pie(self._report)
+        """Fetch this window's per-bucket category series and turn it, with the
+        already-built report, into the stacked share chart. See pie_panel.build_stacked().
+        """
+        if self.window is None:
+            self._pie = None
+            return
+        with self.session_factory() as session:
+            buckets = stats.category_share_series(
+                session,
+                self.window,
+                self._pie_bucket,
+                filters=self._active_filters().replace(date_range=None),
+            )
+        self._pie = pie_panel.build_stacked(self._report, buckets)
 
     def _fill_pie(self) -> None:
-        """Render the wedges and their legend into the pie Static."""
-        pie_panel.fill_pie(self.query_one("#pie", Static), self._pie)
+        """Render the top bar, the per-bucket bars, and their shared legend."""
+        pie_panel.fill_pie(self.query_one("#pie", Static), self._pie, self.window)
 
     def _pie_status(self) -> str:
         """One line, the same shape as _stats_status()/_chart_status()."""
-        return pie_panel.pie_status(self._report, self._pie)
+        return pie_panel.pie_status(self._report, self._pie, self._pie_bucket)
 
     def _fill_periods(self) -> None:
         periods_panel.fill_periods(self.query_one("#periods", DataTable))
@@ -943,7 +980,7 @@ class BudgetApp(App):
         bucket = measure = None
         while parts:
             tail = parts[-1].lower()
-            if bucket is None and tail in queries.BUCKETS:
+            if bucket is None and tail in _CHART_BUCKETS:
                 bucket = tail
             elif measure is None and tail in charts.MEASURE_ALIASES:
                 measure = charts.MEASURE_ALIASES[tail]
@@ -1216,10 +1253,14 @@ class BudgetApp(App):
                 "  click a category in the sidebar to chart just that category\n"
                 "  enter, or the right arrow, on a bar lists that bucket's\n"
                 "  transactions; the left arrow goes back to the chart\n"
-                "pie — pick a period, then see spending by category as a pie\n"
+                "pie — pick a period, then see each category's share of spending as\n"
+                "  one bar for the whole window, plus one bar per bucket beneath it\n"
+                "  showing the same breakdown over time, all in the same colors\n"
                 "pie <period> — skip the picker (e.g. pie 6m, pie 1 year)\n"
-                "  only categories with real net spend get a wedge — a category\n"
-                "  that is all refund, or a window with no spending, draws none\n"
+                "  b cycles the bucket: week, month (default), year — no daily\n"
+                "  only categories with real net spend get a segment — a category\n"
+                "  that is all refund, or a window with no spending, draws none;\n"
+                "  small categories fold into Other\n"
                 "rates — list cached exchange rates (pair, source, span, count)\n"
                 "rates fetch — cache ECB reference rates for every foreign currency\n"
                 "  on file, over its whole date range; runs in the background so the\n"
@@ -1405,12 +1446,13 @@ class BudgetApp(App):
             self.query_one(f"#{name}").display = name == panel
         # The prompt belongs to whichever panel last raised a question.
         self.query_one("#prompt", Static).display = panel == self._prompt_panel
-        if panel in ("txns", "pie"):
-            # "pie" has nothing to put a cursor on — a Static, not a DataTable — so it
-            # leaves the command bar focused rather than trying (and failing) to focus
-            # something that cannot take it.
+        if panel == "txns":
             self.query_one("#command", Input).focus()
         else:
+            # "pie" is a Static with nothing to put a cursor on, but on_mount() still
+            # makes it focusable so 'b' reaches action_cycle_bucket instead of being
+            # typed into the command bar — Input swallows plain letter keys whenever it
+            # holds focus (see test_the_chart_keys_are_inert_outside_the_chart).
             self.query_one(self.PANEL_FOCUS.get(panel, f"#{panel}")).focus()
         self._refresh_status()
 
@@ -2130,15 +2172,23 @@ class BudgetApp(App):
         self._toggle_fold_all()
 
     def action_cycle_bucket(self) -> None:
-        """``b`` on the chart: step day → week → month → day. See check_action().
+        """``b``: on the chart, step day → week → month → day; on the pie, step
+        week → month → year → week. See check_action() for which panel gets which.
 
         A cycle rather than three keys, and it does not skip a bucket that would be
         unwieldy for the window: charting two years by day is a bad idea but it is the
         user's to make, and a key that silently refuses to do anything is worse.
         """
+        if self._panel == "pie":
+            if self.window is None:
+                return
+            order = _SHARE_BUCKETS
+            self._pie_bucket = order[(order.index(self._pie_bucket) + 1) % len(order)]
+            self._redraw_pie()
+            return
         if self.window is None or self._bucket is None:
             return
-        order = queries.BUCKETS
+        order = _CHART_BUCKETS
         self._bucket = order[(order.index(self._bucket) + 1) % len(order)]
         self._redraw_chart()
 
@@ -2153,6 +2203,13 @@ class BudgetApp(App):
     def _redraw_chart(self) -> None:
         self._build_chart()
         self._fill_chart()
+        self._refresh_status()
+
+    def _redraw_pie(self) -> None:
+        """The report is unaffected by which bucket is charted, so only the per-bucket
+        series and the stacked chart built from it need rebuilding."""
+        self._build_pie()
+        self._fill_pie()
         self._refresh_status()
 
     def action_rename_vendor(self) -> None:

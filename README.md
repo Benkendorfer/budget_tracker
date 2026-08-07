@@ -92,7 +92,7 @@ listed. Type commands into the bar at the bottom:
 | `stats <window>` | Skip the picker: `stats 6m`, `stats 1 year`, `stats 2025-01-01..2025-06-30` |
 | `chart` | Pick a time window, then see money over time as bars (see below) |
 | `chart <window> [day\|week\|month] [net\|spending\|income]` | Skip the picker, and set the bar width and what the bars measure: `chart 1y month spending` |
-| `pie` | Pick a time window, then see spending by category as a pie (see below) |
+| `pie` | Pick a time window, then see each category's share of spending over time (see below) |
 | `pie <window>` | Skip the picker: `pie 6m`, `pie 1 year`, `pie 2025-01-01..2025-06-30` |
 | `transfers` | Pair up movements between your own accounts (`transfers reset` undoes it) |
 | `transfers same-account` | Also pair legs within the same account (see below); off by default |
@@ -111,7 +111,8 @@ goes back to the breakdown or chart it came from, once you have drilled into one
 `space` folds or unfolds a category's subtree; and `f` folds or unfolds every group at
 once — see "Statistics" below. On the chart, `b` cycles the bar width between day, week,
 and month, and `m` cycles what the bars measure between net, spending, and income — see
-"Charts". The footer shows the arrows only while they do something.
+"Charts". On the pie panel, `b` cycles the bucket between week, month, and year (no
+daily — see "Pie chart"). The footer shows the arrows only while they do something.
 
 `ctrl+n` prefills a `rename` command for whichever vendor you are pointing at, and
 `ctrl+t` prefills a `categorize` command for the same vendor. With the transaction table
@@ -535,14 +536,36 @@ the chart, the same way it goes back to the statistics breakdown.
 ### Pie chart
 
 `pie` opens the same period picker as `stats` and `chart`; `pie 6m` or
-`pie 2025-01-01..2025-06-30` skips it. `escape` returns to the transactions.
+`pie 2025-01-01..2025-06-30` skips it. `escape` returns to the transactions. The command
+kept its name for muscle memory, even though what it draws is not a pie anymore.
 
-It draws one wedge per top-level category, sized to its share of the window's net
-spending — the same `share` the statistics table's `% spend` column shows, so the two
-never disagree. A subcategory does not get its own wedge: its money is already rolled
-into its parent's (see "Statistics" above), and a category that is all refund with no
-real net spend — or a window with no spending at all — gets no wedge rather than an
-empty sliver. The legend beside the pie lists each category, its share, and its amount.
+It draws one bar for the whole window's spending, sized in proportion to each top-level
+category's share — the same `share` the statistics table's `% spend` column shows, so
+the two never disagree — and beneath it one bar per time bucket, showing the same
+breakdown for just that bucket. Every bar draws the same categories in the same colors
+and the same order as the top one, including which categories are small enough to be
+folded into a trailing `Other`, so a color means the same thing on every row and a
+bucket's own composition is directly comparable to the window's:
+
+```text
+  1 year          ████████████▏███████▏████▏███▏██▏█        102,498.34
+  ────────────────────────────────────────────────────
+  2025-09         ██████▏██████████▏████▏███▏██               4,963.88
+  2025-10         ███████████▏████▏████████▏██▏█              3,428.23
+  2025-11         ████▏████████████████▏███▏██▏█              4,282.78
+
+  ■ Travel 22.2%   ■ Health 19.3%   ■ Rent 16.1%   ■ Other 6.7%
+```
+
+A subcategory does not get its own segment: its money is already rolled into its
+parent's (see "Statistics" above). A category that is all refund with no real net
+spend — or a window with no spending at all — gets no segment rather than an empty
+sliver; a bucket with no spending of its own still gets its own row, just an empty one,
+the same way a quiet month on the chart is drawn rather than skipped.
+
+Press `b` to cycle the bucket: week, month (the default), or year — deliberately no
+daily option here, since a year charted by day is 365 rows; the chart panel keeps its
+own day/week/month cycle for exactly that reason.
 
 ### Currencies and exchange rates
 

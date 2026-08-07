@@ -418,6 +418,27 @@ def test_bucket_totals_by_week_and_day(tmp_path):
     assert [d.label for d in days] == ["03-02", "03-04", "03-09"]
 
 
+def test_bucket_totals_by_year(tmp_path):
+    """A yearly axis wants the year and nothing else -- key and label are the same
+    string (see queries.BUCKET_FORMATS)."""
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        currency, accounts, _ = _seed(session)
+        account = accounts["Checking"]
+        _txn(session, currency, account, date(2024, 12, 5), -1000, "A")
+        _txn(session, currency, account, date(2025, 1, 20), -2000, "B")
+        _txn(session, currency, account, date(2025, 6, 4), -3000, "C")
+        session.commit()
+
+    with session_factory() as session:
+        rows = queries.get_bucket_totals(session, "year")
+
+    assert [r.key for r in rows] == ["2024", "2025"]
+    assert [r.label for r in rows] == ["2024", "2025"]
+    assert [r.outflow_minor for r in rows] == [-1000, -5000]
+    assert [r.count for r in rows] == [1, 2]
+
+
 def test_bucket_totals_exclude_transfers_and_honor_the_range(tmp_path):
     session_factory = _session_factory(tmp_path)
     with session_factory() as session:
@@ -1652,6 +1673,29 @@ def test_category_share_series_rolls_up_per_bucket_and_zero_fills(tmp_path):
     assert jan["Dining"].depth == 1
     assert jan["Dining"].parent_id == jan["Food"].category_id
     assert series[0].net_spend_minor == -1000
+
+
+def test_category_share_series_by_year(tmp_path):
+    """The pie panel's own bucket set stops at year -- see queries.BUCKET_FORMATS's
+    "%Y" key and label -- so a multi-year window rolls up one row per year."""
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        currency, accounts, _ = _seed(session)
+        account = accounts["Checking"]
+        dining = categories.ensure_path(session, "Food > Dining")
+        session.flush()
+        _txn(session, currency, account, date(2024, 6, 10), -1000, "A", dining)
+        _txn(session, currency, account, date(2025, 3, 5), -2000, "B", dining)
+        session.commit()
+
+    window = _custom("2024-01-01", "2025-12-31")
+    with session_factory() as session:
+        series = stats.category_share_series(session, window, "year")
+
+    assert [b.key for b in series] == ["2024", "2025"]
+    assert [b.label for b in series] == ["2024", "2025"]
+    assert series[0].net_spend_minor == -1000
+    assert series[1].net_spend_minor == -2000
 
 
 def test_category_share_series_respects_a_category_drill_down(tmp_path):

@@ -50,7 +50,7 @@ TEXT_FIELDS = ("all", "description", "vendor", "raw")
 UNCATEGORISED_ID = -1
 
 # Time buckets a series can be grouped into.
-BUCKETS = ("day", "week", "month")
+BUCKETS = ("day", "week", "month", "year")
 
 # ``(sort key, axis label)`` strftime patterns per bucket. SQLite and Python agree on
 # every code used here — including ``%W``, week-of-year counting from the first Monday —
@@ -61,6 +61,8 @@ BUCKET_FORMATS: Dict[str, Tuple[str, str]] = {
     "day": ("%Y-%m-%d", "%m-%d"),
     "week": ("%Y-W%W", "W%W"),
     "month": ("%Y-%m", "%Y-%m"),
+    # A yearly axis wants the year and nothing else, for both the sort key and the label.
+    "year": ("%Y", "%Y"),
 }
 
 

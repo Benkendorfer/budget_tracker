@@ -476,7 +476,6 @@ def test_drilling_into_a_bucket_sums_back_to_its_own_bar(tmp_path):
     assert whole.outflow_minor == 4000
 
 
-# --------------------------------------------------------------------------- pie
 
 
 def _cat(name, share, total_minor, depth=0, category_id=1, parent_id=None):
@@ -494,82 +493,6 @@ def _cat(name, share, total_minor, depth=0, category_id=1, parent_id=None):
         parent_id=parent_id,
         depth=depth,
     )
-
-
-def test_pie_only_uses_depth_zero_rows_with_real_net_spend():
-    categories = [
-        _cat("Food", 0.5, -5000, depth=0, category_id=1),
-        _cat("Dining", 0.3, -3000, depth=1, category_id=2, parent_id=1),  # excluded: not depth 0
-        _cat("Income", 0.0, 10000, depth=0, category_id=3),  # excluded: net positive, share 0
-        _cat("Travel", 0.5, -5000, depth=0, category_id=4),
-    ]
-    pie = charts.build_pie(categories, width=9, height=9)
-    names = {s.name for s in pie.slices}
-    assert names == {"Food", "Travel"}
-
-
-def test_an_empty_category_list_is_an_empty_pie():
-    pie = charts.build_pie([], width=9, height=9)
-    assert pie.slices == []
-    assert all(cell is None for row in pie.mask for cell in row)
-
-
-def test_a_window_with_no_net_spend_is_an_empty_pie():
-    """All income, or literally nothing — either way there is no wedge to draw."""
-    categories = [_cat("Paycheck", 0.0, 300000, depth=0, category_id=1)]
-    pie = charts.build_pie(categories, width=9, height=9)
-    assert pie.slices == []
-    assert all(cell is None for row in pie.mask for cell in row)
-
-
-def test_a_single_category_fills_the_whole_pie():
-    categories = [_cat("Everything", 1.0, -10000, depth=0, category_id=1)]
-    pie = charts.build_pie(categories, width=9, height=9)
-    assert len(pie.slices) == 1
-    inside = [cell for row in pie.mask for cell in row if cell is not None]
-    assert inside and all(index == 0 for index in inside)
-    # Some cell is actually inside the circle — an "empty" pie would pass the above
-    # check vacuously.
-    assert len(inside) > 0
-
-
-def test_pie_wedges_are_assigned_clockwise_from_the_top():
-    """Four cardinal points on a 9x9 grid (centre cell at index 4), against three
-    slices of 25/25/50 — chosen so each landmark falls cleanly on one side of a
-    boundary rather than exactly on it."""
-    categories = [
-        _cat("A", 0.25, -2500, depth=0, category_id=1),
-        _cat("B", 0.25, -2500, depth=0, category_id=2),
-        _cat("C", 0.50, -5000, depth=0, category_id=3),
-    ]
-    pie = charts.build_pie(categories, width=9, height=9)
-    top = pie.mask[0][4]
-    right = pie.mask[4][8]
-    bottom = pie.mask[8][4]
-    left = pie.mask[4][0]
-    corner = pie.mask[0][0]
-    assert (top, right, bottom, left) == (0, 1, 2, 2)
-    assert corner is None  # outside the circle entirely
-
-
-def test_pie_rejects_a_non_positive_box():
-    with pytest.raises(ValueError, match="at least 1"):
-        charts.build_pie([_cat("A", 1.0, -100)], width=0, height=9)
-    with pytest.raises(ValueError, match="at least 1"):
-        charts.build_pie([_cat("A", 1.0, -100)], width=9, height=0)
-
-
-def test_pie_slice_shares_and_amounts_come_straight_from_the_category_stat():
-    categories = [_cat("Food", 0.6, -12345, depth=0, category_id=7)]
-    pie = charts.build_pie(categories, width=9, height=9)
-    (food,) = pie.slices
-    assert food.name == "Food"
-    assert food.category_id == 7
-    assert food.share == 0.6
-    assert food.amount_minor == 12345  # a positive magnitude, not the signed total
-
-
-# --------------------------------------------------------------------- share bar
 
 
 def _share_cat(name, share, total, depth=0, cid=None):
