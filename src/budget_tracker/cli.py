@@ -333,6 +333,14 @@ def _cmd_categorize(args: argparse.Namespace) -> int:
         return 0
 
 
+def _format_relocation_preview(preview: "categories_module.PathPreview") -> str:
+    return "; ".join(
+        f"{r.name!r} from {r.from_parent or 'the top level'} to "
+        f"{r.to_parent or 'the top level'} ({r.transaction_count} transaction(s))"
+        for r in preview.relocations
+    )
+
+
 def _cmd_category(args: argparse.Namespace) -> int:
     """Build/inspect the category hierarchy itself — not which category a vendor gets.
 
@@ -349,14 +357,58 @@ def _cmd_category(args: argparse.Namespace) -> int:
 
     with session_factory() as session:
         if command == "add":
+            # Names are unique across the whole tree, so a level that already exists
+            # somewhere else is a relocation of that whole category, not a new one —
+            # refused unconfirmed (see categories.ensure_path).
             try:
-                category = categories_module.ensure_path(session, args.path)
+                preview = categories_module.preview_path(session, args.path)
+            except categories_module.CategoryError as error:
+                print(error)
+                return 1
+            if preview.relocations and not args.yes:
+                print(f"Would relocate {_format_relocation_preview(preview)}.")
+                print(
+                    "A separate category needs its own distinct name, e.g. "
+                    "'Dining (Travel)'."
+                )
+                print("Re-run with --yes to actually move it.")
+                return 1
+            try:
+                category = categories_module.ensure_path(
+                    session, args.path, confirm_relocation=args.yes
+                )
             except categories_module.CategoryError as error:
                 print(error)
                 return 1
             path = categories_module.format_path(session, category)
             session.commit()
             print(f"{path!r} ready.")
+            return 0
+
+        if command == "merge":
+            # merge_category has no dry-run of its own; without --yes it is called
+            # inside this session anyway (so its MergeResult names the real counts),
+            # then simply never committed — closing the session below rolls it back.
+            try:
+                result = categories_module.merge_category(session, args.source, args.target)
+            except categories_module.CategoryError as error:
+                print(error)
+                return 1
+            plural = "y" if result.moved_children == 1 else "ies"
+            summary = (
+                f"{result.moved_transactions} transaction(s), "
+                f"{result.moved_rules} rule(s), "
+                f"{result.moved_children} child categor{plural} moved"
+            )
+            if not args.yes:
+                print(
+                    f"Would merge {result.source!r} into {result.target!r}: {summary}, "
+                    f"then {result.source!r} deleted."
+                )
+                print("Re-run with --yes to actually do it.")
+                return 1
+            session.commit()
+            print(f"Merged {result.source!r} into {result.target!r}: {summary}.")
             return 0
 
         rows = queries.get_categories(session)  # "list"
@@ -795,8 +847,31 @@ def build_parser() -> argparse.ArgumentParser:
             "that category to the top level."
         ),
     )
+    category_add.add_argument(
+        "--yes",
+        action="store_true",
+        help=(
+            "Confirm relocating an existing category (names are unique tree-wide, so "
+            "reusing one is a move, not a new category). Without it, only preview."
+        ),
+    )
 
     category_subparsers.add_parser("list", help="Show the category tree, indented (default).")
+
+    category_merge = category_subparsers.add_parser(
+        "merge",
+        help=(
+            "Fold one category into another: repoints its transactions, rules, and "
+            "children, then deletes it (destructive; see --yes)."
+        ),
+    )
+    category_merge.add_argument("source", help="Category to merge from (deleted).")
+    category_merge.add_argument("target", help="Category to merge into (kept).")
+    category_merge.add_argument(
+        "--yes",
+        action="store_true",
+        help="Actually merge. Without it, only preview what would move.",
+    )
 
     category_rule_parser = subparsers.add_parser(
         "category-rule", help="Manage pattern-based categorisation rules."

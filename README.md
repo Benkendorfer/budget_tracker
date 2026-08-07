@@ -78,6 +78,7 @@ the bottom:
 | `category Food > Dining > Restaurants` | Build/move a category into that spot, creating any missing levels (see below) |
 | `category Dining` | Move an existing category to the top level |
 | `category` / `category list` | Show the category tree, indented |
+| `category merge <source> = <target>` | Fold one category into another (see below) |
 | `filter <text>` | Search description, vendor name, and raw vendor name |
 | `filter <field>:<text>` | Search one of `description`, `vendor`, `raw` |
 | `filter` | Clear the text filter |
@@ -151,6 +152,15 @@ budget category-rule apply
 budget category add "Food > Dining > Restaurants"
 budget category add "Dining"          # a single name moves it to the top level
 budget category list                  # the tree, indented (default with no subcommand)
+# Names are unique tree-wide, so reusing one is a move, not a new category — refused
+# unconfirmed, previewing what would move.
+budget category add "Food > Dining"   # previews only, if Dining already exists elsewhere
+budget category add "Food > Dining" --yes
+
+# Fold a duplicate category into another: repoints its transactions, rules, and
+# children, then deletes it. Destructive, so --yes is required the same way.
+budget category merge Dining Snacks
+budget category merge Dining Snacks --yes
 
 # Pair up money moved between your own accounts.
 budget transfers --days 5
@@ -314,11 +324,32 @@ budget category list                                # the tree, indented
 
 In the app the same three are `category Food > Dining > Restaurants`, `category Dining`,
 and a bare `category` (or `category list`). A path segment that already exists is reused
-rather than duplicated, and — as a convenience for the common case of nesting a category
-that already has transactions — a top-level category matching the last segment's name is
-rescued into place instead of forking a second one with the same name. Moving a category
-under its own descendant is refused (`category Dining > Food` when `Food` already contains
-`Dining` reports the cycle rather than crashing).
+rather than duplicated. Moving a category under its own descendant is refused
+(`category Dining > Food` when `Food` already contains `Dining` reports the cycle rather
+than crashing).
+
+**Category names are unique across the whole tree**, not just among siblings — so
+`Food > Other` and `Travel > Other` cannot coexist; the second one needs its own distinct
+name, e.g. `Travel > Other Travel`. One consequence is that nesting a name that already
+exists somewhere else does not create a second category with that name — it *moves* the
+existing one, subtree and all. That is exactly the common case of rescuing an
+already-populated, previously top-level category into place (say the bank's own `Dining`
+under a new `Food`), so it is allowed, but it moves real transactions and is confirmed
+before it happens: the app shows what would move, from where, to where, and how many
+transactions come with it (the whole subtree's, not just that category's own), and applies
+it only once you type `yes`; anything else, or escape, cancels. From the command line the
+same preview appears without `--yes`, and nothing moves until you pass it. If you actually
+wanted a second, unrelated category with a name already in use, give it a distinct one
+instead — the app's decline message says so.
+
+Duplicate category names can also fold together on purpose: `category merge <source> = <target>`
+(`budget category merge <source> <target>` on the command line) repoints the source's
+transactions, rules, and children onto the target, then deletes the source — the way to
+reconcile two categories that ended up meaning the same thing. It is destructive, so it
+is confirmed the same way, naming how much would move before anything does.
+
+A database created before names were unique can genuinely hold duplicates; opening it
+names them and tells you to merge each one (`category merge`) before it will open.
 
 Filtering by a category — from the sidebar, `filter`, `budget list --category`, or a
 statistics drill-down — already matches its whole subtree, so clicking `Food` shows
@@ -326,9 +357,8 @@ statistics drill-down — already matches its whole subtree, so clicking `Food` 
 parent's rolled-up count reads as nested, not as a flat category with a mysteriously large
 number next to its own children.
 
-A category name only has to be unique among its own siblings, so `Food > Other` and
-`Travel > Other` can coexist. `budget list --category` and the `category` command both
-accept either a bare name or a full path (`"Food > Dining"`, using `>` as the separator).
+`budget list --category` and the `category` command both accept either a bare name or a
+full path (`"Food > Dining"`, using `>` as the separator).
 
 ### Statistics
 
@@ -606,7 +636,8 @@ Conventions:
   `rule.match_field` (`description`/`amount`/`account`), `rule.match_type`
   (`contains`/`equals`/`regex`), `category_source` (`manual`/`rule`/`unset`).
 - Lookup `value` columns are UNIQUE (`account_type`, `currency`, `tag`, `vendor_name`,
-  marked `UK`); `vendor.name` is UNIQUE; `category` is unique on `(parent_id, value)`.
+  marked `UK`); `vendor.name` is UNIQUE; `category.value` is UNIQUE across the whole
+  tree, not just among siblings (see "Nesting categories" above).
   `exchange_rate` is unique on `(currency_id, base_currency_id, rate_date)`.
 - Lookup tables (`account_type`, `currency`, `tag`, `vendor`, `vendor_name`) and pure
   join tables (`transaction_tag`) omit `created_at`/`updated_at`.

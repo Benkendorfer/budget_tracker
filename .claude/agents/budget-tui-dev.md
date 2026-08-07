@@ -101,13 +101,30 @@ placeholder, and `README.md` (which has a command table under "The interactive a
 CLI section, and a prose subsection per feature). Match the README's existing voice and
 do not restructure it. The house style is that every TUI feature has a CLI twin.
 
-## Before you report done
+## Running tests
 
-Run the full suite from the repo root:
+While you work, run only the files you are touching — `pytest -q src/test/test_python/test_tui.py`,
+or `-k` a single test. They are seconds instead of half a minute, and the output is short
+enough to read.
+
+Run the **full suite once**, at the end:
 
 ```bash
 PYTHONPATH="$PWD/src" .venv/bin/python -m pytest -q
 ```
+
+Three rules about that run, because getting them wrong burns a lot of tokens for nothing:
+
+- **One clean run is the record.** Do not re-run the full suite to confirm a result you
+  already have, to "double-check", or "for the record". If nothing changed, the answer
+  will not change either.
+- **A failure outside the files you own is a finding, not a task.** When your change has
+  an intended consequence in a file another agent owns, name the failing tests in your
+  report and stop. Do not re-run hoping they pass, and do not reach outside your
+  ownership to fix them.
+- **If two identical runs disagree, stop and report it.** Varying results mean something
+  outside your control is editing the tree while you test. You cannot debug that from
+  inside, and trying is a loop. Say which tests varied and hand it back.
 
 The `PYTHONPATH` is not decoration. The package is installed editable via a `.pth` file
 holding an **absolute** path to the original checkout. A git worktree has no `.venv` of

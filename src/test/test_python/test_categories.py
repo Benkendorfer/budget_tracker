@@ -1,13 +1,56 @@
 """Tests for manual categories and pattern-based category rules."""
 
+from datetime import date
+
 import pytest
 from sqlalchemy import select
 
 from budget_tracker import categories, queries, vendors
 from budget_tracker.db import get_engine, get_sessionmaker, init_db
 from budget_tracker.importer import import_csv
-from budget_tracker.models import Category, Transaction
+from budget_tracker.models import Account, Category, CategoryRule, Currency, Transaction
 from helpers import learn_format
+
+
+def _legacy_session_factory(tmp_path, name="legacy.db"):
+    """A database whose category table predates the value-uniqueness constraint.
+
+    :func:`categories.merge_category` has to work on exactly this: a database with two
+    same-named categories, which is what it exists to clean up before
+    :func:`budget_tracker.db.init_db` can add the constraint that forbids them. Bypasses
+    ``init_db``, which would refuse to open a database with duplicates already in it.
+    """
+    from sqlalchemy import text
+
+    from budget_tracker.models import Base
+
+    engine = get_engine(tmp_path / name)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE TABLE category ("
+                "id INTEGER PRIMARY KEY, parent_id INTEGER, value VARCHAR, "
+                "created_at TIMESTAMP, updated_at TIMESTAMP, "
+                "CONSTRAINT uq_category_parent_value UNIQUE (parent_id, value))"
+            )
+        )
+    Base.metadata.create_all(engine)  # everything else; category already exists above
+    return get_sessionmaker(engine)
+
+
+def _seed_account_and_currency(session):
+    """A minimal account/currency pair, for tests that hand-build transactions."""
+    currency = session.scalar(select(Currency))
+    if currency is None:
+        currency = Currency(value="USD", symbol="$", decimal_places=2)
+        session.add(currency)
+        session.flush()
+    account = session.scalar(select(Account))
+    if account is None:
+        account = Account(name="Checking", currency_id=currency.id)
+        session.add(account)
+        session.flush()
+    return account, currency
 
 
 def _plain_session_factory(tmp_path, name="plain.db"):
@@ -432,7 +475,8 @@ def test_ensure_path_is_idempotent(tmp_path):
 
 
 def test_ensure_path_reparents_an_existing_category(tmp_path):
-    """An existing top-level category is moved, not duplicated, when nested."""
+    """An existing top-level category is moved, not duplicated, when nested — but only
+    once the relocation is confirmed; the default refuses it (see :func:`ensure_path`)."""
     session_factory = _plain_session_factory(tmp_path)
     with session_factory() as session:
         dining = categories.get_or_create(session, "Dining")
@@ -440,7 +484,9 @@ def test_ensure_path_reparents_an_existing_category(tmp_path):
         dining_id = dining.id
 
     with session_factory() as session:
-        moved = categories.ensure_path(session, "Food > Dining")
+        with pytest.raises(categories.CategoryError, match="relocate"):
+            categories.ensure_path(session, "Food > Dining")
+        moved = categories.ensure_path(session, "Food > Dining", confirm_relocation=True)
         session.commit()
         assert moved.id == dining_id
 
@@ -452,13 +498,17 @@ def test_ensure_path_reparents_an_existing_category(tmp_path):
 
 
 def test_ensure_path_one_element_moves_to_top_level(tmp_path):
+    """A one-element path is a relocation too — promoting a nested category to the top
+    level needs the same confirmation as nesting one deeper does."""
     session_factory = _plain_session_factory(tmp_path)
     with session_factory() as session:
         categories.ensure_path(session, "Food > Dining")
         session.commit()
 
     with session_factory() as session:
-        moved = categories.ensure_path(session, "Dining")
+        with pytest.raises(categories.CategoryError, match="relocate"):
+            categories.ensure_path(session, "Dining")
+        moved = categories.ensure_path(session, "Dining", confirm_relocation=True)
         session.commit()
         assert moved.parent_id is None
 
@@ -473,7 +523,7 @@ def test_resolve_path_exact_match(tmp_path):
     session_factory = _plain_session_factory(tmp_path)
     with session_factory() as session:
         categories.ensure_path(session, "Food > Dining > Restaurants")
-        categories.ensure_path(session, "Travel > Dining")  # same leaf name elsewhere
+        categories.ensure_path(session, "Travel > Airfare")
         session.commit()
 
     with session_factory() as session:
@@ -493,36 +543,51 @@ def test_resolve_path_bare_name_unambiguous(tmp_path):
         assert found is not None and found.value == "Groceries"
 
 
-def test_resolve_path_bare_name_ambiguous_refuses_to_guess(tmp_path):
+def test_ensure_path_refuses_to_duplicate_a_name_across_branches(tmp_path):
+    """Two categories can no longer share a name in different branches: asking to place
+    ``Other`` under a second parent is a *relocation* of the existing one, not a fresh
+    duplicate, and is refused without confirmation (see :func:`ensure_path`)."""
     session_factory = _plain_session_factory(tmp_path)
     with session_factory() as session:
         categories.ensure_path(session, "Food > Other")
-        categories.ensure_path(session, "Travel > Other")
         session.commit()
 
     with session_factory() as session:
-        assert categories.resolve_path(session, "Other") is None
-        # But the full paths are unambiguous.
-        assert categories.resolve_path(session, "Food > Other").value == "Other"
-        assert categories.resolve_path(session, "Travel > Other").value == "Other"
+        with pytest.raises(categories.CategoryError, match="relocate"):
+            categories.ensure_path(session, "Travel > Other")
+
+        moved = categories.ensure_path(session, "Travel > Other", confirm_relocation=True)
+        session.commit()
+        moved_id = moved.id
+
+    with session_factory() as session:
+        names = [c.value for c in session.scalars(select(Category))]
+        assert names.count("Other") == 1  # moved, not duplicated
+        assert session.get(Category, moved_id).value == "Other"
+        assert categories.resolve_path(session, "Travel > Other") is not None
+        assert categories.resolve_path(session, "Food > Other") is None  # moved away
 
 
 # ------------------------------------------------------------------------- set_parent
 
-def test_set_parent_rejects_sibling_name_collision(tmp_path):
+def test_get_or_create_finds_a_nested_category_instead_of_forking_one(tmp_path):
+    """The bug this module exists to fix: a name is looked up across the *whole* tree,
+    so asking for an already-nested category by its bare name reuses it rather than
+    creating a rival top-level one of the same name (which the unique constraint on
+    ``category.value`` would now reject anyway)."""
     session_factory = _plain_session_factory(tmp_path)
     with session_factory() as session:
-        categories.ensure_path(session, "Food > Other")
-        loose = categories.get_or_create(session, "Other")  # a second, top-level "Other"
-        food = session.scalar(select(Category).where(Category.value == "Food"))
+        nested = categories.ensure_path(session, "Food > Other")
         session.commit()
-        loose_id, food_id = loose.id, food.id
+        nested_id = nested.id
 
     with session_factory() as session:
-        loose = session.get(Category, loose_id)
-        food = session.get(Category, food_id)
-        with pytest.raises(categories.CategoryError, match="already exists"):
-            categories.set_parent(session, loose, food)
+        found = categories.get_or_create(session, "Other")
+        assert found.id == nested_id
+        session.commit()
+
+    with session_factory() as session:
+        assert [c.value for c in session.scalars(select(Category))].count("Other") == 1
 
 
 def test_set_parent_rejects_a_direct_cycle(tmp_path):
@@ -615,8 +680,8 @@ def test_filtering_by_a_parent_returns_descendant_transactions(tmp_path):
     with session_factory() as session:
         categories.set_category(session, "COFFEE SHOP A", "Restaurants")
         categories.set_category(session, "COFFEE SHOP B", "Fast Food")
-        categories.ensure_path(session, "Dining > Restaurants")
-        categories.ensure_path(session, "Dining > Fast Food")
+        categories.ensure_path(session, "Dining > Restaurants", confirm_relocation=True)
+        categories.ensure_path(session, "Dining > Fast Food", confirm_relocation=True)
         session.commit()
 
     with session_factory() as session:
@@ -642,8 +707,8 @@ def test_get_categories_rolls_up_parent_counts_and_totals(tmp_path):
     with session_factory() as session:
         categories.set_category(session, "COFFEE SHOP A", "Restaurants")
         categories.set_category(session, "COFFEE SHOP B", "Fast Food")
-        categories.ensure_path(session, "Dining > Restaurants")
-        categories.ensure_path(session, "Dining > Fast Food")
+        categories.ensure_path(session, "Dining > Restaurants", confirm_relocation=True)
+        categories.ensure_path(session, "Dining > Fast Food", confirm_relocation=True)
         session.commit()
 
     with session_factory() as session:
@@ -669,7 +734,7 @@ def test_manual_category_still_works_after_its_category_is_nested(tmp_path):
         session.commit()
 
     with session_factory() as session:
-        categories.ensure_path(session, "Food > Dining")  # re-parent after the fact
+        categories.ensure_path(session, "Food > Dining", confirm_relocation=True)  # re-parent after the fact
         session.commit()
 
     with session_factory() as session:
@@ -687,10 +752,158 @@ def test_category_rule_still_works_after_its_category_is_nested(tmp_path):
         session.commit()
 
     with session_factory() as session:
-        categories.ensure_path(session, "Food > Dining")
+        categories.ensure_path(session, "Food > Dining", confirm_relocation=True)
         session.commit()
 
     with session_factory() as session:
         assert _categories(session, "COFFEE SHOP A") == [("Dining", "rule")]
         assert _categories(session, "COFFEE SHOP B") == [("Dining", "rule")]
         assert categories.apply_category_rules(session) == 0  # still matched, unaffected
+
+
+# ------------------------------------------------------------------ preview_path
+
+def test_preview_path_reports_pure_creates_with_no_relocation(tmp_path):
+    session_factory = _plain_session_factory(tmp_path)
+    with session_factory() as session:
+        preview = categories.preview_path(session, "Food > Dining > Restaurants")
+        assert preview.creates == ["Food", "Dining", "Restaurants"]
+        assert preview.relocations == []
+
+
+def test_preview_path_reports_a_relocation_with_its_rolled_up_subtree_count(tmp_path):
+    session_factory = _plain_session_factory(tmp_path)
+    with session_factory() as session:
+        dining = categories.ensure_path(session, "Dining")
+        restaurants = categories.ensure_path(session, "Dining > Restaurants")
+        account, currency = _seed_account_and_currency(session)
+        session.add(
+            Transaction(
+                account_id=account.id, currency_id=currency.id,
+                posted_date=date(2025, 1, 1),
+                description="x", raw_description="x", value_minor=-100,
+                category_id=dining.id, category_source="manual",
+                import_hash="h1",
+            )
+        )
+        session.add(
+            Transaction(
+                account_id=account.id, currency_id=currency.id,
+                posted_date=date(2025, 1, 2),
+                description="y", raw_description="y", value_minor=-200,
+                category_id=restaurants.id, category_source="manual",
+                import_hash="h2",
+            )
+        )
+        session.commit()
+
+    with session_factory() as session:
+        preview = categories.preview_path(session, "Food > Dining")
+        assert preview.creates == ["Food"]
+        assert len(preview.relocations) == 1
+        relocation = preview.relocations[0]
+        assert relocation.name == "Dining"
+        assert relocation.from_parent is None  # was at the top level
+        assert relocation.to_parent == "Food"
+        # Rolled up: Dining's own transaction plus Restaurants' underneath it.
+        assert relocation.transaction_count == 2
+
+
+# --------------------------------------------------------------------------- merging
+
+def test_merge_category_repoints_transactions_rules_and_children(tmp_path):
+    session_factory = _setup(tmp_path)
+    with session_factory() as session:
+        categories.set_category(session, "COFFEE SHOP A", "Restaurants")
+        categories.add_rule(session, "COFFEE SHOP B*", "Restaurants")
+        categories.apply_category_rules(session)
+        # A second, unrelated category with a child, so the merge has something to
+        # repoint on the child side too.
+        dining = categories.ensure_path(session, "Dining")
+        categories.ensure_path(session, "Dining > Snacks")
+        session.commit()
+        dining_id = dining.id
+
+    with session_factory() as session:
+        result = categories.merge_category(session, "Restaurants", "Dining")
+        session.commit()
+        assert result.source == "Restaurants"
+        assert result.target == "Dining"
+        assert result.moved_transactions == 3  # 2x SHOP A + 1x SHOP B
+        assert result.moved_rules == 1
+        assert result.moved_children == 0  # Restaurants had no children of its own
+
+    with session_factory() as session:
+        names = [c.value for c in session.scalars(select(Category))]
+        assert "Restaurants" not in names
+        assert _categories(session, "COFFEE SHOP A") == [("Dining", "manual")]
+        assert _categories(session, "COFFEE SHOP B") == [("Dining", "rule")]
+        rule = session.scalar(select(CategoryRule))
+        assert rule.category.value == "Dining"
+        # Dining's pre-existing child survived the merge untouched.
+        assert sorted(c.value for c in categories.children(session, dining_id)) == ["Snacks"]
+
+
+def test_merge_category_moves_children_of_the_merged_category(tmp_path):
+    session_factory = _plain_session_factory(tmp_path)
+    with session_factory() as session:
+        categories.ensure_path(session, "Food > Dining > Restaurants")
+        categories.ensure_path(session, "Food > Dining > Fast Food")
+        session.commit()
+
+    with session_factory() as session:
+        categories.merge_category(session, "Dining", "Food")
+        session.commit()
+
+    with session_factory() as session:
+        food = session.scalar(select(Category).where(Category.value == "Food"))
+        assert sorted(c.value for c in categories.children(session, food.id)) == [
+            "Fast Food", "Restaurants",
+        ]
+        assert session.scalar(select(Category).where(Category.value == "Dining")) is None
+
+
+def test_merge_category_rejects_merging_into_itself(tmp_path):
+    session_factory = _plain_session_factory(tmp_path)
+    with session_factory() as session:
+        categories.get_or_create(session, "Dining")
+        session.commit()
+
+    with session_factory() as session:
+        with pytest.raises(categories.CategoryError, match="itself"):
+            categories.merge_category(session, "Dining", "Dining")
+
+
+def test_merge_category_rejects_merging_into_its_own_descendant(tmp_path):
+    session_factory = _plain_session_factory(tmp_path)
+    with session_factory() as session:
+        categories.ensure_path(session, "Food > Dining")
+        session.commit()
+
+    with session_factory() as session:
+        with pytest.raises(categories.CategoryError, match="descendant"):
+            categories.merge_category(session, "Food", "Dining")
+
+
+def test_merge_category_by_full_path_disambiguates_a_shared_leaf_name(tmp_path):
+    """The scenario this whole change exists to fix, cleaned up: a nested and a
+    top-level category share a name. Bare text picks the top-level one (its own path
+    is just its value); the nested one needs its full path."""
+    session_factory = _legacy_session_factory(tmp_path)
+    with session_factory() as session:
+        categories.ensure_path(session, "Travel > Airfare")
+        # Simulate the pre-fix bug directly (get_or_create no longer creates this).
+        stray = Category(value="Airfare", parent_id=None)
+        session.add(stray)
+        session.commit()
+
+    with session_factory() as session:
+        result = categories.merge_category(session, "Airfare", "Travel > Airfare")
+        session.commit()
+        assert result.source == "Airfare"
+        assert result.target == "Airfare"
+
+    with session_factory() as session:
+        assert [c.value for c in session.scalars(select(Category))].count("Airfare") == 1
+        survivor = session.scalar(select(Category).where(Category.value == "Airfare"))
+        assert categories.format_path(session, survivor) == "Travel > Airfare"

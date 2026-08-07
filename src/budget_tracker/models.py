@@ -45,10 +45,16 @@ class Account(Base):
 
 
 class Category(Base):
+    """A node in the category tree.
+
+    ``value`` is unique across the *whole* tree, not just among siblings: two
+    categories can no longer share a name in different branches. See
+    :mod:`.categories` for why (duplicate same-named categories used to be created
+    silently) and :func:`.db.init_db` for how an existing database is migrated.
+    """
+
     __tablename__ = "category"
-    __table_args__ = (
-        UniqueConstraint("parent_id", "value", name="uq_category_parent_value"),
-    )
+    __table_args__ = (UniqueConstraint("value", name="uq_category_value"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     parent_id: Mapped[Optional[int]] = mapped_column(

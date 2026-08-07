@@ -27,7 +27,7 @@ from textual.widgets import (
 )
 
 from . import accounts, categories, formats, queries, stats, transfers, vendors
-from .db import get_engine, get_sessionmaker, init_db
+from .db import DuplicateCategoryNamesError, get_engine, get_sessionmaker, init_db
 from .importer import (
     ImportCandidate,
     UnknownImport,
@@ -135,7 +135,18 @@ class BudgetApp(App):
     def __init__(self) -> None:
         super().__init__()
         self.engine = get_engine()
-        init_db(self.engine)
+        try:
+            init_db(self.engine)
+        except DuplicateCategoryNamesError as error:
+            # init_db's own message names the duplicates; this just turns "the app
+            # cannot open" into "here is the exact command that unblocks it" instead of
+            # a raw traceback with no path forward.
+            raise DuplicateCategoryNamesError(
+                f"{error}\n\nThe app can't open until every duplicate is merged. From "
+                "the command line (not this app, since it can't start either): "
+                "'budget category merge <source> <target> --yes' for each name listed "
+                "above, then run budget again."
+            ) from error
         self.session_factory = get_sessionmaker(self.engine)
         self.account_filter: Optional[int] = None
         self.vendor_filter: Optional[queries.VendorFilter] = None
@@ -165,6 +176,12 @@ class BudgetApp(App):
         # Awaiting a typed "yes" to confirm a pending `unimport`; holds what it would
         # destroy, read up front so the confirmation names real numbers.
         self._pending_unimport: Optional[queries.ImportDeletePreview] = None
+        # Awaiting a typed "yes" to confirm a `category` that would relocate an
+        # existing category; holds the raw path text so the confirmed apply can just
+        # re-run ensure_path with confirm_relocation=True.
+        self._pending_category: Optional[str] = None
+        # Same idea for `category merge`; holds (source, target) as typed.
+        self._pending_category_merge: Optional[tuple] = None
         self._prompt_panel: Optional[str] = None  # which panel the #prompt belongs to
         # True only while the transactions panel is showing exactly what a statistics
         # drill-down put there — the left arrow's "back" is only meaningful then.
@@ -437,6 +454,44 @@ class BudgetApp(App):
                 Text(f"{abs(stat.share) * 100:.1f}%", justify="right"),
                 Text(parent_pct, justify="right"),
             )
+        self._add_stats_total_row(table)
+
+    def _add_stats_total_row(self, table: DataTable) -> None:
+        """A closing total, summing the depth-0 rows above it.
+
+        Only the depth-0 rows: every row's money already includes its descendants, so
+        adding the nested ones too would count a parent's spending twice (see
+        stats.Report.categories). These figures come from the report's own totals rather
+        than from re-adding the column, so the row cannot drift from the status line.
+
+        Selecting it does nothing — _drill_into_category()'s bounds check already rejects
+        a row index past the last category, which is exactly this one.
+
+        A window with no transactions gets no total: a lone "TOTAL 0.00" reads as a
+        result, where an empty table plainly says there is nothing here.
+        """
+        report = self._report
+        if not report.categories:
+            return
+        table.add_row(
+            Text("TOTAL", style="bold"),
+            Text(str(report.count), style="bold", justify="right"),
+            Text(
+                _fmt_amount(report.net_minor),
+                style="bold " + ("red" if report.net_minor < 0 else "green"),
+                justify="right",
+            ),
+            Text(
+                _fmt_amount(stats.per_month(report.net_minor, report.window)),
+                style="bold "
+                + ("red" if report.net_minor < 0 else "green"),
+                justify="right",
+            ),
+            # 100% by construction, and worth printing: it says the column above is a
+            # share of this window's spending and nothing has been left out of it.
+            Text("100.0%" if report.outflow_minor else "", style="bold", justify="right"),
+            Text("", justify="right"),
+        )
 
     def _fill_periods(self) -> None:
         table = self.query_one("#periods", DataTable)
@@ -817,6 +872,12 @@ class BudgetApp(App):
         if self._pending_unimport is not None:
             self._answer_unimport(text)
             return
+        if self._pending_category is not None:
+            self._answer_category(text)
+            return
+        if self._pending_category_merge is not None:
+            self._answer_category_merge(text)
+            return
         self._run_command(text.strip())
 
     def _run_command(self, command: str) -> None:
@@ -881,7 +942,14 @@ class BudgetApp(App):
                 "category Food > Dining > Restaurants — build/move a category into\n"
                 "  that spot, creating any missing levels\n"
                 "category Dining — move an existing category to the top level\n"
+                "  category names are unique across the whole tree, so if that would\n"
+                "  move an existing category rather than create one, you are asked to\n"
+                "  confirm what would move; a genuinely separate category needs its\n"
+                "  own distinct name, e.g. 'Dining (Travel)'\n"
                 "category | category list — show the category tree, indented\n"
+                "category merge <source> = <target> — fold one category into another:\n"
+                "  repoints its transactions, rules, and children, then deletes it\n"
+                "  (asks for confirmation, naming what will move)\n"
                 "transfers [reset] — pair up movements between your own accounts\n"
                 "merge <account> = <account> — fold one account into another\n"
                 "filter <text> — search description, vendor, and raw name\n"
@@ -1240,21 +1308,153 @@ class BudgetApp(App):
         Distinct from ``categorize``: this manages the category hierarchy itself
         (creating, nesting, re-parenting), not which category a vendor's transactions
         get. A one-element path is a move to the top level (:func:`categories.ensure_path`).
+
+        Names are unique across the whole tree, so a path level that already exists
+        somewhere else is a *relocation* of that whole category, not a new one — see
+        :func:`categories.preview_path`. That is confirmed before it happens, the same
+        shape as ``unimport``.
         """
         arg = arg.strip()
         if not arg or arg.lower() == "list":
             self._notify_category_tree()
             return
+        head, _, rest = arg.partition(" ")
+        if head.lower() == "merge":
+            self._do_category_merge(rest.strip())
+            return
         with self.session_factory() as session:
             try:
-                category = categories.ensure_path(session, arg)
-                path = categories.format_path(session, category)
+                preview = categories.preview_path(session, arg)
+            except categories.CategoryError as error:
+                self.notify(str(error), severity="warning", markup=False)
+                return
+            if preview.relocations:
+                self._ask_category_relocation(arg, preview)
+                return
+            category = categories.ensure_path(session, arg)
+            path = categories.format_path(session, category)
+            session.commit()
+        self.reload()
+        self.notify(f"{path!r} ready.", markup=False)
+
+    def _ask_category_relocation(self, path: str, preview: categories.PathPreview) -> None:
+        self._pending_category = path
+        self._prompt_panel = self._panel
+        moved = "; ".join(
+            f"{r.name!r} from {r.from_parent or 'the top level'} to "
+            f"{r.to_parent or 'the top level'} ({r.transaction_count} transaction(s))"
+            for r in preview.relocations
+        )
+        prompt = self.query_one("#prompt", Static)
+        # Text(), not markup: a category name is user data and may hold brackets.
+        prompt.update(
+            Text.assemble(
+                (f"{path!r} would relocate {moved}.\n", "bold"),
+                (
+                    "Type yes to confirm; anything else, or escape, cancels. A "
+                    "separate category needs its own distinct name, e.g. "
+                    "'Dining (Travel)'.",
+                    "dim",
+                ),
+            )
+        )
+        prompt.display = True
+        self.query_one("#command", Input).focus()
+
+    def _answer_category(self, text: str) -> None:
+        path = self._pending_category
+        self._cancel_category()
+        if text.strip().lower() != "yes":
+            self.notify("Category move cancelled.")
+            return
+        with self.session_factory() as session:
+            try:
+                category = categories.ensure_path(session, path, confirm_relocation=True)
+                result_path = categories.format_path(session, category)
             except categories.CategoryError as error:
                 self.notify(str(error), severity="warning", markup=False)
                 return
             session.commit()
         self.reload()
-        self.notify(f"{path!r} ready.", markup=False)
+        self.notify(f"{result_path!r} ready.", markup=False)
+
+    def _cancel_category(self) -> None:
+        self._pending_category = None
+        self._prompt_panel = None
+        self.query_one("#prompt", Static).display = False
+
+    CATEGORY_MERGE_USAGE = "Usage: category merge <source> = <target>"
+
+    def _do_category_merge(self, arg: str) -> None:
+        """``category merge <source> = <target>`` — destructive, so it only previews.
+
+        :func:`categories.merge_category` has no dry-run of its own, so the preview is
+        the real call made inside a session that is never committed: closing it below
+        discards everything it did, and the counts on the returned
+        :class:`categories.MergeResult` are exactly what a real merge would move,
+        read before the source category was deleted. ``_answer_category_merge`` re-runs
+        it for real, and commits, only once the user has confirmed.
+        """
+        if "=" not in arg:
+            self.notify(self.CATEGORY_MERGE_USAGE, severity="warning")
+            return
+        source, target = (part.strip() for part in arg.split("=", 1))
+        if not source or not target:
+            self.notify(self.CATEGORY_MERGE_USAGE, severity="warning")
+            return
+        with self.session_factory() as session:
+            try:
+                result = categories.merge_category(session, source, target)
+            except categories.CategoryError as error:
+                self.notify(str(error), severity="warning", markup=False)
+                return
+            # Not committed: leaving the `with` block below rolls this back.
+
+        self._pending_category_merge = (source, target)
+        self._prompt_panel = self._panel
+        prompt = self.query_one("#prompt", Static)
+        prompt.update(
+            Text.assemble(
+                (
+                    f"Merge {result.source!r} into {result.target!r}: "
+                    f"{result.moved_transactions} transaction(s), "
+                    f"{result.moved_rules} rule(s), "
+                    f"{result.moved_children} child categor"
+                    f"{'y' if result.moved_children == 1 else 'ies'} moved, then "
+                    f"{result.source!r} is deleted.\n",
+                    "bold",
+                ),
+                ("Type yes to confirm; anything else, or escape, cancels.", "dim"),
+            )
+        )
+        prompt.display = True
+        self.query_one("#command", Input).focus()
+
+    def _answer_category_merge(self, text: str) -> None:
+        source, target = self._pending_category_merge
+        self._cancel_category_merge()
+        if text.strip().lower() != "yes":
+            self.notify("Merge cancelled.")
+            return
+        with self.session_factory() as session:
+            try:
+                result = categories.merge_category(session, source, target)
+            except categories.CategoryError as error:
+                self.notify(str(error), severity="error", markup=False)
+                return
+            session.commit()
+        self.reload()
+        self.notify(
+            f"Merged {result.source!r} into {result.target!r}: "
+            f"{result.moved_transactions} transaction(s), {result.moved_rules} rule(s), "
+            f"{result.moved_children} child categories moved.",
+            markup=False,
+        )
+
+    def _cancel_category_merge(self) -> None:
+        self._pending_category_merge = None
+        self._prompt_panel = None
+        self.query_one("#prompt", Static).display = False
 
     def _notify_category_tree(self) -> None:
         if not self._categories:
@@ -1452,6 +1652,14 @@ class BudgetApp(App):
         if self._pending_unimport is not None:
             self.notify("Unimport cancelled.")
             self._cancel_unimport()
+            return
+        if self._pending_category is not None:
+            self.notify("Category move cancelled.")
+            self._cancel_category()
+            return
+        if self._pending_category_merge is not None:
+            self.notify("Merge cancelled.")
+            self._cancel_category_merge()
             return
         if self._panel != "txns":
             self._set_panel("txns")

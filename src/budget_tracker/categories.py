@@ -21,9 +21,10 @@ Nothing here commits; callers own the transaction, as in :mod:`.vendors`.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import List, Optional
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from .models import Category, CategoryRule, Transaction, Vendor, VendorName
@@ -49,11 +50,23 @@ class CategoryError(ValueError):
 
 
 def get_or_create(session: Session, value: str) -> Category:
-    """Fetch the top-level category named ``value``, creating it if new. No commit."""
+    """The category named ``value``, from anywhere in the tree, creating a new
+    top-level one only if nothing anywhere has that name. No commit.
+
+    Category names are unique across the whole tree now (see :class:`.models.Category`),
+    so a flat string — a bank's CSV category column, or what a user types into
+    ``categorize``/``category-rule`` — matches at most one category, wherever it is
+    nested. This is the one lookup :func:`set_category`, :func:`add_rule`, and
+    :func:`.importer._get_or_create_category` all share; before this, each did its own
+    top-level-only lookup, so an import naming an already-nested category (say
+    "Airfare" under "Travel") forked a rival top-level "Airfare" instead of binding to
+    the existing one.
+
+    Never *moves* an existing category — :func:`ensure_path` does that, and only with
+    confirmation.
+    """
     value = value.strip()
-    category = session.scalar(
-        select(Category).where(Category.parent_id.is_(None), Category.value == value)
-    )
+    category = session.scalar(select(Category).where(Category.value == value))
     if category is None:
         category = Category(value=value)
         session.add(category)
@@ -63,9 +76,10 @@ def get_or_create(session: Session, value: str) -> Category:
 
 # --------------------------------------------------------------------------- paths
 #
-# Names are unique only among siblings (``UniqueConstraint("parent_id", "value")``), so
-# "Food > Other" and "Travel > Other" can coexist. Every lookup below is therefore
-# path-aware; nothing here does a bare-name match that could silently pick one of several.
+# A name is unique across the whole tree (``UniqueConstraint("value")``), so a bare
+# name matches at most one category and a full path is just a placement, not an
+# identity. The lookups below reflect that: nothing here needs to hedge against several
+# same-named categories any more.
 
 
 def parse_path(text: str) -> List[str]:
@@ -101,18 +115,20 @@ def _sibling(session: Session, parent_id: Optional[int], value: str) -> Optional
     return session.scalar(select(Category).where(clause, Category.value == value))
 
 
-def resolve_path(session: Session, path: str) -> Optional[Category]:
-    """Exact path lookup, e.g. ``"Food > Dining"``.
+def _by_name(session: Session, name: str) -> Optional[Category]:
+    """The one category named ``name``, anywhere in the tree, or ``None``."""
+    return session.scalar(select(Category).where(Category.value == name))
 
-    A bare name (no separator) is also accepted, but only when it is unambiguous — when
-    exactly one category anywhere in the tree carries it. That keeps existing callers and
-    typed commands working now that names repeat across branches; an ambiguous bare name
-    returns ``None`` rather than guessing which one was meant.
+
+def resolve_path(session: Session, path: str) -> Optional[Category]:
+    """Exact path lookup, e.g. ``"Food > Dining"``; a bare name is a plain lookup too.
+
+    A bare name matches at most one category now that names are unique across the
+    whole tree, so there is nothing left to disambiguate.
     """
     parts = parse_path(path)
     if len(parts) == 1:
-        matches = list(session.scalars(select(Category).where(Category.value == parts[0])))
-        return matches[0] if len(matches) == 1 else None
+        return _by_name(session, parts[0])
     parent_id: Optional[int] = None
     category: Optional[Category] = None
     for part in parts:
@@ -146,20 +162,16 @@ def descendant_ids(session: Session, category_id: int) -> List[int]:
 def set_parent(session: Session, child: Category, parent: Optional[Category]) -> Category:
     """Move ``child`` under ``parent`` (``None`` for the top level). No commit.
 
-    Refuses a move that would make ``child`` its own ancestor, and a move that would
-    collide with an existing sibling of the same name under the destination — the unique
-    constraint would otherwise reject it at flush with a far less helpful error.
+    Refuses a move that would make ``child`` its own ancestor. A destination-sibling
+    name collision can no longer happen — names are unique across the whole tree, so
+    nothing else can already be sitting under ``parent`` with ``child``'s name; see
+    :func:`ensure_path`, which is what decides whether a same-named category should
+    move here at all.
     """
     parent_id = parent.id if parent is not None else None
     if parent_id is not None and parent_id in descendant_ids(session, child.id):
         reason = "itself" if parent_id == child.id else f"its own descendant {parent.value!r}"
         raise CategoryError(f"Cannot move {child.value!r} under {reason}; that is a cycle.")
-    collision = _sibling(session, parent_id, child.value)
-    if collision is not None and collision.id != child.id:
-        location = format_path(session, parent) if parent is not None else "the top level"
-        raise CategoryError(
-            f"{child.value!r} already exists under {location}; cannot move it there too."
-        )
     child.parent_id = parent_id
     session.flush()
     return child
@@ -172,53 +184,216 @@ def _create(session: Session, value: str, parent: Optional[Category]) -> Categor
     return category
 
 
-def _step(session: Session, parent: Optional[Category], name: str) -> Category:
-    """One element of a path: reuse ``name`` under ``parent`` if it is already there.
+@dataclass
+class Relocation:
+    """An existing category :func:`ensure_path` would move to make room for a path."""
 
-    Otherwise, rescue a *stray top-level* category of the same name into this slot rather
-    than forking a same-named duplicate — someone building "Food > Dining" after already
-    having a bare "Dining" almost always means the same category. A name nested somewhere
-    else in the tree is left alone: only an explicit bare-name lookup (:func:`resolve_path`,
-    or the one-element case below) reaches across branches like that, since silently
-    abducting an unrelated same-named category out of another branch while building an
-    unrelated path would be a surprising, destructive guess.
-    """
-    parent_id = parent.id if parent is not None else None
-    existing = _sibling(session, parent_id, name)
-    if existing is not None:
-        return existing
-    if parent_id is not None:
-        stray = _sibling(session, None, name)
-        if stray is not None:
-            return set_parent(session, stray, parent)
-    return _create(session, name, parent)
+    name: str
+    from_parent: Optional[str]  # current parent's path, or None for the top level
+    to_parent: Optional[str]  # destination parent's path, or None for the top level
+    transaction_count: int  # rolled up over the whole subtree, not just this category
 
 
-def ensure_path(session: Session, path: str) -> Category:
-    """Create or complete ``path``, re-parenting its last element under the one before it.
+@dataclass
+class PathPreview:
+    """What applying a path would do, per :func:`preview_path`. Nothing is written."""
 
-    Each element is created if missing, reusing an already-correctly-placed category, or
-    (for a non-top-level slot) rescuing a stray top-level category of the same name into
-    place — see :func:`_step`. A one-element path is a special case: rather than restrict
-    the search to stray top-level categories, it moves an existing category to the top
-    level from *anywhere* in the tree, as long as the bare name is unambiguous; ambiguous
-    or absent, it creates one fresh at the top level. Does not commit.
+    creates: List[str] = field(default_factory=list)  # levels with no existing category
+    relocations: List[Relocation] = field(default_factory=list)  # existing ones that move
+
+
+# A sentinel expected-parent-id that no real category id (nor None, the top level) can
+# ever equal — used by preview_path while walking through a level that does not exist
+# yet, so a same-named category found further down is still correctly reported as
+# relocating into a not-yet-created parent, rather than looking like it is already
+# in place.
+_NOT_YET_BUILT = object()
+
+
+def preview_path(session: Session, path: str) -> PathPreview:
+    """What :func:`ensure_path` would do to ``path``, without writing anything.
+
+    Walks the path level by level: a name with nothing anywhere in the tree is a
+    level that would be created; a name that exists but under a different parent than
+    this path puts it is a relocation, reported with its current and destination
+    parent and the transaction count rolled up over its *whole* subtree — a category
+    with children must not be reported as moving fewer rows than it actually would.
     """
     parts = parse_path(path)
-    if len(parts) == 1:
-        name = parts[0]
-        existing = _sibling(session, None, name)
-        if existing is not None:
-            return existing
-        elsewhere = resolve_path(session, name)
-        return set_parent(session, elsewhere, None) if elsewhere is not None else _create(
-            session, name, None
+    creates: List[str] = []
+    relocations: List[Relocation] = []
+    expected_parent_id: object = None  # None means "the top level"
+    parent_path = ""
+    for part in parts:
+        found = _by_name(session, part)
+        if found is None:
+            creates.append(part)
+            expected_parent_id = _NOT_YET_BUILT
+        else:
+            if found.parent_id != expected_parent_id:
+                current_parent = (
+                    session.get(Category, found.parent_id)
+                    if found.parent_id is not None
+                    else None
+                )
+                relocations.append(
+                    Relocation(
+                        name=found.value,
+                        from_parent=(
+                            format_path(session, current_parent)
+                            if current_parent is not None
+                            else None
+                        ),
+                        to_parent=parent_path or None,
+                        transaction_count=_subtree_txn_count(session, found.id),
+                    )
+                )
+            expected_parent_id = found.id
+        parent_path = f"{parent_path} {PATH_SEPARATOR} {part}" if parent_path else part
+    return PathPreview(creates=creates, relocations=relocations)
+
+
+def _subtree_txn_count(session: Session, category_id: int) -> int:
+    ids = descendant_ids(session, category_id)
+    return session.scalar(
+        select(func.count(Transaction.id)).where(Transaction.category_id.in_(ids))
+    ) or 0
+
+
+def ensure_path(
+    session: Session, path: str, confirm_relocation: bool = False
+) -> Category:
+    """Create or complete ``path``, moving an existing category into place if needed.
+
+    Each level is created if nothing anywhere has that name yet, or reused as-is if it
+    is already exactly where this path puts it. A level that already exists somewhere
+    *else* in the tree is a relocation of that whole category — including everything
+    nested under it — and is refused unless ``confirm_relocation`` is set, raising
+    :class:`CategoryError` naming what it would have moved. Call :func:`preview_path`
+    first to show the user what that is before setting it; a caller that has not been
+    updated to confirm therefore cannot silently relocate anything, top-level
+    promotion (a one-element path) included. Does not commit.
+    """
+    preview = preview_path(session, path)
+    if preview.relocations and not confirm_relocation:
+        moved = "; ".join(
+            f"{r.name!r} from {r.from_parent or 'the top level'} to "
+            f"{r.to_parent or 'the top level'} ({r.transaction_count} transactions)"
+            for r in preview.relocations
+        )
+        raise CategoryError(
+            f"{path!r} would relocate {moved}. Pass confirm_relocation=True to do it."
         )
 
-    node: Optional[Category] = None
+    parts = parse_path(path)
+    parent: Optional[Category] = None
     for part in parts:
-        node = _step(session, node, part)
-    return node
+        parent_id = parent.id if parent is not None else None
+        found = _by_name(session, part)
+        if found is None:
+            found = _create(session, part, parent)
+        elif found.parent_id != parent_id:
+            found = set_parent(session, found, parent)
+        parent = found
+    return parent
+
+
+# ------------------------------------------------------------------------- merging
+
+@dataclass
+class MergeResult:
+    source: str
+    target: str
+    moved_transactions: int
+    moved_rules: int
+    moved_children: int
+
+
+def _find_for_merge(session: Session, text_: str) -> Category:
+    """Locate exactly one category by name or path, for :func:`merge_category`.
+
+    Unlike every other lookup in this module, this one has to work on a database that
+    does *not* yet have unique names — merging duplicates is how such a database gets
+    there in the first place (see :func:`.db.init_db`'s migration). A full (multi-segment)
+    path is always safe, since ``(parent_id, value)`` was already unique before this
+    change. A bare name is safe too once names are unique, which is the common case;
+    while they are not, it is only unambiguous when at most one *top-level* category
+    carries it — a top-level category's own path is just its bare value, so that is the
+    one thing left for the bare form to mean once the name also exists, nested, under
+    some other parent. Anything left ambiguous after that refuses to guess.
+    """
+    parts = parse_path(text_)
+    if len(parts) > 1:
+        parent_id: Optional[int] = None
+        category: Optional[Category] = None
+        for part in parts:
+            category = _sibling(session, parent_id, part)
+            if category is None:
+                raise CategoryError(f"No category at path {text_!r}.")
+            parent_id = category.id
+        return category
+
+    name = parts[0]
+    matches = list(session.scalars(select(Category).where(Category.value == name)))
+    if not matches:
+        raise CategoryError(f"No category named {text_!r}.")
+    if len(matches) == 1:
+        return matches[0]
+    top_level = [m for m in matches if m.parent_id is None]
+    if len(top_level) == 1:
+        return top_level[0]
+    raise CategoryError(
+        f"{text_!r} matches {len(matches)} categories; give a full path "
+        f"(e.g. 'Parent > {name}') to say which one."
+    )
+
+
+def merge_category(session: Session, source: str, target: str) -> MergeResult:
+    """Fold ``source`` into ``target``: repoint its transactions, its category rules,
+    and any children onto ``target``, then delete it. No commit.
+
+    ``source``/``target`` are a bare name or a full path, resolved by
+    :func:`_find_for_merge` rather than :func:`get_or_create` since the whole point of
+    this function is cleaning up a database where names are not unique yet.
+
+    Refuses a merge that would make ``target`` its own ancestor — merging a category
+    into one of its own descendants, which would leave nothing above the moved
+    subtree to be the descendant *of*.
+    """
+    src = _find_for_merge(session, source)
+    tgt = _find_for_merge(session, target)
+    if src.id == tgt.id:
+        raise CategoryError(f"Cannot merge {src.value!r} into itself.")
+    if tgt.id in descendant_ids(session, src.id):
+        raise CategoryError(
+            f"Cannot merge {src.value!r} into its own descendant {tgt.value!r}; "
+            "that would make it its own ancestor."
+        )
+
+    moved_transactions = 0
+    for txn in session.scalars(select(Transaction).where(Transaction.category_id == src.id)):
+        txn.category_id = tgt.id
+        moved_transactions += 1
+
+    moved_rules = 0
+    for rule in session.scalars(select(CategoryRule).where(CategoryRule.category_id == src.id)):
+        rule.category_id = tgt.id
+        moved_rules += 1
+
+    moved_children = 0
+    for child in children(session, src.id):
+        child.parent_id = tgt.id
+        moved_children += 1
+
+    session.delete(src)
+    session.flush()
+    return MergeResult(
+        source=src.value,
+        target=tgt.value,
+        moved_transactions=moved_transactions,
+        moved_rules=moved_rules,
+        moved_children=moved_children,
+    )
 
 
 def _vendor_ids(session: Session, vendor: str) -> List[int]:

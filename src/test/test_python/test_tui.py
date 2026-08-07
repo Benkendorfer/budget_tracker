@@ -7,14 +7,16 @@ suite does not need pytest-asyncio.
 import asyncio
 import datetime
 
+import pytest
+from sqlalchemy import text as sql_text
 from textual.widgets import DataTable, Input, ListView, Static
 
 from budget_tracker import categories, formats, queries, stats, transfers, vendors
-from budget_tracker.db import get_engine, get_sessionmaker, init_db
+from budget_tracker.db import DuplicateCategoryNamesError, get_engine, get_sessionmaker, init_db
 from budget_tracker.importer import import_csv, read_header_and_rows
 from budget_tracker.models import Account, Currency, Transaction
 from helpers import learn_format
-from budget_tracker.tui import TRANSFER_MARK, BudgetApp
+from budget_tracker.tui import TRANSFER_MARK, BudgetApp, _fmt_amount
 
 CSV = """Transaction Date,Posted Date,Card No.,Description,Category,Debit,Credit
 2025-07-01,2025-07-02,8207,COFFEE SHOP A,Dining,3.00,
@@ -799,9 +801,11 @@ def test_enter_on_a_preset_shows_the_stats_panel(tmp_path, monkeypatch):
     assert window.key == "1m"
     assert state[0] is False and state[1] is True
     # Biggest spender first, income last; the 100-day-old row is out of this window.
-    assert [row[0] for row in rows] == ["Housing", "Dining", "Income"]
-    assert [row[2] for row in rows] == ["-1,000.00", "-40.00", "2,000.00"]
-    assert [row[4] for row in rows] == ["96.2%", "3.8%", "0.0%"]
+    # The closing TOTAL row sums the depth-0 rows above it: -1,000 - 40 + 2,000 = 960.
+    assert [row[0] for row in rows] == ["Housing", "Dining", "Income", "TOTAL"]
+    assert [row[2] for row in rows] == ["-1,000.00", "-40.00", "2,000.00", "960.00"]
+    assert [row[4] for row in rows] == ["96.2%", "3.8%", "0.0%", "100.0%"]
+    assert rows[-1][1] == "4"  # every transaction in the window, not just the spending
     assert state[2].startswith("1 month ")
     assert "4 txns" in state[2] and "out -1,040.00" in state[2]
     assert "in 2,000.00" in state[2]
@@ -868,6 +872,7 @@ def test_stats_with_a_preset_spec_skips_the_picker(tmp_path, monkeypatch):
         ["Housing", "1", "-1,000.00"],
         ["Dining", "3", "-540.00"],
         ["Income", "1", "2,000.00"],
+        ["TOTAL", "5", "460.00"],
     ]
 
 
@@ -891,7 +896,10 @@ def test_stats_with_an_explicit_range_skips_the_picker(tmp_path, monkeypatch):
     assert window.key == "custom"
     # 3.00 + 4.00 + 3.50 over 31 days: 1050 * 30.4375 / 31 = 1030.9 minor units a month.
     # The trailing "" is % parent, blank at depth 0 (identical to % spend there).
-    assert rows == [["Dining", "3", "-10.50", "-10.31", "100.0%", ""]]
+    assert rows == [
+        ["Dining", "3", "-10.50", "-10.31", "100.0%", ""],
+        ["TOTAL", "3", "-10.50", "-10.31", "100.0%", ""],
+    ]
     assert state[2].startswith("custom 2025-07-01→2025-07-31 3 txns")
 
 
@@ -933,7 +941,10 @@ def test_custom_row_prompts_for_a_range_and_applies_it(tmp_path, monkeypatch):
     assert asked[3] == "command" and asked[4] is True
     assert pending is False and prompt_visible is False  # the question is done with
     # The trailing "" is % parent, blank at depth 0.
-    assert state[1] is True and rows == [["Dining", "3", "-10.50", "-10.31", "100.0%", ""]]
+    assert state[1] is True and rows == [
+        ["Dining", "3", "-10.50", "-10.31", "100.0%", ""],
+        ["TOTAL", "3", "-10.50", "-10.31", "100.0%", ""],
+    ]
 
 
 def test_a_bad_spec_notifies_and_leaves_the_panel_alone(tmp_path, monkeypatch):
@@ -1037,16 +1048,18 @@ def test_stats_panel_rescopes_when_a_filter_changes(tmp_path, monkeypatch):
             return before, filtered, _stats_rows(app), _stats_state(app)
 
     before, (filtered_rows, filtered_state), housing_rows, housing_state = asyncio.run(run())
-    assert len(before) == 3
+    assert len(before) == 4  # three categories plus the closing TOTAL row
     # Averages depend on the length of a window anchored to today, so this case checks
     # the scope; the fixed custom range above pins the arithmetic.
     # The trailing "" is % parent, blank at depth 0.
     assert [row[:3] + row[4:] for row in filtered_rows] == [
-        ["Dining", "2", "-40.00", "100.0%", ""]
+        ["Dining", "2", "-40.00", "100.0%", ""],
+        ["TOTAL", "2", "-40.00", "100.0%", ""],
     ]
     assert "2 txns" in filtered_state[2] and "out -40.00" in filtered_state[2]
     assert [row[:3] + row[4:] for row in housing_rows] == [
-        ["Housing", "1", "-1,000.00", "100.0%", ""]
+        ["Housing", "1", "-1,000.00", "100.0%", ""],
+        ["TOTAL", "1", "-1,000.00", "100.0%", ""],
     ]
     assert housing_state[1] is True  # still on the stats panel throughout
 
@@ -1575,7 +1588,7 @@ def test_left_arrow_returns_to_the_stats_panel_with_the_full_breakdown(tmp_path,
     assert category_filter is None
     assert date_filter is None
     assert len(rows) > 1
-    assert [r[0] for r in rows] == ["Housing", "Dining", "Income"]
+    assert [r[0] for r in rows] == ["Housing", "Dining", "Income", "TOTAL"]
     assert cursor_row == 1  # back on the Dining row that was drilled from
 
 
@@ -1841,8 +1854,47 @@ def test_stats_table_fits_the_main_panel_with_a_deep_hierarchy(tmp_path, monkeyp
     # The indented, truncated leaf name still respects the Category column's budget.
     assert all(len(row[0]) <= widths["Category"] for row in rows)
     # Every row below the top rendered a % parent value; only the root leaves it blank.
+    # The closing TOTAL row is not a category and leaves it blank too, so it is excluded
+    # here rather than the assertion being weakened to tolerate any blank.
+    assert rows[-1][0] == "TOTAL"
     assert rows[0][-1] == ""
-    assert all(row[-1].endswith("%") for row in rows[1:])
+    assert all(row[-1].endswith("%") for row in rows[1:-1])
+
+
+def test_stats_total_row_agrees_with_the_report_and_cannot_be_drilled(
+    tmp_path, monkeypatch
+):
+    """The total must come from the report's own figures, and must not act like a row.
+
+    Re-adding the column would double-count a parent's spending with its children's,
+    since every row's money already includes its descendants.
+    """
+    _setup_recent(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._run_command("stats 1m")
+            await pilot.pause()
+            table = app.query_one("#stats_table", DataTable)
+            report = app._report
+            table.move_cursor(row=table.row_count - 1)  # the TOTAL row
+            await pilot.press("right")  # the drill-down key
+            await pilot.pause()
+            return _stats_rows(app), report, app._panel, app.category_filter
+
+    rows, report, panel, category_filter = asyncio.run(run())
+    total = rows[-1]
+    assert total[0] == "TOTAL"
+    assert total[1] == str(report.count)
+    assert total[2] == _fmt_amount(report.net_minor)
+    assert total[3] == _fmt_amount(stats.per_month(report.net_minor, report.window))
+    # Summing the depth-0 rows reproduces it; summing every row would not.
+    depth0 = [c for c in report.categories if c.depth == 0]
+    assert sum(c.total_minor for c in depth0) == report.net_minor
+    assert sum(c.count for c in depth0) == report.count
+    # Drilling from the total row is a no-op: it is not a category.
+    assert panel == "stats" and category_filter is None
 
 
 def test_categories_sidebar_indents_by_depth(tmp_path, monkeypatch):
@@ -1894,10 +1946,11 @@ def test_category_filter_matches_the_whole_subtree(tmp_path, monkeypatch):
     assert descriptions == ["Big meal", "Fast food", "Groceries"]
 
 
-def test_category_command_builds_a_nested_path(tmp_path, monkeypatch):
+def test_category_command_asks_for_confirmation_before_a_relocation(tmp_path, monkeypatch):
     """``Dining`` already exists (top-level, from the CSV's bank-supplied category) and
-    has transactions; ``ensure_path`` rescues it into place under the new ``Food``
-    rather than forking a duplicate (see categories._step)."""
+    has transactions, so nesting it under a new ``Food`` is a relocation of that whole
+    category — names are unique across the whole tree, so it cannot mean a second one —
+    and has to be confirmed before it happens."""
     _setup(tmp_path, monkeypatch)
 
     async def run():
@@ -1905,14 +1958,39 @@ def test_category_command_builds_a_nested_path(tmp_path, monkeypatch):
         async with app.run_test() as pilot:
             app._run_command("category Food > Dining > Restaurants")
             await pilot.pause()
+            prompt = app.query_one("#prompt", Static)
+            depths = {c.name: c.depth for c in app._categories}
+            return str(prompt.content), prompt.display, app._pending_category, depths
+
+    text, visible, pending, depths = asyncio.run(run())
+    assert visible is True and pending == "Food > Dining > Restaurants"
+    assert "'Dining'" in text and "3 transaction(s)" in text
+    assert "distinct name" in text
+    assert depths["Dining"] == 0  # nothing moved yet
+
+
+def test_category_command_confirmed_relocates_the_existing_category(tmp_path, monkeypatch):
+    """``ensure_path`` rescues ``Dining`` into place under the new ``Food`` rather than
+    forking a duplicate, once the relocation is confirmed."""
+    _setup(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._run_command("category Food > Dining > Restaurants")
+            await pilot.pause()
+            app.query_one("#command", Input).value = "yes"
+            await pilot.press("enter")
+            await pilot.pause()
             sidebar = [
                 str(item.children[0].content)
                 for item in app.query_one("#categories", ListView).children
             ]
             depths = {c.name: c.depth for c in app._categories}
-            return [n.message for n in app._notifications], sidebar, depths
+            return [n.message for n in app._notifications], sidebar, depths, app._pending_category
 
-    messages, sidebar, depths = asyncio.run(run())
+    messages, sidebar, depths, pending = asyncio.run(run())
+    assert pending is None
     assert any("Food > Dining > Restaurants" in m for m in messages)
     assert depths["Food"] == 0
     assert depths["Dining"] == 1  # rescued under Food, still carrying its 3 transactions
@@ -1922,20 +2000,67 @@ def test_category_command_builds_a_nested_path(tmp_path, monkeypatch):
     assert any(label.startswith("  Dining (") for label in sidebar)
 
 
+def test_category_command_relocation_cancelled_leaves_it_in_place(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._run_command("category Food > Dining > Restaurants")
+            await pilot.pause()
+            app.query_one("#command", Input).value = "no thanks"
+            await pilot.press("enter")
+            await pilot.pause()
+            messages = [n.message for n in app._notifications]
+            depths = {c.name: c.depth for c in app._categories}
+            return messages, depths, app._pending_category, app.query_one(
+                "#prompt", Static
+            ).display
+
+    messages, depths, pending, prompt_visible = asyncio.run(run())
+    assert any("Category move cancelled" in m for m in messages)
+    assert pending is None
+    assert prompt_visible is False
+    assert depths["Dining"] == 0  # untouched: still top-level
+
+
+def test_category_command_relocation_escape_cancels(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._run_command("category Food > Dining > Restaurants")
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause()
+            messages = [n.message for n in app._notifications]
+            depths = {c.name: c.depth for c in app._categories}
+            return messages, depths, app._pending_category
+
+    messages, depths, pending = asyncio.run(run())
+    assert any("Category move cancelled" in m for m in messages)
+    assert pending is None
+    assert depths["Dining"] == 0
+
+
 def test_category_command_one_element_moves_to_top_level(tmp_path, monkeypatch):
     # The fixture CSV's rows import with the bank's own top-level "Dining" category;
     # nesting it under "Food" rescues that existing (and populated) category into place
     # rather than creating an unrelated new one (see categories.ensure_path).
     session_factory = _setup(tmp_path, monkeypatch)
     with session_factory() as session:
-        categories.ensure_path(session, "Food > Dining")
+        categories.ensure_path(session, "Food > Dining", confirm_relocation=True)
         session.commit()
 
     async def run():
         app = BudgetApp()
         async with app.run_test() as pilot:
             before = next(c.depth for c in app._categories if c.name == "Dining")
-            app._run_command("category Dining")
+            app._run_command("category Dining")  # also a relocation: back to the top
+            await pilot.pause()
+            app.query_one("#command", Input).value = "yes"
+            await pilot.press("enter")
             await pilot.pause()
             after = next(c.depth for c in app._categories if c.name == "Dining")
             return before, after
@@ -1967,7 +2092,7 @@ def test_category_command_bare_shows_the_tree(tmp_path, monkeypatch):
 def test_category_command_reports_a_cycle_without_crashing(tmp_path, monkeypatch):
     session_factory = _setup(tmp_path, monkeypatch)
     with session_factory() as session:
-        categories.ensure_path(session, "Food > Dining")
+        categories.ensure_path(session, "Food > Dining", confirm_relocation=True)
         session.commit()
 
     async def run():
@@ -1975,7 +2100,12 @@ def test_category_command_reports_a_cycle_without_crashing(tmp_path, monkeypatch
         async with app.run_test() as pilot:
             # Food already has Dining as a child; asking to move Food under Dining
             # (still under Food) makes Food its own descendant's descendant — a cycle.
+            # Food itself relocating (top level -> under Food > Dining) is confirmed
+            # first; the cycle check underneath that is what actually rejects it.
             app._run_command("category Food > Dining > Food")
+            await pilot.pause()
+            app.query_one("#command", Input).value = "yes"
+            await pilot.press("enter")
             await pilot.pause()
             return (
                 [n.message for n in app._notifications],
@@ -1987,6 +2117,135 @@ def test_category_command_reports_a_cycle_without_crashing(tmp_path, monkeypatch
     assert any("cycle" in m for m in messages)
     assert panel == "txns"  # the app is still up, on the panel it started on
     assert food_depth == 0  # the rejected move left Food where it was
+
+
+# ------------------------------------------------------------- category hierarchy (merge)
+
+
+def test_category_merge_asks_for_confirmation_naming_what_will_move(tmp_path, monkeypatch):
+    session_factory = _setup(tmp_path, monkeypatch)
+    with session_factory() as session:
+        categories.ensure_path(session, "Snacks")
+        session.commit()
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._run_command("category merge Dining = Snacks")
+            await pilot.pause()
+            prompt = app.query_one("#prompt", Static)
+            return str(prompt.content), prompt.display, app._pending_category_merge
+
+    text, visible, pending = asyncio.run(run())
+    assert visible is True and pending == ("Dining", "Snacks")
+    assert "'Dining'" in text and "'Snacks'" in text
+    assert "3 transaction(s)" in text
+
+
+def test_category_merge_confirmed_moves_everything_and_deletes_the_source(
+    tmp_path, monkeypatch
+):
+    session_factory = _setup(tmp_path, monkeypatch)
+    with session_factory() as session:
+        categories.ensure_path(session, "Snacks")
+        session.commit()
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._run_command("category merge Dining = Snacks")
+            await pilot.pause()
+            app.query_one("#command", Input).value = "yes"
+            await pilot.press("enter")
+            await pilot.pause()
+            messages = [n.message for n in app._notifications]
+            return messages, app._pending_category_merge
+
+    messages, pending = asyncio.run(run())
+    assert pending is None
+    assert any(
+        "Merged 'Dining' into 'Snacks'" in m and "3 transaction(s)" in m for m in messages
+    )
+    with session_factory() as session:
+        assert categories.resolve_path(session, "Dining") is None
+        assert queries.resolve_category(session, "Snacks") is not None
+
+
+def test_category_merge_cancelled_moves_nothing(tmp_path, monkeypatch):
+    session_factory = _setup(tmp_path, monkeypatch)
+    with session_factory() as session:
+        categories.ensure_path(session, "Snacks")
+        session.commit()
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._run_command("category merge Dining = Snacks")
+            await pilot.pause()
+            app.query_one("#command", Input).value = "no"
+            await pilot.press("enter")
+            await pilot.pause()
+            messages = [n.message for n in app._notifications]
+            return messages, app._pending_category_merge
+
+    messages, pending = asyncio.run(run())
+    assert pending is None
+    assert any("Merge cancelled" in m for m in messages)
+    with session_factory() as session:
+        assert categories.resolve_path(session, "Dining") is not None
+
+
+def test_category_merge_reports_an_unknown_category(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._run_command("category merge Nope = Dining")
+            await pilot.pause()
+            return [n.message for n in app._notifications], app._pending_category_merge
+
+    messages, pending = asyncio.run(run())
+    assert any("No category named 'Nope'" in m for m in messages)
+    assert pending is None
+
+
+# ------------------------------------------------------ duplicate category names (startup)
+
+
+def _legacy_duplicate_category_db(tmp_path):
+    """A database predating unique category names, with one name used twice — the
+    shape :func:`db.init_db` refuses to open (see test_db.py, which owns that module)."""
+    db_path = tmp_path / "legacy.db"
+    engine = get_engine(db_path)
+    with engine.begin() as connection:
+        connection.execute(
+            sql_text(
+                "CREATE TABLE category ("
+                "id INTEGER PRIMARY KEY, parent_id INTEGER, value VARCHAR, "
+                "created_at TIMESTAMP, updated_at TIMESTAMP, "
+                "CONSTRAINT uq_category_parent_value UNIQUE (parent_id, value))"
+            )
+        )
+        connection.execute(sql_text("INSERT INTO category (value) VALUES ('Airfare')"))
+        connection.execute(sql_text("INSERT INTO category (value) VALUES ('Airfare')"))
+    return db_path
+
+
+def test_duplicate_category_names_block_startup_with_a_pointer_to_merge(
+    tmp_path, monkeypatch
+):
+    """Today this is a raw traceback with no path forward; it has to at least name the
+    duplicate and point at the command that fixes it."""
+    db_path = _legacy_duplicate_category_db(tmp_path)
+    monkeypatch.setenv("BUDGET_DB", str(db_path))
+
+    with pytest.raises(DuplicateCategoryNamesError) as exc_info:
+        BudgetApp()
+
+    message = str(exc_info.value)
+    assert "Airfare" in message
+    assert "category merge" in message
 
 
 # ------------------------------------------------------------------------- unimport

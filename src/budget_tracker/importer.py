@@ -70,15 +70,16 @@ def _get_or_create_vendor(session: Session, name: str) -> Vendor:
 
 
 def _get_or_create_category(session: Session, value: str) -> Category:
-    value = value.strip()
-    category = session.scalar(
-        select(Category).where(Category.parent_id.is_(None), Category.value == value)
-    )
-    if category is None:
-        category = Category(value=value)
-        session.add(category)
-        session.flush()
-    return category
+    """The category ``value`` names, from anywhere in the tree. No commit.
+
+    Delegates to :func:`categories.get_or_create` (imported here, not at module level,
+    to keep the dependency one-way like the other cross-module calls below) so a bank's
+    flat CSV category binds to an already-nested category of the same name instead of
+    forking a rival top-level one.
+    """
+    from .categories import get_or_create
+
+    return get_or_create(session, value)
 
 
 def _parse_amount_minor(debit: str, credit: str, decimal_places: int) -> int:

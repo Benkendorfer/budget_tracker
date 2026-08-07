@@ -122,10 +122,23 @@ def test_category_rule_apply_re_runs_every_rule(tmp_path, monkeypatch, capsys):
 # ------------------------------------------------------ category hierarchy (nesting)
 
 
-def test_category_add_builds_a_nested_path(tmp_path, monkeypatch, capsys):
+def test_category_add_refuses_a_relocation_without_yes(tmp_path, monkeypatch, capsys):
+    """"Dining" already exists (the bank's own top-level category, with the CSV's three
+    transactions), so nesting it under "Food" is a relocation of that whole category —
+    names are unique across the whole tree, so it cannot mean creating a second one."""
     _setup(tmp_path, monkeypatch)
 
-    assert cli.main(["category", "add", "Food > Dining > Restaurants"]) == 0
+    assert cli.main(["category", "add", "Food > Dining > Restaurants"]) == 1
+    out = capsys.readouterr().out
+    assert "relocate" in out
+    assert "'Dining'" in out and "3 transaction(s)" in out
+    assert "distinct name" in out
+
+
+def test_category_add_confirmed_relocates_and_builds_the_path(tmp_path, monkeypatch, capsys):
+    _setup(tmp_path, monkeypatch)
+
+    assert cli.main(["category", "add", "Food > Dining > Restaurants", "--yes"]) == 0
     assert "'Food > Dining > Restaurants' ready." in capsys.readouterr().out
 
 
@@ -134,7 +147,9 @@ def test_category_list_shows_the_tree_indented(tmp_path, monkeypatch, capsys):
     with session_factory() as session:
         # "Dining" already exists (the bank's own top-level category, with the CSV's
         # three transactions); nesting it rescues it into place rather than forking.
-        categories.ensure_path(session, "Food > Dining")
+        # Called directly on the core, so it is confirmed up front like any other
+        # test fixture setup — it is not what this test is exercising.
+        categories.ensure_path(session, "Food > Dining", confirm_relocation=True)
         session.commit()
 
     assert cli.main(["category"]) == 0  # bare command defaults to "list"
@@ -146,12 +161,14 @@ def test_category_list_shows_the_tree_indented(tmp_path, monkeypatch, capsys):
 def test_category_add_reports_a_cycle_without_crashing(tmp_path, monkeypatch, capsys):
     session_factory = _setup(tmp_path, monkeypatch)
     with session_factory() as session:
-        categories.ensure_path(session, "Food > Dining")
+        categories.ensure_path(session, "Food > Dining", confirm_relocation=True)
         session.commit()
 
     # Food already has Dining as a child; moving Food under Dining (still under Food)
-    # makes Food its own descendant's descendant.
-    assert cli.main(["category", "add", "Food > Dining > Food"]) == 1
+    # makes Food its own descendant's descendant. --yes confirms the relocation half of
+    # this path (Food itself moving under Food > Dining) so the cycle check underneath
+    # it is what actually rejects this.
+    assert cli.main(["category", "add", "Food > Dining > Food", "--yes"]) == 1
     assert "cycle" in capsys.readouterr().out
 
 
@@ -160,12 +177,53 @@ def test_list_dash_dash_category_resolves_a_full_path(tmp_path, monkeypatch, cap
     is reachable by its full path, not just a bare top-level name."""
     session_factory = _setup(tmp_path, monkeypatch)
     with session_factory() as session:
-        categories.ensure_path(session, "Food > Dining")
+        categories.ensure_path(session, "Food > Dining", confirm_relocation=True)
         session.commit()
 
     assert cli.main(["list", "--category", "Food > Dining"]) == 0
     out = capsys.readouterr().out
     assert "3 txns" in out
+
+
+# --------------------------------------------------------- category hierarchy (merge)
+
+
+def test_category_merge_without_yes_only_previews(tmp_path, monkeypatch, capsys):
+    session_factory = _setup(tmp_path, monkeypatch)
+    with session_factory() as session:
+        categories.ensure_path(session, "Snacks")
+        session.commit()
+
+    assert cli.main(["category", "merge", "Dining", "Snacks"]) == 1
+    out = capsys.readouterr().out
+    assert "Would merge 'Dining' into 'Snacks'" in out
+    assert "3 transaction(s)" in out
+    # Nothing actually moved: the trial run inside the preview was never committed.
+    assert _categories_of(session_factory) == ["Dining", "Dining", "Dining"]
+
+
+def test_category_merge_confirmed_moves_everything_and_deletes_the_source(
+    tmp_path, monkeypatch, capsys
+):
+    session_factory = _setup(tmp_path, monkeypatch)
+    with session_factory() as session:
+        categories.ensure_path(session, "Snacks")
+        session.commit()
+
+    assert cli.main(["category", "merge", "Dining", "Snacks", "--yes"]) == 0
+    out = capsys.readouterr().out
+    assert "Merged 'Dining' into 'Snacks'" in out
+    assert "3 transaction(s)" in out
+    assert _categories_of(session_factory) == ["Snacks", "Snacks", "Snacks"]
+    with session_factory() as session:
+        assert categories.resolve_path(session, "Dining") is None
+
+
+def test_category_merge_reports_an_unknown_category(tmp_path, monkeypatch, capsys):
+    _setup(tmp_path, monkeypatch)
+
+    assert cli.main(["category", "merge", "Nope", "Dining"]) == 1
+    assert "No category named 'Nope'" in capsys.readouterr().out
 
 
 def test_list_dash_dash_category_reports_an_unknown_name(tmp_path, monkeypatch, capsys):

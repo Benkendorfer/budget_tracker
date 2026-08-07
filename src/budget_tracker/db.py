@@ -66,10 +66,54 @@ def _add_missing_columns(engine: Engine) -> None:
                     )
 
 
+class DuplicateCategoryNamesError(RuntimeError):
+    """Two or more categories share a name, so global uniqueness can't be enforced.
+
+    Raised by :func:`init_db` when opening a pre-existing database that predates the
+    unique-name constraint. Merge the named duplicates with
+    :func:`categories.merge_category` (which repoints their transactions, rules, and
+    children before deleting the loser) and open the database again.
+    """
+
+
+def _ensure_unique_category_names(engine: Engine) -> None:
+    """Add a unique index on ``category.value`` if it is not already unique.
+
+    Called after ``create_all``, so the table always exists by now — either freshly
+    made with the constraint already built into the model, or predating it. The old
+    constraint was ``(parent_id, value)``, and SQLite treats NULLs in a unique index as
+    distinct from one another, so it never actually constrained top-level categories
+    either — a database opened before this migration can genuinely hold two rows with
+    the same name. Adding the index straight away would fail with an opaque
+    ``IntegrityError``, so duplicates are checked for and named first. ``CREATE UNIQUE
+    INDEX IF NOT EXISTS`` makes the rest idempotent, and harmless to run again once a
+    fresh ``create_all`` has already given the table this same constraint by name.
+    """
+    with engine.begin() as connection:
+        duplicates = [
+            row[0]
+            for row in connection.execute(
+                text("SELECT value FROM category GROUP BY value HAVING COUNT(*) > 1")
+            )
+        ]
+        if duplicates:
+            names = ", ".join(repr(v) for v in duplicates)
+            raise DuplicateCategoryNamesError(
+                f"Category name(s) used more than once: {names}. Category names must "
+                "now be unique across the whole tree; merge each duplicate with "
+                "categories.merge_category(session, source, target) before this "
+                "database can be opened."
+            )
+        connection.execute(
+            text("CREATE UNIQUE INDEX IF NOT EXISTS uq_category_value ON category (value)")
+        )
+
+
 def init_db(engine: Engine) -> None:
-    """Create any missing tables, then patch in any columns added since."""
+    """Create any missing tables, then patch in any columns/constraints added since."""
     _add_missing_columns(engine)
     Base.metadata.create_all(engine)
+    _ensure_unique_category_names(engine)
 
 
 def get_sessionmaker(engine: Engine) -> "sessionmaker[Session]":
