@@ -606,3 +606,53 @@ def test_importing_pairs_a_top_up_against_the_bank_account_that_funded_it(tmp_pa
         groups = {leg.transfer_group_id for leg in legs}
         assert None not in groups, "the top-up was never paired with the bank leg"
         assert len(groups) == 1, "the two legs landed in different transfer groups"
+
+
+# ------------------------------------------------------ recording observed rates
+
+from budget_tracker import rates as rates_module
+from budget_tracker.models import ExchangeRate
+
+
+def test_import_records_the_rate_a_conversion_actually_witnessed(tmp_path):
+    """A rate the user actually got is the best evidence for that day — findable
+    afterwards through rates.rate_on, same as a fetched or hand-set one."""
+    path = _write_csv(tmp_path / "wise.csv", [_conversion()])
+    factory = _factory(tmp_path)
+    with factory() as session:
+        import_wise_csv(session, path)
+
+    with factory() as session:
+        assert rates_module.rate_on(
+            session, date(2026, 3, 2), "USD", "CHF"
+        ) == Decimal("0.8")
+
+
+def test_a_row_with_no_conversion_records_no_rate(tmp_path):
+    """An ordinary OUT payment has no exchange rate to harvest, cross-currency or not."""
+    path = _write_csv(tmp_path / "wise.csv", [_row(ID="A")])
+    factory = _factory(tmp_path)
+    with factory() as session:
+        import_wise_csv(session, path)
+
+    with factory() as session:
+        assert session.query(ExchangeRate).count() == 0
+
+
+def test_reimporting_a_conversion_does_not_duplicate_its_observed_rate(tmp_path):
+    """record_rate upserts on (day, base, quote, source), so re-running an import that
+    finds every row already there must not grow a second row for the same rate."""
+    path = _write_csv(tmp_path / "wise.csv", [_conversion()])
+    factory = _factory(tmp_path)
+    with factory() as session:
+        import_wise_csv(session, path)
+    with factory() as session:
+        second = import_wise_csv(session, path)
+
+    assert second.inserted == 0  # every transaction already on file
+    with factory() as session:
+        rows = session.query(ExchangeRate).filter_by(
+            base="USD", quote="CHF", source=rates_module.OBSERVED
+        ).all()
+        assert len(rows) == 1
+        assert Decimal(rows[0].rate) == Decimal("0.8")

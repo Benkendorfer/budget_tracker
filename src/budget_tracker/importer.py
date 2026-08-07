@@ -723,6 +723,18 @@ def import_wise_csv(
     if len(accounts) == 1:
         import_record.account_id = next(iter(accounts.values())).id
 
+    # These are rates the user actually paid on real conversions, so they are the best
+    # evidence for those specific days — better than a later reference rate. Recorded
+    # unconditionally (not just for newly inserted rows): record_rate upserts on
+    # (day, base, quote, source), so re-importing an already-seen file just rewrites the
+    # same values rather than duplicating them.
+    if plan.rates:
+        from . import rates as rates_module
+
+        rates_module.record_observed(
+            session, ((r.day, r.base, r.quote, r.rate) for r in plan.rates)
+        )
+
     from .vendors import apply_rules
 
     apply_rules(session)

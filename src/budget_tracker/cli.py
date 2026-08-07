@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+from datetime import date, datetime
 from pathlib import Path
 from typing import List, Optional
 
@@ -95,6 +96,12 @@ def _resolve_category(session, name: str) -> Optional[int]:
         print(f"No category named {name!r}.")
         return None
     return category.id
+
+
+def _iso_date(text: str) -> date:
+    """argparse ``type=`` for a ``YYYY-MM-DD`` flag; a bad value fails argparse's own
+    usage error rather than a traceback."""
+    return datetime.strptime(text, "%Y-%m-%d").date()
 
 
 def _cmd_import(args: argparse.Namespace) -> int:
@@ -724,6 +731,103 @@ def _cmd_transfers(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_rates(args: argparse.Namespace) -> int:
+    """List cached exchange rates, fetch ECB references, or set a manual one.
+
+    ``rates.py`` and ``wise.py`` are finished modules this only wires up: the
+    aggregation for ``list`` is done here with a direct query rather than through
+    ``queries.py``, which this change does not touch.
+    """
+    from decimal import Decimal, InvalidOperation
+
+    from sqlalchemy import func, select
+
+    from . import rates as rates_module
+    from .models import ExchangeRate, Transaction
+
+    engine = get_engine()
+    init_db(engine)
+    session_factory = get_sessionmaker(engine)
+    command = args.rates_command or "list"
+
+    with session_factory() as session:
+        if command == "set":
+            try:
+                rate = Decimal(args.rate)
+            except InvalidOperation:
+                print(f"Could not read {args.rate!r} as a rate.")
+                return 1
+            on = args.on or date.today()
+            rates_module.record_rate(
+                session, on, args.base, args.quote, rate, rates_module.MANUAL
+            )
+            session.commit()
+            print(f"Set {args.base} -> {args.quote} = {rate} on {on.isoformat()} (manual).")
+            return 0
+
+        if command == "fetch":
+            start, end = args.start, args.end
+            if start is None or end is None:
+                first, last = session.execute(
+                    select(
+                        func.min(Transaction.posted_date),
+                        func.max(Transaction.posted_date),
+                    )
+                ).one()
+                start = start or first
+                end = end or last
+            if start is None or end is None:
+                print(
+                    "No transactions in the database to derive a date range from; "
+                    "pass --start and --end."
+                )
+                return 1
+            print(f"Range: {start.isoformat()}..{end.isoformat()}")
+
+            # A single base against every other currency on file: rate_on can derive
+            # the inverse of a cached pair, but not a third currency from two others, so
+            # this covers every pair only when one side of each is the base.
+            currencies = sorted({row.currency for row in queries.get_accounts(session)})
+            base = DEFAULT_CURRENCY_CODE if DEFAULT_CURRENCY_CODE in currencies else (
+                currencies[0] if currencies else None
+            )
+            quotes = [c for c in currencies if c != base] if base else []
+            if not quotes:
+                print(f"Only one currency on file ({base or 'none'}); nothing to fetch.")
+                return 0
+
+            try:
+                written = rates_module.fetch_ecb_rates(session, start, end, base, quotes)
+            except rates_module.FrankfurterError as error:
+                print(f"Could not fetch ECB rates: {error}")
+                return 1
+            session.commit()
+            print(f"Wrote {written} rate(s) for {base} -> {', '.join(quotes)}.")
+            return 0
+
+        rows = session.execute(
+            select(
+                ExchangeRate.base,
+                ExchangeRate.quote,
+                ExchangeRate.source,
+                func.min(ExchangeRate.day),
+                func.max(ExchangeRate.day),
+                func.count(),
+            )
+            .group_by(ExchangeRate.base, ExchangeRate.quote, ExchangeRate.source)
+            .order_by(ExchangeRate.base, ExchangeRate.quote, ExchangeRate.source)
+        ).all()  # "list"
+
+    if not rows:
+        print("No exchange rates cached yet. Run 'budget rates fetch' or 'budget rates set'.")
+        return 0
+    for base, quote, source, first, last, count in rows:
+        span = first.isoformat() if first == last else f"{first.isoformat()}..{last.isoformat()}"
+        plural = "" if count == 1 else "s"
+        print(f"  {base} -> {quote}   {source:<8} {span:<23} {count} rate{plural}")
+    return 0
+
+
 def _cmd_tui(args: argparse.Namespace) -> int:
     # Imported lazily so plain `import` runs without pulling in Textual.
     from .tui import run
@@ -976,6 +1080,41 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     transfers_parser.set_defaults(func=_cmd_transfers)
+
+    rates_parser = subparsers.add_parser(
+        "rates", help="Cache and inspect currency exchange rates."
+    )
+    rates_parser.set_defaults(func=_cmd_rates, rates_command="list")
+    rates_subparsers = rates_parser.add_subparsers(dest="rates_command")
+
+    rates_subparsers.add_parser(
+        "list", help="Show cached rates: pair, source, date span, count (default)."
+    )
+
+    rates_fetch = rates_subparsers.add_parser(
+        "fetch",
+        help=(
+            "Fetch ECB reference rates. With no dates, covers every transaction on "
+            "file and every currency an account is in."
+        ),
+    )
+    rates_fetch.add_argument(
+        "--start", type=_iso_date, help="Start date (default: earliest transaction)."
+    )
+    rates_fetch.add_argument(
+        "--end", type=_iso_date, help="End date (default: latest transaction)."
+    )
+
+    rates_set = rates_subparsers.add_parser(
+        "set",
+        help="Record a rate by hand; outranks other sources for that day.",
+    )
+    rates_set.add_argument("base", help="Base currency code, e.g. USD.")
+    rates_set.add_argument("quote", help="Quote currency code, e.g. CHF.")
+    rates_set.add_argument("rate", help="How many QUOTE units one BASE unit buys.")
+    rates_set.add_argument(
+        "--on", type=_iso_date, help="Date the rate applies to (default: today)."
+    )
 
     format_parser = subparsers.add_parser(
         "format",

@@ -17,6 +17,7 @@
     - [Charts](#charts)
     - [Pie chart](#pie-chart)
     - [Transfers between your own accounts](#transfers-between-your-own-accounts)
+    - [Currencies and exchange rates](#currencies-and-exchange-rates)
     - [Importing data](#importing-data)
     - [Where the data lives](#where-the-data-lives)
     - [Running the tests](#running-the-tests)
@@ -173,6 +174,12 @@ budget category merge Dining Snacks
 budget category merge Dining Snacks --yes
 
 # Pair up money moved between your own accounts.
+# Exchange rates: what is cached, fetch more, or set one by hand.
+budget rates                    # or: budget rates list
+budget rates fetch              # covers every transaction and currency on file
+budget rates fetch --start 2025-01-01 --end 2025-12-31
+budget rates set USD CHF 0.805 --on 2025-12-02
+
 budget transfers --days 5
 budget transfers --same-account   # also pair legs within one account (see below)
 budget transfers --reset
@@ -529,6 +536,42 @@ never disagree. A subcategory does not get its own wedge: its money is already r
 into its parent's (see "Statistics" above), and a category that is all refund with no
 real net spend — or a window with no spending at all — gets no wedge rather than an
 empty sliver. The legend beside the pie lists each category, its share, and its amount.
+
+### Currencies and exchange rates
+
+Every transaction records the currency it happened in, and every account is denominated
+in exactly one — which is why a Wise export splits itself into `Wise USD`, `Wise CHF`,
+and `Wise EUR` rather than becoming one mixed account. Keeping an account single-currency
+is what lets every per-account total be added up without conversion.
+
+Rates come from three places, ranked by how specific they are to the day being converted:
+
+| Source | Where it comes from |
+| --- | --- |
+| `manual` | A rate you typed in yourself with `budget rates set` |
+| `observed` | A rate you actually got, harvested automatically from a real conversion when you import a Wise transfer log |
+| `ecb` | The daily reference midpoint, fetched from the European Central Bank via Frankfurter with `budget rates fetch` |
+
+**The closest rate on or before the day wins; the source only breaks a tie on the same
+day.** Source does not outrank recency, which is the tempting reading but the wrong one:
+it would mean one rate typed in January silently converting every transaction of the
+following year too, an error that grows quietly and shows up nowhere. A hand-set rate is
+authoritative for the day you set it, which is what setting it meant.
+
+On-or-before rather than exact-date matching is not a nicety — the ECB only publishes on
+working days, so an exact-date lookup would fail for every weekend and holiday.
+
+```bash
+budget rates fetch      # works out the date range and currency pairs from your data
+budget rates list       # pair, source, date span, count
+```
+
+Fetching needs no API key. Only the pair actually stored is needed: the reverse is derived
+by inversion, so caching `USD → CHF` also answers `CHF → USD`.
+
+**A missing rate is never guessed.** It is not treated as 1.0 and not averaged from
+neighbours; the amount is reported as unconverted instead, the same way transfers excluded
+from a total are counted rather than silently dropped.
 
 ### Transfers between your own accounts
 
