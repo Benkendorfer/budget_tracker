@@ -50,6 +50,11 @@ class ImportResult:
     skipped_duplicates: int
 
 
+# Shown in the import panel's Status column for a transfer-log export. Not a row in
+# csv_format: this layout is recognized from its own columns, not learned.
+WISE_FORMAT_NAME = "Wise transfer log"
+
+
 def _get_or_create_currency(session: Session, code: str) -> Currency:
     currency = session.scalar(select(Currency).where(Currency.value == code))
     if currency is None:
@@ -236,7 +241,7 @@ def _count_csvs(directory: Path) -> int:
     That means matching on the lowercased suffix rather than a ``*.csv`` glob (which is
     case-sensitive, and would miss a ``.CSV``) and skipping dot-prefixed names (which the
     listing hides, so counting them would promise files you cannot reach). A folder
-    labelled "2 CSVs" that turns out to hold three is worse than no count at all.
+    labeled "2 CSVs" that turns out to hold three is worse than no count at all.
     """
     try:
         return sum(
@@ -317,6 +322,15 @@ def inspect_csv(session: Session, path: Path) -> ImportCandidate:
         fieldnames, rows = read_header_and_rows(path)
     except OSError as error:
         return ImportCandidate(path=path, row_count=0, problem=f"unreadable: {error}")
+    # Recognized by its own columns rather than by a learned format, so it is ready the
+    # first time it is seen and never asks the layout questions — none of which it could
+    # answer, since it carries two currencies per row and no single amount column.
+    from . import wise
+
+    if wise.looks_like_wise(fieldnames):
+        return ImportCandidate(
+            path=path, row_count=len(rows), format_name=WISE_FORMAT_NAME
+        )
     try:
         fmt = detect(session, fieldnames)
     except UnknownFormat:
@@ -370,12 +384,24 @@ def import_csv(
 
     ``account_name`` names the account for formats whose files carry no account column;
     passing it for other formats overrides the account they would have derived.
+
+    A Wise transfer-log export is recognized here and handed to :func:`import_wise_csv`,
+    so every caller — the app's import panel, ``import all``, the CLI — picks it up
+    without needing to know the layout exists. It cannot go through the path below: a row
+    carries two currencies and may imply two transactions, which :class:`FormatSpec`
+    has no way to express.
     """
     path = Path(path)
     # Same reader as inference used, or the two would disagree about which line is the
     # header and a format learned from this file would not match it on import.
     reader = _dict_reader(_read_text(path))
     fieldnames = reader.fieldnames or []
+
+    from . import wise
+
+    if fmt is None and wise.looks_like_wise(fieldnames):
+        return import_wise_csv(session, path)
+
     if fmt is None:
         fmt = detect(session, fieldnames)
     missing = [c for c in fmt.signature if c not in fieldnames]
@@ -581,4 +607,134 @@ def delete_import(session: Session, import_id: int) -> DeleteResult:
         import_id=import_id,
         transactions_deleted=len(doomed),
         transfers_broken=transfers_broken,
+    )
+
+
+def import_wise_csv(
+    session: Session,
+    path: Path,
+    account_prefix: str = "Wise",
+) -> ImportResult:
+    """Import a Wise transfer-log export. See :mod:`.wise` for what the rows mean.
+
+    This bypasses :class:`~.formats.FormatSpec` entirely, because the layout is not a
+    ledger: a row carries two currencies and can imply two transactions. :func:`wise.plan_rows`
+    makes every decision about which leg is yours and what it means; this function does
+    nothing but write the result down.
+
+    Accounts are created per currency (``Wise USD``, ``Wise CHF``), derived from each
+    row's own currency rather than asked for once per file — so a single export that
+    mixes balances splits itself across the right accounts.
+    """
+    from . import wise
+
+    path = Path(path)
+    reader = _dict_reader(_read_text(path))
+    rows = list(reader)
+    if not wise.looks_like_wise(reader.fieldnames or []):
+        raise UnknownFormat(
+            f"'{path.name}' is not a Wise transfer export: it is missing "
+            f"{[c for c in wise.SIGNATURE if c not in (reader.fieldnames or [])]}."
+        )
+
+    plan = wise.plan_rows(rows)
+
+    import_record = Import(source_file=path.name, row_count=len(rows))
+    session.add(import_record)
+    session.flush()
+
+    currencies: Dict[str, Currency] = {}
+    accounts: Dict[str, Account] = {}
+    inserted = 0
+    skipped = 0
+    conversions = []
+
+    for planned in plan.transactions:
+        # Namespaced by the reader, not by a format name: this hash must stay stable even
+        # if the file is later renamed or re-exported, since the transfer ID is the only
+        # thing that makes re-importing idempotent.
+        import_hash = _row_hash("wise", planned.dedup_key)
+        exists = session.scalar(
+            select(Transaction.id).where(Transaction.import_hash == import_hash)
+        )
+        if exists is not None:
+            skipped += 1
+            continue
+
+        currency = currencies.get(planned.currency)
+        if currency is None:
+            currency = _get_or_create_currency(session, planned.currency)
+            currencies[planned.currency] = currency
+        account = accounts.get(planned.currency)
+        if account is None:
+            account = _get_or_create_account(
+                session, wise.account_name(planned.currency, account_prefix), currency
+            )
+            accounts[planned.currency] = account
+
+        scale = 10 ** currency.decimal_places
+        value_minor = int((planned.amount * scale).to_integral_value())
+
+        vendor = (
+            _get_or_create_vendor(session, planned.description)
+            if planned.description
+            else None
+        )
+
+        category = None
+        category_source = "unset"
+        if planned.category:
+            category = _get_or_create_category(session, planned.category)
+            category_source = "import"
+
+        txn = Transaction(
+            account_id=account.id,
+            category_id=category.id if category else None,
+            currency_id=currency.id,
+            import_id=import_record.id,
+            vendor_id=vendor.id if vendor else None,
+            posted_date=planned.posted_date,
+            description=planned.description,
+            raw_description=planned.description,
+            value_minor=value_minor,
+            category_source=category_source,
+            import_hash=import_hash,
+        )
+        session.add(txn)
+        if planned.is_transfer:
+            conversions.append(txn)
+        inserted += 1
+
+    # A conversion is a transfer with only one leg recorded: the money arriving in the
+    # other currency is deliberately not stored (each account tracks only its own side).
+    # It still needs a transfer_group_id, because that — not the two legs canceling — is
+    # what keeps it out of the spending figures. Group ids elsewhere are transaction ids,
+    # so a group of one uses its own; that needs the flush above it for an id to exist.
+    if conversions:
+        from .transfers import TRANSFER_CATEGORY, TRANSFER_SOURCE as _TRANSFER_SOURCE
+
+        session.flush()
+        transfer_category = _get_or_create_category(session, TRANSFER_CATEGORY)
+        for txn in conversions:
+            txn.transfer_group_id = txn.id
+            txn.category_id = transfer_category.id
+            txn.category_source = _TRANSFER_SOURCE
+
+    if len(accounts) == 1:
+        import_record.account_id = next(iter(accounts.values())).id
+
+    from .vendors import apply_rules
+
+    apply_rules(session)
+
+    from .categories import apply_category_rules
+
+    apply_category_rules(session)
+
+    session.commit()
+    return ImportResult(
+        source_file=path.name,
+        total_rows=len(rows),
+        inserted=inserted,
+        skipped_duplicates=skipped,
     )

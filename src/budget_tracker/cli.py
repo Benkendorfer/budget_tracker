@@ -523,7 +523,7 @@ def _ask(question: formats.Question) -> str:
 
 
 def _setup_format(session, path: Path, fieldnames, rows) -> Optional[object]:
-    """Walk the user through defining a format for an unrecognised CSV."""
+    """Walk the user through defining a format for an unrecognized CSV."""
     print(f"'{path.name}' does not match any format you have defined yet.")
     default_name = re.sub(r"[^a-z0-9]+", "_", path.stem.lower()).strip("_") or "format"
     name = input(f"Name for this layout [{default_name}]: ").strip() or default_name
