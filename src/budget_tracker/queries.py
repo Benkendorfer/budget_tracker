@@ -950,6 +950,142 @@ def get_bucket_totals(
     ]
 
 
+@dataclass
+class CategoryBucketTotal:
+    """One (time bucket, category) cell -- the cross ``get_category_totals`` and
+    ``get_bucket_totals`` each slice separately, needed for a chart that compares a
+    category's share of spending across time.
+    """
+
+    bucket_key: str
+    bucket_label: str
+    category_id: Optional[int]  # None for uncategorised, matching CategoryTotal.id
+    category_name: str  # "" when uncategorised
+    parent_id: Optional[int]
+    count: int
+    total_minor: int  # signed sum
+    outflow_minor: int
+    inflow_minor: int
+
+
+def get_category_bucket_totals(
+    session: Session,
+    bucket: str = "month",
+    account_id: Optional[int] = None,
+    category_id: Optional[int] = None,
+    vendor_filter: Optional[VendorFilter] = None,
+    text_filter: Optional[TextFilter] = None,
+    date_range: Optional[DateRange] = None,
+    home_currency: str = HOME_CURRENCY,
+    filters: Optional[Filters] = None,
+) -> List[CategoryBucketTotal]:
+    """Money grouped by (time bucket, category) -- the cross ``get_category_totals``
+    and ``get_bucket_totals`` each slice separately.
+
+    Transfers are dropped outright, the same as ``get_bucket_totals`` -- not kept as a
+    zero-money row the way ``get_category_totals`` keeps a category holding one, since
+    there is no bucket-shaped place to put a transfer leg once its money is zeroed.
+
+    Chronological by bucket; a category with nothing in a given bucket simply has no
+    row for it there, exactly like a quiet bucket in ``get_bucket_totals`` has no row at
+    all -- zero-filling per bucket, and rolling each bucket up to depth 0, is the
+    caller's job (see ``stats.category_share_series``).
+    """
+    patterns = BUCKET_FORMATS.get(bucket)
+    if patterns is None:
+        raise ValueError(f"Unknown bucket {bucket!r}; expected one of {list(BUCKETS)}.")
+    key_format, label_format = patterns
+
+    resolved = resolve_filters(
+        filters, account_id, category_id, vendor_filter, text_filter, date_range
+    )
+    base = _txn_query(resolved).subquery()
+    amount = base.c.value_minor
+    real = base.c.transfer_group_id.is_(None)
+    key = func.strftime(key_format, base.c.posted_date)
+    label = func.strftime(label_format, base.c.posted_date)
+
+    if _currencies_present(session, base, real) <= {home_currency}:
+        total, outflow, inflow = _signed_sums(amount)
+        rows = session.execute(
+            select(
+                key, label, base.c.category_id, func.coalesce(Category.value, ""),
+                Category.parent_id, func.count(), total, outflow, inflow,
+            )
+            .select_from(base)
+            .join(Category, Category.id == base.c.category_id, isouter=True)
+            .where(real)
+            .group_by(key, label, base.c.category_id)
+            .order_by(key)
+        ).all()
+        return [
+            CategoryBucketTotal(
+                bucket_key=r[0], bucket_label=r[1], category_id=r[2], category_name=r[3],
+                parent_id=r[4], count=r[5], total_minor=r[6], outflow_minor=r[7],
+                inflow_minor=r[8],
+            )
+            for r in rows
+        ]
+
+    # Slow path: mirrors get_bucket_totals and get_category_totals -- info (count,
+    # names) comes from one grouping, money from a finer (bucket, category, currency,
+    # day) grouping converted per group at that day's own rate (against the rate table
+    # cached once per session -- see rates._rate_book -- so this is one lookup per
+    # group in Python, not one query per group), then summed up in Python.
+    info_rows = session.execute(
+        select(
+            key, label, base.c.category_id, func.coalesce(Category.value, ""),
+            Category.parent_id, func.count(),
+        )
+        .select_from(base)
+        .join(Category, Category.id == base.c.category_id, isouter=True)
+        .where(real)
+        .group_by(key, label, base.c.category_id)
+    ).all()
+
+    money_groups = session.execute(
+        select(
+            key, base.c.category_id, Currency.value, base.c.posted_date,
+            func.coalesce(func.sum(case((amount < 0, amount), else_=0)), 0),
+            func.coalesce(func.sum(case((amount > 0, amount), else_=0)), 0),
+        )
+        .select_from(base)
+        .join(Currency, Currency.id == base.c.currency_id)
+        .where(real)
+        .group_by(key, base.c.category_id, Currency.value, base.c.posted_date)
+    ).all()
+
+    # See get_totals for why this is checked once ahead of the loop rather than left to
+    # rates.convert to raise.
+    home_currency_known = rates.currency_known(session, home_currency)
+
+    sums: Dict[Tuple[str, Optional[int]], Tuple[int, int]] = defaultdict(lambda: (0, 0))
+    for bucket_key, cat_id, currency, day, outflow_sum, inflow_sum in money_groups:
+        converted_outflow = converted_inflow = None
+        if home_currency_known:
+            converted_outflow = rates.convert(session, outflow_sum, currency, home_currency, day)
+            converted_inflow = rates.convert(session, inflow_sum, currency, home_currency, day)
+        if converted_outflow is None or converted_inflow is None:
+            continue  # missing rate (or an unknown home_currency): left out, not zeroed
+        cur_outflow, cur_inflow = sums[(bucket_key, cat_id)]
+        sums[(bucket_key, cat_id)] = (
+            cur_outflow + converted_outflow, cur_inflow + converted_inflow
+        )
+
+    results = [
+        CategoryBucketTotal(
+            bucket_key=bucket_key, bucket_label=bucket_label, category_id=cat_id,
+            category_name=name, parent_id=parent_id, count=count,
+            total_minor=sums[(bucket_key, cat_id)][0] + sums[(bucket_key, cat_id)][1],
+            outflow_minor=sums[(bucket_key, cat_id)][0],
+            inflow_minor=sums[(bucket_key, cat_id)][1],
+        )
+        for bucket_key, bucket_label, cat_id, name, parent_id, count in info_rows
+    ]
+    results.sort(key=lambda r: r.bucket_key)
+    return results
+
+
 def get_imports(session: Session) -> List[ImportRow]:
     """Past imports, most recent first — where an ``unimport`` id comes from."""
     rows = session.execute(

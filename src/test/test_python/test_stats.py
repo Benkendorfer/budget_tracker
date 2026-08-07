@@ -1439,3 +1439,301 @@ def test_a_parent_is_immediately_followed_by_its_whole_subtree(tmp_path):
     # Food's two children sit in the two rows straight after it, nothing wedged between.
     assert set(names[food + 1:food + 3]) == {"Dining", "Groceries"}
     assert rows[food + 1].depth == rows[food + 2].depth == rows[food].depth + 1
+
+
+# --------------------------------------------------------- category x bucket totals
+
+def test_get_category_bucket_totals_groups_by_bucket_and_category(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        currency, accounts, cats = _seed(session, category_names=("Dining", "Travel"))
+        account = accounts["Checking"]
+        _txn(session, currency, account, date(2025, 1, 5), -1000, "A", cats["Dining"])
+        _txn(session, currency, account, date(2025, 1, 20), -500, "B", cats["Travel"])
+        _txn(session, currency, account, date(2025, 2, 3), -2000, "C", cats["Dining"])
+        _txn(session, currency, account, date(2025, 2, 4), -300, "D")  # uncategorised
+        session.commit()
+
+    with session_factory() as session:
+        rows = queries.get_category_bucket_totals(session, "month")
+
+    by_key_name = {(r.bucket_key, r.category_name): r for r in rows}
+    assert by_key_name[("2025-01", "Dining")].outflow_minor == -1000
+    assert by_key_name[("2025-01", "Travel")].outflow_minor == -500
+    assert by_key_name[("2025-02", "Dining")].outflow_minor == -2000
+    uncategorised = by_key_name[("2025-02", "")]
+    assert uncategorised.outflow_minor == -300
+    assert uncategorised.category_id is None
+    # Chronological by bucket.
+    assert [r.bucket_key for r in rows] == sorted(r.bucket_key for r in rows)
+
+
+def test_get_category_bucket_totals_drops_transfers_outright(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        currency, accounts, cats = _seed(
+            session, account_names=("Checking", "Savings"), category_names=("Dining",)
+        )
+        _txn(session, currency, accounts["Checking"], date(2025, 3, 1), -50000, "Xfer To")
+        _txn(session, currency, accounts["Savings"], date(2025, 3, 2), 50000, "Xfer From")
+        _txn(session, currency, accounts["Checking"], date(2025, 3, 3), -2500, "Coffee",
+             category=cats["Dining"])
+        transfers.detect_transfers(session)
+        session.commit()
+
+    with session_factory() as session:
+        rows = queries.get_category_bucket_totals(session, "month")
+
+    # Unlike get_category_totals, a transfer leg leaves no row at all here -- there is
+    # no bucket-shaped place to put a category holding zero money.
+    assert len(rows) == 1
+    assert rows[0].category_name == "Dining"
+    assert rows[0].outflow_minor == -2500
+
+
+def test_get_category_bucket_totals_honors_filters(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        currency, accounts, cats = _seed(
+            session, account_names=("Checking", "Card"), category_names=("Dining",)
+        )
+        _txn(session, currency, accounts["Checking"], date(2025, 3, 1), -1000, "A",
+             cats["Dining"])
+        _txn(session, currency, accounts["Card"], date(2025, 3, 2), -2000, "B",
+             cats["Dining"])
+        _txn(session, currency, accounts["Checking"], date(2025, 4, 1), -5000, "C",
+             cats["Dining"])
+        session.commit()
+
+    with session_factory() as session:
+        account_id = queries.resolve_account(session, "Checking")
+        rows = queries.get_category_bucket_totals(
+            session, "month", account_id=account_id,
+            date_range=(date(2025, 3, 1), date(2025, 3, 31)),
+        )
+
+    assert len(rows) == 1
+    assert rows[0].outflow_minor == -1000
+
+
+def test_get_category_bucket_totals_rejects_an_unknown_bucket(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        with pytest.raises(ValueError, match="Unknown bucket"):
+            queries.get_category_bucket_totals(session, "quarter")
+
+
+def test_get_category_bucket_totals_convert_before_summing(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        currencies, accounts = _seed_two_currencies(session)
+        dining = Category(value="Dining")
+        session.add(dining)
+        session.flush()
+        day = date(2025, 6, 15)
+        rates.record_rate(session, day, "CHF", "USD", Decimal("1.10"), rates.ECB)
+        _txn(session, currencies["USD"], accounts["Checking"], day, -2000, "Snack",
+             category=dining)
+        _txn(session, currencies["CHF"], accounts["Card CHF"], day, -10000, "Fondue",
+             category=dining)
+        session.commit()
+
+    with session_factory() as session:
+        rows = queries.get_category_bucket_totals(session, "month")
+
+    assert len(rows) == 1
+    assert rows[0].bucket_key == "2025-06"
+    assert rows[0].category_name == "Dining"
+    # -20.00 USD + (-100.00 CHF * 1.10) = -20.00 + -110.00 USD = -13000 minor.
+    assert rows[0].outflow_minor == -2000 + -11000
+
+
+def test_get_category_bucket_totals_leaves_unconvertible_money_out(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        currencies, accounts = _seed_two_currencies(session)
+        dining = Category(value="Dining")
+        session.add(dining)
+        session.flush()
+        # No rate recorded at all.
+        _txn(session, currencies["CHF"], accounts["Card CHF"], date(2025, 6, 1), -10000,
+             "Fondue", category=dining)
+        session.commit()
+
+    with session_factory() as session:
+        rows = queries.get_category_bucket_totals(session, "month")
+
+    assert len(rows) == 1
+    assert rows[0].count == 1  # the row is still real and counted...
+    assert rows[0].outflow_minor == 0  # ...but its money could not be converted
+
+
+def test_get_category_bucket_totals_filters_object_matches_individual_arguments(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        accounts, cats, vendor = _seed_for_filters(session)
+        text_filter = queries.TextFilter("coffee")
+
+    with session_factory() as session:
+        by_args = queries.get_category_bucket_totals(session, "day", text_filter=text_filter)
+    with session_factory() as session:
+        by_filters = queries.get_category_bucket_totals(
+            session, "day", filters=queries.Filters(text_filter=text_filter)
+        )
+
+    assert len(by_args) == 1
+    assert by_args == by_filters
+
+
+def test_category_bucket_totals_conversion_does_not_query_per_group(tmp_path):
+    """Same guard as test_conversion_does_not_query_per_transaction_group, for the
+    finer (bucket, category, currency, day) grouping this function adds."""
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        currency, accounts, cats = _seed(
+            session, account_names=("US", "CH"), category_names=("Dining", "Travel")
+        )
+        chf = Currency(value="CHF", symbol="CHF", decimal_places=2)
+        session.add(chf)
+        session.flush()
+        accounts["CH"].currency_id = chf.id
+        for offset in range(40):
+            day = date(2026, 1, 1) + timedelta(days=offset)
+            _txn(session, currency, accounts["US"], day, -100, f"us{offset}", cats["Dining"])
+            txn = _txn(session, chf, accounts["CH"], day, -200, f"ch{offset}", cats["Travel"])
+            txn.currency_id = chf.id
+            rates.record_rate(session, day, "USD", "CHF", Decimal("0.9"), rates.ECB)
+        session.commit()
+
+    from sqlalchemy import event
+    from sqlalchemy.engine import Engine
+
+    counted = []
+    listener = lambda *args, **kwargs: counted.append(1)  # noqa: E731
+    event.listen(Engine, "before_cursor_execute", listener)
+    try:
+        with session_factory() as session:
+            rows = queries.get_category_bucket_totals(session, "day")
+    finally:
+        event.remove(Engine, "before_cursor_execute", listener)
+
+    assert len(rows) == 80
+    # 40 days x 2 categories, each in its own currency -- a per-group lookup would be
+    # in the hundreds; the whole rate table is read once instead.
+    assert len(counted) < 20, f"{len(counted)} queries for one get_category_bucket_totals"
+
+
+# --------------------------------------------------------- per-bucket category rollup
+
+def test_category_share_series_rolls_up_per_bucket_and_zero_fills(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        currency, accounts, _ = _seed(session)
+        account = accounts["Checking"]
+        dining = categories.ensure_path(session, "Food > Dining")
+        session.flush()
+        _txn(session, currency, account, date(2025, 1, 10), -1000, "A", dining)
+        _txn(session, currency, account, date(2025, 3, 5), -2000, "B", dining)
+        session.commit()
+
+    window = _custom("2025-01-01", "2025-03-31")
+    with session_factory() as session:
+        series = stats.category_share_series(session, window, "month")
+
+    assert [b.key for b in series] == ["2025-01", "2025-02", "2025-03"]
+    # February held nothing: an empty row, not a missing one.
+    assert series[1].categories == []
+    assert series[1].net_spend_minor == 0
+
+    jan = {c.name: c for c in series[0].categories}
+    assert set(jan) == {"Food", "Dining"}
+    assert jan["Food"].depth == 0
+    assert jan["Food"].outflow_minor == -1000  # rolled up from Dining
+    assert jan["Dining"].depth == 1
+    assert jan["Dining"].parent_id == jan["Food"].category_id
+    assert series[0].net_spend_minor == -1000
+
+
+def test_category_share_series_respects_a_category_drill_down(tmp_path):
+    """Mirrors build_report's own root_category_id handling: the filtered-to category
+    is displayed at depth 0 in every bucket, not the category above it."""
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        currency, accounts, _ = _seed(session)
+        account = accounts["Checking"]
+        food = categories.ensure_path(session, "Life > Food")
+        dining = categories.ensure_path(session, "Life > Food > Dining")
+        session.flush()
+        _txn(session, currency, account, date(2025, 1, 5), -1000, "A", dining)
+        _txn(session, currency, account, date(2025, 1, 6), -500, "B", food)
+        session.commit()
+        food_id = food.id
+
+    window = _custom("2025-01-01", "2025-01-31")
+    with session_factory() as session:
+        series = stats.category_share_series(session, window, "month", category_id=food_id)
+
+    jan = series[0].categories
+    assert [(c.name, c.depth) for c in jan] == [("Food", 0), ("Dining", 1)]
+    assert jan[0].total_minor == -1500
+    assert jan[0].parent_id is None  # the drill-down root, not climbing to Life
+    assert jan[1].parent_id == food_id
+
+
+def test_category_share_series_filters_object_matches_individual_arguments(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        accounts, cats, vendor = _seed_for_filters(session)
+        account_id = accounts["Checking"].id
+
+    window = _custom("2025-03-01", "2025-03-31")
+    with session_factory() as session:
+        by_args = stats.category_share_series(session, window, "day", account_id=account_id)
+    with session_factory() as session:
+        by_filters = stats.category_share_series(
+            session, window, "day", filters=queries.Filters(account_id=account_id)
+        )
+
+    assert by_args == by_filters
+    assert sum(len(b.categories) for b in by_args) == 1
+
+
+def test_category_totals_across_buckets_equal_the_top_bars_own_total(tmp_path):
+    """The acceptance test: summing a category's total_minor over every bucket must
+    reproduce its total_minor in build_report's own (rolled up, converted) categories --
+    with a nested hierarchy and more than one currency present, so a wrong rollup, a
+    double-counted parent, a dropped bucket, or an inconsistent conversion would each
+    show up here."""
+    from collections import defaultdict
+
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        currencies, accounts = _seed_two_currencies(session)
+        dining = categories.ensure_path(session, "Food > Dining")
+        groceries = categories.ensure_path(session, "Food > Groceries")
+        travel = categories.ensure_path(session, "Travel")
+        session.flush()
+        early, late = date(2025, 1, 15), date(2025, 3, 10)
+        rates.record_rate(session, early, "CHF", "USD", Decimal("1.10"), rates.ECB)
+        rates.record_rate(session, late, "CHF", "USD", Decimal("1.20"), rates.ECB)
+        _txn(session, currencies["USD"], accounts["Checking"], early, -1000, "A", dining)
+        _txn(session, currencies["CHF"], accounts["Card CHF"], early, -2000, "B", groceries)
+        _txn(session, currencies["USD"], accounts["Checking"], late, -500, "C", dining)
+        _txn(session, currencies["CHF"], accounts["Card CHF"], late, -3000, "D", travel)
+        _txn(session, currencies["USD"], accounts["Checking"], late, -700, "E")  # uncategorised
+        session.commit()
+
+    window = _custom("2025-01-01", "2025-03-31")
+    with session_factory() as session:
+        report = stats.build_report(session, window)
+        series = stats.category_share_series(session, window, "month")
+
+    summed = defaultdict(int)
+    for bucket in series:
+        for cat in bucket.categories:
+            summed[cat.name] += cat.total_minor
+    for cat in report.categories:
+        assert summed[cat.name] == cat.total_minor, cat.name
+    # Uncategorised is not part of report.categories' name-keying oddity -- check it too.
+    uncategorised = next(c for c in report.categories if c.name == stats.UNCATEGORISED)
+    assert summed[stats.UNCATEGORISED] == uncategorised.total_minor

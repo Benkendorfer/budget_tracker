@@ -35,7 +35,7 @@ from datetime import date, timedelta
 from typing import List, Optional, Tuple
 
 from .queries import BUCKET_FORMATS, BucketTotal
-from .stats import CategoryStat, Window
+from .stats import BucketCategories, CategoryStat, Window
 
 BLOCK = "█"
 
@@ -544,3 +544,136 @@ def build_share_bar(
         width=width,
         total_minor=sum(segment.amount_minor for segment in segments),
     )
+
+
+# --------------------------------------------------------------- the stacked share bar
+#
+# One :func:`build_share_bar` for the whole window, plus one full-width bar per time
+# bucket -- composition over time, comparable only because every bar draws the same
+# segments in the same order (see build_stacked_share's docstring for why that is the
+# one thing this layout cannot get wrong).
+
+
+@dataclass(frozen=True)
+class StackedBar:
+    """One time bucket's own composition, drawn full width -- its own 100%, not a
+    fraction of the window's."""
+
+    key: str
+    label: str
+    total_minor: int  # this bucket's own net spend; the bar's own 100%
+    # Same segment identities (name, category_id, is_other), same order, as the chart's
+    # own `segments` -- only `share`/`amount_minor`/`cells` vary bucket to bucket. Empty
+    # when the bucket had no net spend at all: an empty bar, not a missing row (the row
+    # itself still exists in `StackedShareChart.bars`).
+    segments: List[ShareSegment]
+
+
+@dataclass(frozen=True)
+class StackedShareChart:
+    # The category set every bar -- `top` and each of `bars` -- draws, in the one order
+    # they all share. Read once here rather than off any particular bar, so a caller has
+    # exactly one place to build a legend and assign colours from.
+    segments: List[ShareSegment]
+    top: ShareBar  # the window-wide bar, unchanged from calling build_share_bar directly
+    bars: List[StackedBar]
+    width: int
+
+
+def build_stacked_share(
+    categories: List[CategoryStat],
+    buckets: List[BucketCategories],
+    width: int = SHARE_BAR_WIDTH,
+) -> StackedShareChart:
+    """The window-wide share bar plus one full-width bar per time bucket, all sharing
+    the same segments in the same order.
+
+    ``categories`` is the window's own depth-0 rollup (``stats.Report.categories``) and
+    decides the segment set exactly as :func:`build_share_bar` already does; ``buckets``
+    is the per-bucket rollup of the same window (``stats.category_share_series``), one
+    entry per bucket in chronological order.
+
+    The top bar's segments are the *only* thing that decides what a category is called
+    and where it sits: a bucket where some category was large, or one where it did not
+    appear at all, still draws every one of the top bar's segments in the same
+    positions -- zero-width where that bucket had nothing -- and anything the top bar
+    folded into ``Other`` (too small over the whole window) or never carried at all
+    (net positive over the whole window, even if a real cost in this one bucket) goes
+    into that bucket's ``Other`` too. A bucket is allowed to pick its own segments in
+    no version of this chart: that is what would let the same colour mean two different
+    categories on two different rows, which defeats the entire point of stacking them
+    for comparison. Each bucket's own ``Other``, unlike the top bar's, can therefore
+    hold money the top bar's own ``Other`` does not -- see the ``needs_other`` guard
+    below -- so a category never silently loses its bucket-level spend just because it
+    nets out over the whole window.
+
+    A bucket with no net spend at all draws as an empty bar (``segments == []``) rather
+    than a missing row, matching how :func:`build_share_bar` treats an empty window.
+    """
+    top = build_share_bar(categories, width=width)
+    real_ids = [seg.category_id for seg in top.segments if not seg.is_other]
+    real_id_set = set(real_ids)
+
+    def other_spend(bucket: BucketCategories) -> int:
+        return sum(
+            -min(0, cat.total_minor)
+            for cat in bucket.categories
+            if cat.depth == 0 and cat.category_id not in real_id_set
+        )
+
+    # The top bar reserves an Other slot whenever it folded a sliver into one; a bucket
+    # can also need the slot on its own, for a category that is entirely invisible in
+    # `top` (net positive over the whole window) but a real cost in that one bucket.
+    needs_other = any(seg.is_other for seg in top.segments) or any(
+        other_spend(bucket) > 0 for bucket in buckets
+    )
+
+    if needs_other and not any(seg.is_other for seg in top.segments):
+        # `top` itself drew no Other -- add a zero-share placeholder so `segments`
+        # still matches what every bucket bar below actually draws.
+        legend = list(top.segments) + [
+            ShareSegment(
+                name=OTHER_LABEL, category_id=None, share=0.0, amount_minor=0, cells=0,
+                is_other=True,
+            )
+        ]
+    else:
+        legend = top.segments
+    segment_ids = [seg.category_id for seg in legend]
+    segment_names = [seg.name for seg in legend]
+
+    bars: List[StackedBar] = []
+    for bucket in buckets:
+        by_id = {cat.category_id: cat for cat in bucket.categories if cat.depth == 0}
+        amounts = [
+            -min(0, by_id[cid].total_minor) if cid in by_id else 0 for cid in real_ids
+        ]
+        if needs_other:
+            amounts.append(other_spend(bucket))
+        bucket_total = sum(amounts)
+
+        if bucket_total == 0:
+            bars.append(
+                StackedBar(key=bucket.key, label=bucket.label, total_minor=0, segments=[])
+            )
+            continue
+
+        shares = [amount / bucket_total for amount in amounts]
+        cells = _apportion(shares, width)
+        segments = [
+            ShareSegment(
+                name=name, category_id=cid, share=share, amount_minor=amount, cells=count,
+                is_other=(cid is None),
+            )
+            for name, cid, share, amount, count in zip(
+                segment_names, segment_ids, shares, amounts, cells
+            )
+        ]
+        bars.append(
+            StackedBar(
+                key=bucket.key, label=bucket.label, total_minor=bucket_total,
+                segments=segments,
+            )
+        )
+
+    return StackedShareChart(segments=legend, top=top, bars=bars, width=width)

@@ -433,6 +433,95 @@ def _bucket_days(bucket: str, window: Window):
         day += timedelta(days=1)
 
 
+@dataclass(frozen=True)
+class BucketCategories:
+    """One time bucket's depth-0 rolled-up categories -- the category-shaped half of
+    the cross :func:`charts.build_stacked_share` needs, alongside :func:`spending_series`'s
+    money-shaped half.
+
+    Zero-filled the same way :func:`spending_series` zero-fills a quiet bucket: a
+    bucket with nothing in it is an empty ``categories`` list rather than a missing
+    key, so a caller does not have to special-case a gap in the axis.
+    """
+
+    key: str
+    label: str
+    categories: List[CategoryStat]
+    # This bucket's own net spend -- the denominator its rows' `share` was measured
+    # against, and the bucket's own "100%" for a chart that draws it full width. Not
+    # the window's net_spend_minor; each bucket gets its own.
+    net_spend_minor: int = 0
+
+
+def category_share_series(
+    session: Session,
+    window: Window,
+    bucket: str = "month",
+    account_id: Optional[int] = None,
+    category_id: Optional[int] = None,
+    vendor_filter: Optional[VendorFilter] = None,
+    text_filter: Optional[TextFilter] = None,
+    home_currency: str = HOME_CURRENCY,
+    filters: Optional[Filters] = None,
+) -> List[BucketCategories]:
+    """Depth-0 category rollups per time bucket, zero-filled across the window.
+
+    Each bucket gets its own :func:`_roll_up_categories` pass over just that bucket's
+    rows, reusing the same walk :func:`build_report` uses for the whole window, so a
+    parent's rolled-up total within one bucket is computed exactly the same way as it
+    is over the whole report -- summing a category's ``total_minor`` across every
+    bucket this returns reproduces its ``total_minor`` in :func:`build_report`'s own
+    ``categories`` for the same window and filters.
+    """
+    resolved = resolve_filters(
+        filters, account_id, category_id, vendor_filter, text_filter, date_range=None
+    ).replace(date_range=(window.start, window.end))
+    rows = queries.get_category_bucket_totals(
+        session, bucket=bucket, filters=resolved, home_currency=home_currency
+    )
+    key_format, label_format = BUCKET_FORMATS[bucket]
+
+    root_category_id = (
+        resolved.category_id
+        if resolved.category_id not in (None, queries.UNCATEGORISED_ID)
+        else None
+    )
+
+    by_bucket: Dict[str, List[CategoryTotal]] = defaultdict(list)
+    for row in rows:
+        by_bucket[row.bucket_key].append(
+            CategoryTotal(
+                id=row.category_id,
+                name=row.category_name,
+                count=row.count,
+                total_minor=row.total_minor,
+                outflow_minor=row.outflow_minor,
+                inflow_minor=row.inflow_minor,
+                parent_id=row.parent_id,
+            )
+        )
+
+    result: List[BucketCategories] = []
+    for day in _bucket_days(bucket, window):
+        key = day.strftime(key_format)
+        bucket_rows = by_bucket.get(key, [])
+        categories = (
+            _roll_up_categories(session, bucket_rows, window, root_category_id)
+            if bucket_rows
+            else []
+        )
+        net_spend_minor = sum(min(0, c.total_minor) for c in categories if c.depth == 0)
+        result.append(
+            BucketCategories(
+                key=key,
+                label=day.strftime(label_format),
+                categories=categories,
+                net_spend_minor=net_spend_minor,
+            )
+        )
+    return result
+
+
 def spending_series(
     session: Session,
     window: Window,

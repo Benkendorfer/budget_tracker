@@ -13,7 +13,7 @@ from budget_tracker import charts, queries, stats
 from budget_tracker.db import get_engine, get_sessionmaker, init_db
 from budget_tracker.models import Account, Category, Currency, Transaction
 from budget_tracker.queries import BucketTotal
-from budget_tracker.stats import CategoryStat
+from budget_tracker.stats import BucketCategories, CategoryStat
 
 
 def _bucket(key, outflow, inflow=0, count=1, label=None):
@@ -731,3 +731,175 @@ def test_the_other_segment_is_not_drillable():
     other = bar.segments[-1]
     assert other.is_other is True and other.category_id is None
     assert all(seg.category_id is not None for seg in bar.segments[:-1])
+
+
+# --------------------------------------------------------------- the stacked share bar
+
+
+def _bucket_cats(key, cats, label=None):
+    net_spend_minor = sum(min(0, c.total_minor) for c in cats if c.depth == 0)
+    return BucketCategories(
+        key=key, label=label or key, categories=cats, net_spend_minor=net_spend_minor
+    )
+
+
+def test_every_bar_shares_the_top_bars_segments_in_the_same_order():
+    top_categories = [
+        _share_cat("Food", 0.6, -6000, cid=1),
+        _share_cat("Rent", 0.4, -4000, cid=2),
+    ]
+    buckets = [
+        _bucket_cats("2026-01", [
+            _share_cat("Food", 1.0, -3000, cid=1), _share_cat("Rent", 0.0, 0, cid=2),
+        ]),
+        # February: Food had nothing at all this month.
+        _bucket_cats("2026-02", [_share_cat("Rent", 1.0, -4000, cid=2)]),
+    ]
+    chart = charts.build_stacked_share(top_categories, buckets, width=100)
+
+    identity = [(s.category_id, s.name, s.is_other) for s in chart.segments]
+    assert identity == [(s.category_id, s.name, s.is_other) for s in chart.top.segments]
+    for bar in chart.bars:
+        assert [(s.category_id, s.name, s.is_other) for s in bar.segments] == identity
+
+
+def test_a_category_absent_from_a_bucket_is_a_zero_width_segment_not_a_missing_one():
+    top_categories = [
+        _share_cat("Food", 0.6, -6000, cid=1),
+        _share_cat("Rent", 0.4, -4000, cid=2),
+    ]
+    buckets = [_bucket_cats("2026-02", [_share_cat("Rent", 1.0, -4000, cid=2)])]
+    chart = charts.build_stacked_share(top_categories, buckets, width=100)
+
+    (bar,) = chart.bars
+    food = next(s for s in bar.segments if s.category_id == 1)
+    assert food.cells == 0
+    assert food.amount_minor == 0
+    rent = next(s for s in bar.segments if s.category_id == 2)
+    assert rent.cells == 100  # the whole bar, since Rent was the only spend that month
+
+
+def test_a_bucket_with_no_spending_at_all_is_an_empty_bar_not_a_missing_row():
+    top_categories = [_share_cat("Food", 1.0, -1000, cid=1)]
+    buckets = [
+        _bucket_cats("2026-01", [_share_cat("Food", 1.0, -1000, cid=1)]),
+        _bucket_cats("2026-02", []),
+    ]
+    chart = charts.build_stacked_share(top_categories, buckets, width=50)
+
+    assert [b.key for b in chart.bars] == ["2026-01", "2026-02"]
+    assert chart.bars[1].segments == []
+    assert chart.bars[1].total_minor == 0
+    assert sum(s.cells for s in chart.bars[0].segments) == 50
+
+
+def test_every_non_empty_bar_is_full_width_regardless_of_the_buckets_own_size():
+    """The point of drawing each bucket at its own 100%: a quiet month and a heavy one
+    both fill the track, so composition -- not magnitude -- is what the eye compares."""
+    top_categories = [_share_cat("Food", 1.0, -100000, cid=1)]
+    buckets = [
+        _bucket_cats("2026-01", [_share_cat("Food", 1.0, -100, cid=1)]),
+        _bucket_cats("2026-02", [_share_cat("Food", 1.0, -99900, cid=1)]),
+    ]
+    chart = charts.build_stacked_share(top_categories, buckets, width=40)
+
+    assert sum(s.cells for s in chart.bars[0].segments) == 40
+    assert sum(s.cells for s in chart.bars[1].segments) == 40
+    # ...but the magnitude is not lost, just carried alongside rather than charted.
+    assert chart.bars[0].total_minor == 100
+    assert chart.bars[1].total_minor == 99900
+
+
+def test_a_category_large_in_one_bucket_but_small_overall_is_folded_in_both():
+    """Sliver is 1% over the whole window and folds into the top bar's Other -- even
+    though it is the only thing January spent on, January must fold it into Other too,
+    not draw it as its own segment, or the same colour would mean two different things
+    on two different rows."""
+    top_categories = [
+        _share_cat("Rent", 0.99, -99000, cid=1),
+        _share_cat("Sliver", 0.01, -1000, cid=2),
+    ]
+    top = charts.build_share_bar(top_categories, width=100)
+    assert [s.name for s in top.segments] == ["Rent", "Other"]
+
+    buckets = [_bucket_cats("2026-01", [
+        _share_cat("Rent", 0.0, 0, cid=1), _share_cat("Sliver", 1.0, -1000, cid=2),
+    ])]
+    chart = charts.build_stacked_share(top_categories, buckets, width=100)
+
+    (jan,) = chart.bars
+    assert [s.name for s in jan.segments] == ["Rent", "Other"]
+    rent = next(s for s in jan.segments if s.name == "Rent")
+    other = next(s for s in jan.segments if s.name == "Other")
+    assert rent.cells == 0
+    assert other.cells == 100  # fills the whole bar, but is still Other, not "Sliver"
+    assert other.amount_minor == 1000
+
+
+def test_a_category_invisible_in_the_top_bar_still_earns_an_other_slot_in_its_bucket():
+    """Net positive over the whole window (refunded elsewhere), so it never appears in
+    the top bar at all -- not even folded into Other, since build_share_bar drops a
+    net-positive row entirely. A bucket where it was a real cost still needs somewhere
+    to put that money, or it would simply vanish from that bucket's bar."""
+    top_categories = [
+        _share_cat("Rent", 1.0, -10000, cid=1),
+        _share_cat("Refunded", 0.0, 5000, cid=2),
+    ]
+    top = charts.build_share_bar(top_categories, width=100)
+    assert [s.name for s in top.segments] == ["Rent"]  # no Other at all
+
+    buckets = [_bucket_cats("2026-01", [
+        _share_cat("Rent", 0.0, 0, cid=1), _share_cat("Refunded", 1.0, -3000, cid=2),
+    ])]
+    chart = charts.build_stacked_share(top_categories, buckets, width=100)
+
+    assert [s.name for s in chart.segments] == ["Rent", "Other"]
+    (jan,) = chart.bars
+    assert [s.name for s in jan.segments] == ["Rent", "Other"]
+    other = next(s for s in jan.segments if s.name == "Other")
+    assert other.amount_minor == 3000
+    assert other.cells == 100
+    # build_share_bar itself is untouched: `top` is exactly what calling it directly
+    # would return.
+    assert chart.top.segments == top.segments
+
+
+def test_an_empty_bucket_list_is_a_chart_with_no_bars():
+    top_categories = [_share_cat("Food", 1.0, -1000, cid=1)]
+    chart = charts.build_stacked_share(top_categories, [], width=100)
+    assert chart.bars == []
+    assert [s.name for s in chart.segments] == ["Food"]
+
+
+def test_a_zero_width_stacked_chart_is_rejected():
+    with pytest.raises(ValueError, match="at least 1"):
+        charts.build_stacked_share([_share_cat("A", 1.0, -100)], [], width=0)
+
+
+def test_stacked_share_against_a_real_window(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        currency, account = _seed(session)
+        food = Category(value="Food")
+        rent = Category(value="Rent")
+        session.add_all([food, rent])
+        session.flush()
+        _txn(session, currency, account, date(2026, 1, 10), -1000, "A", category=food)
+        _txn(session, currency, account, date(2026, 2, 10), -2000, "B", category=rent)
+        session.commit()
+
+    window = stats.parse("2026-01-01..2026-02-28")
+    with session_factory() as session:
+        report = stats.build_report(session, window)
+        bucket_categories = stats.category_share_series(session, window, "month")
+
+    chart = charts.build_stacked_share(report.categories, bucket_categories, width=50)
+
+    assert [b.key for b in chart.bars] == ["2026-01", "2026-02"]
+    assert sum(s.cells for s in chart.bars[0].segments) == 50
+    assert sum(s.cells for s in chart.bars[1].segments) == 50
+    # January was all Food, February all Rent -- each bar draws the same two segments,
+    # one of them at zero width.
+    jan_food = next(s for s in chart.bars[0].segments if s.name == "Food")
+    jan_rent = next(s for s in chart.bars[0].segments if s.name == "Rent")
+    assert jan_food.cells == 50 and jan_rent.cells == 0
