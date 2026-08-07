@@ -1075,6 +1075,61 @@ def _category_of(app, description):
     return None
 
 
+def test_sidebar_is_not_rebuilt_when_only_the_filters_changed(tmp_path, monkeypatch):
+    """Rebuilding the sidebar dominated every drill-down: it runs to hundreds of rows,
+    and mounting that many widgets costs far more than the query behind it. Nothing a
+    filter or a drill does can change it — the sidebar queries take no filter arguments —
+    so the rebuild must be skipped, while a real data change must still come through.
+    """
+    _setup_recent(tmp_path, monkeypatch)
+    rebuilt = []
+    original_clear = ListView.clear
+
+    def counting_clear(self, *args, **kwargs):
+        rebuilt.append(self.id)
+        return original_clear(self, *args, **kwargs)
+
+    monkeypatch.setattr(ListView, "clear", counting_clear)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            at_startup = list(rebuilt)
+
+            app._run_command("stats 1m")
+            await pilot.pause()
+            table = app.query_one("#stats_table", DataTable)
+            table.move_cursor(row=0)
+            rebuilt.clear()
+            await pilot.press("right")  # drill down
+            await pilot.pause()
+            await pilot.press("left")  # and back
+            await pilot.pause()
+            after_drill = list(rebuilt)
+
+            app._run_command("filter rent")
+            await pilot.pause()
+            after_filter = list(rebuilt)
+
+            rebuilt.clear()
+            app._run_command("categorize RENT PAYMENT = Housing Costs")
+            await pilot.pause()
+            sidebar = [
+                str(item.children[0].content)
+                for item in app.query_one("#categories", ListView).children
+            ]
+            return at_startup, after_drill, after_filter, sidebar
+
+    at_startup, after_drill, after_filter, sidebar = asyncio.run(run())
+    # All three lists are populated once when the app opens.
+    assert sorted(at_startup) == ["accounts", "categories", "vendors"]
+    assert after_drill == []  # a full round trip rebuilds nothing
+    assert after_filter == []
+    # ...but a change to the underlying data still reaches the screen.
+    assert any("Housing Costs" in label for label in sidebar), sidebar
+
+
 def test_categorize_command_categorises_a_vendor(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
 

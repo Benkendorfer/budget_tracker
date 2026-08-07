@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Set
+from typing import Dict, List, Optional, Set
 
 from rich.text import Text
 from textual.app import App, ComposeResult
@@ -213,6 +213,9 @@ class BudgetApp(App):
         self._accounts: List[queries.AccountRow] = []
         self._vendors: List[queries.VendorRow] = []
         self._categories: List[queries.CategoryRow] = []
+        # Last labels rendered into each sidebar list, so _fill_list can skip a rebuild
+        # that would produce exactly what is already on screen.
+        self._list_labels: Dict[str, List[str]] = {}
         # Parallel to the rows in #txns, so a cursor index maps back to a transaction.
         self._txns: List[queries.TxnRow] = []
         self._rules: List[queries.RuleRow] = []
@@ -429,11 +432,27 @@ class BudgetApp(App):
         self._refresh_status()
 
     def _fill_list(self, selector: str, labels: List[str]) -> None:
+        """Render a sidebar list, but only when its contents have actually changed.
+
+        reload() runs on every filter change and every statistics drill-down, and none of
+        those touch the sidebar: get_accounts/get_vendors/get_categories take no filter
+        arguments, so their output depends on the database alone. Rebuilding anyway cost
+        more than everything else in a drill-down put together — the vendor list runs to
+        several hundred rows, and mounting that many widgets is far dearer than the query
+        behind it. Comparing the labels first is cheap, correct whatever the caller
+        wanted, and keeps the list's scroll position across a drill.
+
+        extend() mounts the items in one pass; appending in a loop mounts them one at a
+        time and is several times slower on a list this long.
+        """
+        if self._list_labels.get(selector) == labels:
+            return
+        self._list_labels[selector] = list(labels)
         list_view = self.query_one(selector, ListView)
         list_view.clear()
-        list_view.append(ListItem(Label("— All —")))
-        for label in labels:
-            list_view.append(ListItem(Label(label)))
+        list_view.extend(
+            [ListItem(Label("— All —"))] + [ListItem(Label(label)) for label in labels]
+        )
 
     def _fill_txns(self, txns: List[queries.TxnRow]) -> None:
         table = self.query_one("#txns", DataTable)
