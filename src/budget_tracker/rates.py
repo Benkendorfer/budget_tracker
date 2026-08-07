@@ -202,6 +202,23 @@ def rate_on(session: Session, day: date, base: str, quote: str) -> Optional[Deci
     return best_rate
 
 
+def currency_known(session: Session, code: str) -> bool:
+    """Whether ``code`` has a :class:`Currency` row at all.
+
+    For an aggregate (see ``queries.get_totals``) to check *before* calling
+    :func:`convert`, so it can treat "this database has never had a row for the
+    currency it converts into" as just another way of not being able to convert --
+    left out and counted, never raised -- the same answer as a missing rate.
+
+    This is deliberately not folded into :func:`convert` itself: a caller handing
+    :func:`convert` a currency code that does not exist is a programming error (a
+    typo, a code that was never real), and that must stay loud. The distinction is
+    which side is asking -- an aggregate checking its *target* currency ahead of time
+    degrades gracefully; :func:`convert` handed a bad code directly still raises.
+    """
+    return session.scalar(select(Currency.id).where(Currency.value == code)) is not None
+
+
 _PLACES_KEY = "_decimal_places"
 
 

@@ -10,7 +10,15 @@ from sqlalchemy.engine import Engine
 
 from budget_tracker import categories, queries, rates, stats, transfers
 from budget_tracker.db import get_engine, get_sessionmaker, init_db
-from budget_tracker.models import Account, Category, Currency, Transaction, Vendor
+from budget_tracker.models import (
+    Account,
+    Category,
+    Currency,
+    Transaction,
+    Vendor,
+    VendorName,
+    VendorRule,
+)
 
 
 def _session_factory(tmp_path):
@@ -504,6 +512,37 @@ def test_get_transactions_does_not_query_per_row(tmp_path):
     assert len(executed) < 10, f"{len(executed)} queries for 120 rows — lazy loading is back"
 
 
+def test_get_rules_does_not_query_vendor_name_per_row(tmp_path):
+    """Another N+1 guard, mirroring the one above.
+
+    ``RuleRow.name`` reads ``rule.vendor_name.value`` -- left lazy, that was one
+    ``SELECT ... FROM vendor_name WHERE vendor_name.id = ?`` per rule: 134 of them for
+    134 rules in a single ``reload()`` on a real database, all hitting the table this
+    test's engine-level listener counts.
+    """
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        for i in range(120):
+            vendor_name = VendorName(value=f"Shop {i} Inc")
+            session.add(vendor_name)
+            session.flush()
+            session.add(VendorRule(pattern=f"SHOP {i}*", vendor_name_id=vendor_name.id))
+        session.commit()
+
+    executed = []
+    listener = lambda *args, **kwargs: executed.append(1)  # noqa: E731
+    event.listen(Engine, "before_cursor_execute", listener)
+    try:
+        with session_factory() as session:
+            rows = queries.get_rules(session)
+    finally:
+        event.remove(Engine, "before_cursor_execute", listener)
+
+    assert len(rows) == 120
+    assert {r.name for r in rows} == {f"Shop {i} Inc" for i in range(120)}
+    assert len(executed) < 10, f"{len(executed)} queries for 120 rules — lazy loading is back"
+
+
 def test_category_rows_carry_a_filter_ready_id(tmp_path):
     """Each row can be handed straight back as a category filter, nulls included."""
     session_factory = _session_factory(tmp_path)
@@ -861,6 +900,31 @@ def test_get_totals_counts_unconvertible_rows_without_dropping_or_zeroing_them(t
     assert totals.unconverted_count == 1  # ...but is never silently zeroed or dropped
 
 
+def test_get_totals_degrades_when_home_currency_has_no_currency_row(tmp_path):
+    """A brand-new database whose first-ever import is foreign has no USD row yet --
+    nothing has ever been in USD. That must not raise: a currency the aggregate
+    cannot convert *into* is just another way of "cannot convert this group", exactly
+    like a missing rate (see test_get_totals_counts_unconvertible_rows_..._above)."""
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        chf = Currency(value="CHF", symbol="Fr", decimal_places=2)
+        session.add(chf)
+        session.flush()
+        card = Account(name="Card CHF", currency_id=chf.id)
+        session.add(card)
+        session.flush()
+        _txn(session, chf, card, date(2025, 6, 1), -10000, "Fondue")
+        session.commit()
+
+    with session_factory() as session:
+        totals = queries.get_totals(session)  # home_currency defaults to "USD"
+
+    assert totals.count == 1
+    assert totals.outflow_minor == 0
+    assert totals.inflow_minor == 0
+    assert totals.unconverted_count == 1  # left out, not zeroed or dropped
+
+
 def test_get_totals_home_currency_argument_can_target_a_non_usd_currency(tmp_path):
     session_factory = _session_factory(tmp_path)
     with session_factory() as session:
@@ -926,6 +990,29 @@ def test_get_category_totals_leave_an_unconvertible_categorys_money_out(tmp_path
     assert rows[0].total_minor == 0
 
 
+def test_get_category_totals_degrades_when_home_currency_has_no_currency_row(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        chf = Currency(value="CHF", symbol="Fr", decimal_places=2)
+        session.add(chf)
+        session.flush()
+        card = Account(name="Card CHF", currency_id=chf.id)
+        session.add(card)
+        dining = Category(value="Dining")
+        session.add(dining)
+        session.flush()
+        _txn(session, chf, card, date(2025, 6, 1), -10000, "Fondue", category=dining)
+        session.commit()
+
+    with session_factory() as session:
+        rows = queries.get_category_totals(session)  # home_currency defaults to "USD"
+
+    assert len(rows) == 1
+    assert rows[0].count == 1
+    assert rows[0].outflow_minor == 0
+    assert rows[0].total_minor == 0
+
+
 def test_get_bucket_totals_convert_before_summing(tmp_path):
     session_factory = _session_factory(tmp_path)
     with session_factory() as session:
@@ -942,6 +1029,26 @@ def test_get_bucket_totals_convert_before_summing(tmp_path):
     assert [r.key for r in rows] == ["2025-06"]
     assert rows[0].count == 2
     assert rows[0].outflow_minor == -2000 + -11000
+
+
+def test_get_bucket_totals_degrades_when_home_currency_has_no_currency_row(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        chf = Currency(value="CHF", symbol="Fr", decimal_places=2)
+        session.add(chf)
+        session.flush()
+        card = Account(name="Card CHF", currency_id=chf.id)
+        session.add(card)
+        session.flush()
+        _txn(session, chf, card, date(2025, 6, 15), -10000, "Fondue")
+        session.commit()
+
+    with session_factory() as session:
+        rows = queries.get_bucket_totals(session, "month")  # home_currency defaults to "USD"
+
+    assert [r.key for r in rows] == ["2025-06"]
+    assert rows[0].count == 1
+    assert rows[0].outflow_minor == 0
 
 
 def test_build_report_and_spending_series_surface_the_unconverted_count(tmp_path):
@@ -1241,3 +1348,94 @@ def test_a_rate_recorded_in_this_session_is_seen_by_the_next_lookup(tmp_path):
         assert rates.rate_on(session, date(2026, 3, 2), "USD", "CHF") == D("0.8")
         rates.record_rate(session, date(2026, 3, 2), "USD", "CHF", D("0.9"), rates.MANUAL)
         assert rates.rate_on(session, date(2026, 3, 2), "USD", "CHF") == D("0.9")
+
+
+def _seed_tree(session):
+    """Food > (Dining, Groceries), Travel > Airfare, Health > Health Care, and Rent."""
+    currency, accounts, _ = _seed(session)
+    account = accounts["Checking"]
+    tree = {
+        "Food": [("Dining", 40), ("Groceries", 25)],
+        "Travel": [("Airfare", 5)],
+        "Health": [("Health Care", 8)],
+        "Rent": [],
+    }
+    made = {}
+    for parent_name, children in tree.items():
+        parent = categories.ensure_path(session, parent_name)
+        made[parent_name] = parent
+        # A couple of transactions directly on the parent, plus each child's.
+        for i in range(2):
+            _txn(session, currency, account, date(2026, 1, 1), -100,
+                 f"{parent_name}{i}", category=parent)
+        for child_name, n in children:
+            child = categories.ensure_path(session, f"{parent_name} > {child_name}")
+            made[child_name] = child
+            for i in range(n):
+                _txn(session, currency, account, date(2026, 1, 1), -10,
+                     f"{child_name}{i}", category=child)
+    session.commit()
+    return made
+
+
+def test_the_category_list_puts_every_child_under_its_own_parent(tmp_path):
+    """Rows carry `depth` and the sidebar indents on it, so a flat sort makes the
+    indentation lie. It had "Dining" indented directly beneath "Travel" while actually
+    belonging to "Food" -- reading as a category path that does not exist.
+    """
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        _seed_tree(session)
+    with session_factory() as session:
+        rows = queries.get_categories(session)
+
+    by_id = {row.id: row for row in rows}
+    for index, row in enumerate(rows):
+        if row.parent_id is None:
+            assert row.depth == 0
+            continue
+        # The nearest preceding row one level shallower must be this row's real parent,
+        # which is exactly what the indentation claims to the eye.
+        preceding = next(
+            rows[j] for j in range(index - 1, -1, -1) if rows[j].depth == row.depth - 1
+        )
+        assert preceding.id == row.parent_id, (
+            f"{row.name!r} is drawn under {preceding.name!r} "
+            f"but belongs to {by_id[row.parent_id].name!r}"
+        )
+
+
+def test_siblings_are_ordered_by_the_count_the_sidebar_shows(tmp_path):
+    """Sorting by money while displaying a count looks arbitrary, because from the
+    outside it is."""
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        _seed_tree(session)
+    with session_factory() as session:
+        rows = queries.get_categories(session)
+
+    from collections import defaultdict
+
+    siblings = defaultdict(list)
+    for row in rows:
+        siblings[row.parent_id].append(row.count)
+    for parent_id, counts in siblings.items():
+        assert counts == sorted(counts, reverse=True), f"under parent {parent_id}"
+
+    names = [row.name for row in rows]
+    assert names.index("Dining") < names.index("Groceries")  # 40 beats 25
+    assert names.index("Food") < names.index("Dining")       # parent leads its subtree
+
+
+def test_a_parent_is_immediately_followed_by_its_whole_subtree(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        _seed_tree(session)
+    with session_factory() as session:
+        rows = queries.get_categories(session)
+
+    names = [row.name for row in rows]
+    food = names.index("Food")
+    # Food's two children sit in the two rows straight after it, nothing wedged between.
+    assert set(names[food + 1:food + 3]) == {"Dining", "Groceries"}
+    assert rows[food + 1].depth == rows[food + 2].depth == rows[food].depth + 1

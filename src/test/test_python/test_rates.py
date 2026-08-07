@@ -178,6 +178,17 @@ def test_convert_unknown_currency_raises_rather_than_assuming_two_places(tmp_pat
             rates.convert(session, 100, "USD", "XYZ", date(2025, 12, 1))
 
 
+def test_currency_known_true_only_for_a_seeded_currency(tmp_path):
+    session_factory = _setup(tmp_path)
+    with session_factory() as session:
+        _add_currency(session, "USD")
+        session.commit()
+
+    with session_factory() as session:
+        assert rates.currency_known(session, "USD") is True
+        assert rates.currency_known(session, "CHF") is False
+
+
 # ------------------------------------------------------------------------- recording
 
 def test_record_rate_is_idempotent(tmp_path):

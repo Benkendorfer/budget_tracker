@@ -375,9 +375,35 @@ def get_categories(session: Session) -> List[CategoryRow]:
         for cat in all_categories
         if cat.id in rolled and rolled[cat.id][0] > 0
     ]
-    # Same key the pre-rollup version sorted by: ascending total, so biggest spend first.
-    rows.sort(key=lambda r: r.total_minor)
-    return rows
+    # Depth-first: every category immediately followed by its own subtree, siblings
+    # busiest first. The rows carry `depth` and a UI indents on it, so a flat sort makes
+    # the indentation lie -- it had "Dining" sitting indented directly beneath "Travel"
+    # while actually belonging to "Food", which reads as a category path that does not
+    # exist. Sorting by count rather than by money also makes the order match the number
+    # a sidebar shows: sorted by total while displaying a count looks arbitrary, because
+    # from the outside it is.
+    by_parent_row: Dict[Optional[int], List[CategoryRow]] = defaultdict(list)
+    for row in rows:
+        by_parent_row[row.parent_id].append(row)
+    for siblings in by_parent_row.values():
+        siblings.sort(key=lambda r: (-r.count, r.name.lower()))
+
+    ordered: List[CategoryRow] = []
+
+    def walk(parent_id: Optional[int]) -> None:
+        for row in by_parent_row.get(parent_id, []):
+            ordered.append(row)
+            walk(row.id)
+
+    # A category whose parent was dropped for having nothing in its subtree would other-
+    # wise never be reached, so anything left over is emitted after the real roots.
+    walk(None)
+    if len(ordered) < len(rows):
+        seen = {row.id for row in ordered}
+        for row in rows:
+            if row.id not in seen:
+                ordered.append(row)
+    return ordered
 
 
 def get_rules(session: Session) -> List[RuleRow]:
@@ -388,7 +414,16 @@ def get_rules(session: Session) -> List[RuleRow]:
     """
     from .vendors import RULE, matches  # local import keeps the dependency one-way
 
-    rules = list(session.scalars(select(VendorRule).order_by(VendorRule.id)))
+    rules = list(
+        session.scalars(
+            # rule.vendor_name.value below reads through this on every row; left
+            # lazy it was one SELECT per rule -- 134 of them for one reload() on a
+            # real database, all hitting vendor_name individually.
+            select(VendorRule)
+            .options(selectinload(VendorRule.vendor_name))
+            .order_by(VendorRule.id)
+        )
+    )
     counts = {rule.id: 0 for rule in rules}
     owned = session.scalars(select(Vendor).where(Vendor.vendor_name_source == RULE))
     for vendor in owned:
@@ -417,7 +452,14 @@ def get_category_rules(session: Session) -> List[CategoryRuleRow]:
     """
     from .categories import RULE, matches  # local import keeps the dependency one-way
 
-    rules = list(session.scalars(select(CategoryRule).order_by(CategoryRule.id)))
+    rules = list(
+        session.scalars(
+            # Same lazy-load-per-row pattern as get_rules above, on rule.category.
+            select(CategoryRule)
+            .options(selectinload(CategoryRule.category))
+            .order_by(CategoryRule.id)
+        )
+    )
     counts = {rule.id: 0 for rule in rules}
     owner = {}
     for vendor in session.scalars(select(Vendor)):
@@ -653,12 +695,21 @@ def get_totals(
         .group_by(Currency.value, base.c.posted_date)
     ).all()
 
+    # Checked once, ahead of the loop: a home_currency with no Currency row (typically
+    # a brand-new database whose first-ever import is foreign, so USD has never been
+    # created) can convert nothing, no matter what rates exist. Without this,
+    # rates.convert would raise on the first group instead of leaving it unconverted --
+    # see currency_known's docstring for why that check lives there and not in convert.
+    home_currency_known = rates.currency_known(session, home_currency)
+
     outflow_minor = 0
     inflow_minor = 0
     unconverted_count = 0
     for currency, day, group_count, outflow_sum, inflow_sum in groups:
-        converted_outflow = rates.convert(session, outflow_sum, currency, home_currency, day)
-        converted_inflow = rates.convert(session, inflow_sum, currency, home_currency, day)
+        converted_outflow = converted_inflow = None
+        if home_currency_known:
+            converted_outflow = rates.convert(session, outflow_sum, currency, home_currency, day)
+            converted_inflow = rates.convert(session, inflow_sum, currency, home_currency, day)
         # A missing rate is missing for the whole (currency, day) group -- rate_on does
         # not depend on the amount -- so either both convert or neither does. Never
         # guessed as zero: the group is left out and its rows counted as unconverted.
@@ -777,12 +828,18 @@ def get_category_totals(
         .group_by(base.c.category_id, Currency.value, base.c.posted_date)
     ).all()
 
+    # See get_totals for why this is checked once ahead of the loop rather than left to
+    # rates.convert to raise.
+    home_currency_known = rates.currency_known(session, home_currency)
+
     sums: Dict[Optional[int], Tuple[int, int]] = defaultdict(lambda: (0, 0))
     for cat_id, currency, day, _group_count, outflow_sum, inflow_sum in money_groups:
-        converted_outflow = rates.convert(session, outflow_sum, currency, home_currency, day)
-        converted_inflow = rates.convert(session, inflow_sum, currency, home_currency, day)
+        converted_outflow = converted_inflow = None
+        if home_currency_known:
+            converted_outflow = rates.convert(session, outflow_sum, currency, home_currency, day)
+            converted_inflow = rates.convert(session, inflow_sum, currency, home_currency, day)
         if converted_outflow is None or converted_inflow is None:
-            continue  # missing rate: this group's money is left out, not zeroed
+            continue  # missing rate (or an unknown home_currency): left out, not zeroed
         cur_outflow, cur_inflow = sums[cat_id]
         sums[cat_id] = (cur_outflow + converted_outflow, cur_inflow + converted_inflow)
 
@@ -866,14 +923,20 @@ def get_bucket_totals(
     # Count is added unconditionally -- a real transaction that could not be converted
     # is still a real transaction, exactly as a category holding one still shows its
     # count (see get_category_totals) -- only its money is left out.
+    # See get_totals for why this is checked once ahead of the loop rather than left to
+    # rates.convert to raise.
+    home_currency_known = rates.currency_known(session, home_currency)
+
     buckets: Dict[str, List[int]] = {}
     labels: Dict[str, str] = {}
     for currency, day, group_count, outflow_sum, inflow_sum in groups:
         key = day.strftime(key_format)
         labels[key] = day.strftime(label_format)
         count, outflow, inflow = buckets.setdefault(key, [0, 0, 0])
-        converted_outflow = rates.convert(session, outflow_sum, currency, home_currency, day)
-        converted_inflow = rates.convert(session, inflow_sum, currency, home_currency, day)
+        converted_outflow = converted_inflow = None
+        if home_currency_known:
+            converted_outflow = rates.convert(session, outflow_sum, currency, home_currency, day)
+            converted_inflow = rates.convert(session, inflow_sum, currency, home_currency, day)
         if converted_outflow is None or converted_inflow is None:
             buckets[key] = [count + group_count, outflow, inflow]
             continue
