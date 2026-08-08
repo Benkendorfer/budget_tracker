@@ -84,7 +84,7 @@ def test_transaction_table_shows_the_account_after_the_amount(tmp_path, monkeypa
 
     headers, first = asyncio.run(run())
     assert headers == [
-        "",
+        "Sel",
         "Date",
         "Description",
         "Vendor",
@@ -312,7 +312,7 @@ def test_txns_table_columns_fit_the_real_terminal(tmp_path, monkeypatch):
             return widths, table.size.width
 
     widths, panel_width = asyncio.run(run())
-    assert widths == [2, 10, 30, 20, 16, 15, 18, transactions.TAGS_COLUMN_WIDTH]
+    assert widths == [3, 10, 30, 20, 16, 15, 18, transactions.TAGS_COLUMN_WIDTH]
     # Two cells of padding per column, plus the panel's own round border.
     assert sum(widths) + 2 * len(widths) + 2 <= panel_width
 

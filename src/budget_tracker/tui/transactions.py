@@ -10,6 +10,9 @@ from __future__ import annotations
 from typing import AbstractSet, Dict, FrozenSet, List, Tuple
 
 from rich.text import Text
+from textual import events
+from textual.coordinate import Coordinate
+from textual.message import Message
 from textual.widgets import DataTable
 
 from .. import queries
@@ -17,6 +20,52 @@ from .formatting import TRANSFER_MARK, TRANSFER_STYLE, _amount_cell, _truncate, 
 
 # The cell shown in the leading select column -- see BudgetApp._selected_ids.
 SELECTED_MARK = "✓"
+
+# The Sel column's index. Clicking it is a checkbox click; see TxnTable.
+SELECT_COLUMN = 0
+
+
+class TxnTable(DataTable):
+    """The transactions table, whose first column is a checkbox rather than data.
+
+    Textual's ``DataTable`` only posts a selection message when a click lands on the
+    row the cursor is *already* on -- the first click on any other row just moves the
+    cursor. That is the right behavior for a table you navigate, and the wrong one for
+    a checkbox, where a single click on the Sel column has to toggle that row whether
+    or not the cursor happened to be there. So clicks on that one column are handled
+    here and everything else is left to ``DataTable``, which keeps click-to-move,
+    click-again-to-select, and every keyboard binding exactly as they were.
+
+    Two Textual details make this subtler than an override normally is. Event handlers
+    are dispatched to **every** class in the MRO, so ``DataTable._on_click`` runs after
+    this one whether or not it is called explicitly -- calling ``super()._on_click``
+    would run it twice, which is enough to move the cursor and then immediately treat
+    the click as landing on the already-current row. And ``event.stop()`` is the wrong
+    tool for suppressing it: that stops the event bubbling to ancestors, not the MRO
+    walk. ``prevent_default()`` is what breaks out of that walk.
+    """
+
+    class SelectClicked(Message):
+        """A click landed on the Sel column of ``row``."""
+
+        def __init__(self, table: "TxnTable", row: int) -> None:
+            self.table = table
+            self.row = row
+            super().__init__()
+
+        @property
+        def control(self) -> "TxnTable":
+            return self.table
+
+    async def _on_click(self, event: events.Click) -> None:
+        meta = event.style.meta
+        row = meta.get("row", -1)
+        if meta.get("column") == SELECT_COLUMN and row >= 0 and self.show_cursor:
+            # Move the cursor there too, so a following 'x' acts on the row just
+            # clicked rather than on wherever the cursor used to be.
+            self.cursor_coordinate = Coordinate(row, SELECT_COLUMN)
+            self.post_message(self.SelectClicked(self, row))
+            event.prevent_default()
 
 # The trip marker in the Tags column, e.g. "✈Japan 2026" -- distinct from an ordinary
 # tag's "#" prefix so a trip reads as a place, not a label.

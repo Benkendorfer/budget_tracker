@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 
+from textual.widgets import DataTable
+
 from budget_tracker import queries, tags
 from budget_tracker.db import get_engine, get_sessionmaker
 from budget_tracker.tui.app import BudgetApp
@@ -160,6 +162,66 @@ def test_the_tags_column_shows_the_trip_first(tmp_path, monkeypatch):
     cell = _run(tmp_path, monkeypatch, body)
     assert cell.startswith("✈Japan 2026")
     assert "#reimbursable" in cell
+
+
+# --- clicking the Sel column -----------------------------------------------------
+#
+# Textual's DataTable only posts a selection message when a click lands on the row the
+# cursor is already on, and dispatches _on_click to every class in the MRO. Both bite
+# here, so these guard the click path specifically rather than the toggle behind it.
+
+
+def test_one_click_on_the_sel_column_selects_that_row(tmp_path, monkeypatch):
+    """First click, not second — a checkbox that needs two clicks is not a checkbox."""
+
+    async def body(app, pilot):
+        await pilot.click("#txns", offset=(2, 2))  # Sel column, first data row
+        await pilot.pause()
+        return set(app._selected_ids), app._txns[0].id
+
+    selected, first_id = _run(tmp_path, monkeypatch, body)
+    assert selected == {first_id}
+
+
+def test_clicking_the_sel_column_again_deselects(tmp_path, monkeypatch):
+    async def body(app, pilot):
+        await pilot.click("#txns", offset=(2, 2))
+        await pilot.pause()
+        await pilot.click("#txns", offset=(2, 2))
+        await pilot.pause()
+        return set(app._selected_ids)
+
+    assert _run(tmp_path, monkeypatch, body) == set()
+
+
+def test_clicking_another_column_moves_the_cursor_without_selecting(
+    tmp_path, monkeypatch
+):
+    """Otherwise the table could not be navigated by mouse without selecting."""
+
+    async def body(app, pilot):
+        await pilot.click("#txns", offset=(40, 3))  # Description column, second row
+        await pilot.pause()
+        table = app.query_one("#txns", DataTable)
+        return set(app._selected_ids), table.cursor_row
+
+    selected, cursor_row = _run(tmp_path, monkeypatch, body)
+    assert selected == set()
+    assert cursor_row == 1
+
+
+def test_clicking_a_row_the_cursor_is_already_on_still_selects(tmp_path, monkeypatch):
+    """DataTable's own click-again-to-select keeps working outside the Sel column."""
+
+    async def body(app, pilot):
+        await pilot.click("#txns", offset=(40, 3))
+        await pilot.pause()
+        await pilot.click("#txns", offset=(40, 3))
+        await pilot.pause()
+        return set(app._selected_ids), app._txns[1].id
+
+    selected, second_id = _run(tmp_path, monkeypatch, body)
+    assert selected == {second_id}
 
 
 # --- the selection itself --------------------------------------------------------

@@ -134,8 +134,12 @@ else the highlighted row.
 
 #### Selecting several transactions at once
 
-The leading blank column in the transaction table is a checkbox: press `x` on a row, or
-click it, to select it (`enter` does the same). `sel all` selects every transaction the
+The leading `Sel` column in the transaction table is a checkbox: **click it** to select
+that row. Clicking anywhere else in a row just moves the cursor there, so you can still
+navigate by mouse without selecting; clicking that row a second time, pressing `x`, or
+pressing `enter` all toggle it too. Note the command bar holds focus by default, so `x`
+only reaches the table once the table has focus — clicking any row gives it focus, and
+`tab` does too. `sel all` selects every transaction the
 table is currently showing and `sel none` clears the selection; the status line shows
 `N selected` whenever it is non-empty. Once anything is selected, `ctrl+n` and `ctrl+t`
 prefill `sel vendor = ` / `sel category = ` instead of their usual single-vendor

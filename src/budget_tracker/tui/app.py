@@ -320,7 +320,7 @@ class BudgetApp(App):
                 yield Static("Trips", id="head_trips", classes="heading")
                 yield ListView(id="trips")
             with Vertical(id="main"):
-                yield DataTable(id="txns")
+                yield transactions.TxnTable(id="txns")
                 yield DataTable(id="rules")
                 yield DataTable(id="imports")
                 yield Static("", id="prompt")
@@ -407,8 +407,10 @@ class BudgetApp(App):
         table.cursor_type = "row"
         table.zebra_stripes = True
         # A row the multi-select feature can act on: "✓" when it is in
-        # self._selected_ids, blank otherwise.
-        table.add_column("", width=2)
+        # self._selected_ids, blank otherwise. Headed rather than blank so the column
+        # announces what it is; 3 wide because "Sel" is, and a 2-wide column would
+        # clip its own heading to "Se".
+        table.add_column("Sel", width=3)
         table.add_column("Date", width=10)
         table.add_column("Description", width=30)
         table.add_column("Vendor", width=20)
@@ -423,8 +425,8 @@ class BudgetApp(App):
         # single tag ("✈Japan 2026 #reimbursable") is already 25 characters, and that
         # is the ordinary case rather than a worst case.
         table.add_column("Tags", width=transactions.TAGS_COLUMN_WIDTH)
-        # 2 + 10 + 30 + 20 + 16 + 15 + 18 + 30 = 141, plus 2 columns of padding each
-        # (16) = 157. The main panel is ~175 wide at the terminal size the user
+        # 3 + 10 + 30 + 20 + 16 + 15 + 18 + 30 = 142, plus 2 columns of padding each
+        # (16) = 158. The main panel is ~175 wide at the terminal size the user
         # actually runs (213 columns), not the 130-wide test default, so this fits
         # with room to spare -- see the 2026-08-08 spec correction that replaced the
         # earlier 92-column budget.
@@ -1013,6 +1015,12 @@ class BudgetApp(App):
             self.trip_filter = None if index == 0 else self._trips[index - 1].id
         self.reload()
 
+    def on_txn_table_select_clicked(
+        self, event: transactions.TxnTable.SelectClicked
+    ) -> None:
+        """A click straight on the Sel column toggles that row, first click included."""
+        self._toggle_txn_selected(event.row)
+
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         """Enter on a row in the imports panel imports that file."""
         if event.data_table.id == "stats_table":
@@ -1035,8 +1043,10 @@ class BudgetApp(App):
                 self._open_period(stats.resolve(stats.PRESETS[row][0]))
             return
         if event.data_table.id == "txns":
-            # Enter and a mouse click both fire this event; either toggles the row's
-            # selection, same as 'x'. See _toggle_txn_selected().
+            # Enter, and a click on a row the cursor is already on, both fire this;
+            # either toggles the row, same as 'x'. A first click on the Sel column of
+            # some other row is handled by TxnTable.SelectClicked instead, because
+            # DataTable does not post this message for one. See _toggle_txn_selected().
             self._toggle_txn_selected(event.cursor_row)
             return
         if event.data_table.id != "imports":
