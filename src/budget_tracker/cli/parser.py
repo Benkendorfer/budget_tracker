@@ -3,8 +3,8 @@
 The parser wires each subcommand to its handler; the handlers themselves live in the
 command-family modules alongside this one (``import_cmds.py``, ``list_cmd.py``,
 ``vendors.py``, ``categories.py``, ``accounts.py``, ``transfers.py``, ``formats.py``,
-``rates.py``). This module only assembles argparse structure — no handler logic — so it
-stays readable as the single place every subcommand is registered.
+``rates.py``, ``tags.py``). This module only assembles argparse structure — no handler
+logic — so it stays readable as the single place every subcommand is registered.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from datetime import date, datetime
 from typing import List, Optional
 
 from .. import queries
+from .. import tags as tags_module
 from .. import transfers as transfers_module
 from .accounts import _cmd_account
 from .categories import _cmd_categorize, _cmd_category, _cmd_category_rule
@@ -22,6 +23,7 @@ from .formats import _cmd_format
 from .import_cmds import _cmd_import, _cmd_imports, _cmd_unimport
 from .list_cmd import _cmd_list
 from .rates import _cmd_rates
+from .tags import _cmd_tags
 from .transfers import _cmd_transfers
 from .vendors import _cmd_rename, _cmd_rule
 
@@ -115,6 +117,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--category",
         help="Filter by category name, or a full path (e.g. 'Food > Dining').",
     )
+    list_parser.add_argument("--tag", help="Filter by tag name.")
+    list_parser.add_argument("--trip", help="Filter by trip name.")
     list_parser.add_argument(
         "--search", help="Case-insensitive substring to look for."
     )
@@ -244,6 +248,45 @@ def build_parser() -> argparse.ArgumentParser:
     category_rule_subparsers.add_parser("list", help="Show every rule (default).")
     category_rule_subparsers.add_parser(
         "apply", help="Re-run all rules, e.g. after importing outside the app."
+    )
+
+    tags_parser = subparsers.add_parser(
+        "tags", help="List, rename, or delete tags and trips."
+    )
+    tags_parser.set_defaults(func=_cmd_tags, tags_command="list", kind=None)
+    tags_subparsers = tags_parser.add_subparsers(dest="tags_command")
+
+    tags_list = tags_subparsers.add_parser(
+        "list", help="Show every tag with its transaction count and total (default)."
+    )
+    tags_list.add_argument(
+        "--kind", choices=list(tags_module.KINDS), help="Only tags of this kind."
+    )
+
+    tags_rename = tags_subparsers.add_parser("rename", help="Rename a tag or trip.")
+    tags_rename.add_argument("old", help="Current tag/trip name.")
+    tags_rename.add_argument("new", help="New name.")
+    tags_rename.add_argument(
+        "--kind",
+        choices=list(tags_module.KINDS),
+        default=tags_module.TAG,
+        help="Tag kind (default: %(default)s).",
+    )
+
+    tags_delete = tags_subparsers.add_parser(
+        "delete", help="Delete a tag or trip and unlink it everywhere (destructive; see --yes)."
+    )
+    tags_delete.add_argument("name", help="Tag/trip name to delete.")
+    tags_delete.add_argument(
+        "--kind",
+        choices=list(tags_module.KINDS),
+        default=tags_module.TAG,
+        help="Tag kind (default: %(default)s).",
+    )
+    tags_delete.add_argument(
+        "--yes",
+        action="store_true",
+        help="Actually delete. Without it, only preview what would be unlinked.",
     )
 
     account_parser = subparsers.add_parser(

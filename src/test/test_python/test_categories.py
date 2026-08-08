@@ -183,6 +183,73 @@ def test_clear_category_reverts_only_manual_rows(tmp_path):
         assert _categories(session, "GROCERY STORE") == [("Groceries", "import")]
 
 
+# --------------------------------------------------------------------- per-row form
+
+
+def test_set_category_for_categorises_exactly_the_given_rows(tmp_path):
+    """The per-row form must not spill onto other transactions of the same vendor --
+    unlike set_category, which is deliberately vendor-wide."""
+    session_factory = _setup(tmp_path)
+    with session_factory() as session:
+        rows = {t.description: t.id for t in queries.get_transactions(session)}
+        # Two "COFFEE SHOP A" rows exist; only tag the first one found.
+        shop_a_ids = [
+            t.id for t in session.scalars(
+                select(Transaction).where(Transaction.description == "COFFEE SHOP A")
+            )
+        ]
+        target_id = shop_a_ids[0]
+
+    with session_factory() as session:
+        assert categories.set_category_for(session, [target_id], "Dining") == 1
+        session.commit()
+
+    with session_factory() as session:
+        target = session.get(Transaction, target_id)
+        assert (target.category.value, target.category_source) == ("Dining", "manual")
+        other_id = [i for i in shop_a_ids if i != target_id][0]
+        other = session.get(Transaction, other_id)
+        assert other.category_id is None  # the sibling row is untouched
+
+
+def test_set_category_for_empty_selection_is_a_no_op(tmp_path):
+    session_factory = _setup(tmp_path)
+    with session_factory() as session:
+        assert categories.set_category_for(session, [], "Dining") == 0
+
+
+def test_clear_category_for_only_clears_manual_rows(tmp_path):
+    session_factory = _setup(tmp_path)
+    with session_factory() as session:
+        grocery = session.scalar(
+            select(Transaction).where(Transaction.description == "GROCERY STORE")
+        )
+        grocery_id = grocery.id
+        shop_a_id = session.scalars(
+            select(Transaction.id).where(Transaction.description == "COFFEE SHOP A")
+        ).first()
+
+    with session_factory() as session:
+        categories.set_category_for(session, [shop_a_id], "Dining")
+        session.commit()
+
+    with session_factory() as session:
+        # The bank-supplied category on GROCERY STORE is not this function's to undo.
+        assert categories.clear_category_for(session, [grocery_id, shop_a_id]) == 1
+        session.commit()
+
+    with session_factory() as session:
+        assert session.get(Transaction, shop_a_id).category_id is None
+        grocery = session.get(Transaction, grocery_id)
+        assert (grocery.category.value, grocery.category_source) == ("Groceries", "import")
+
+
+def test_clear_category_for_empty_selection_is_a_no_op(tmp_path):
+    session_factory = _setup(tmp_path)
+    with session_factory() as session:
+        assert categories.clear_category_for(session, []) == 0
+
+
 def test_get_or_create_reuses_an_existing_category(tmp_path):
     session_factory = _setup(tmp_path)
     with session_factory() as session:

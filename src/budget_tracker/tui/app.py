@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.coordinate import Coordinate
 from textual.widgets import (
     DataTable,
     Footer,
@@ -147,6 +148,9 @@ class BudgetApp(App):
         # typed into a command is still just a letter.
         Binding("b", "cycle_bucket", "Bucket", show=True),
         Binding("m", "cycle_measure", "Measure", show=True),
+        # Same shape again: a plain letter, gated to the transactions table by
+        # check_action, so 'x' typed into a command is still just a letter.
+        Binding("x", "toggle_selected", "Select", show=True),
         ("ctrl+c", "quit", "Quit"),
     ]
 
@@ -185,6 +189,12 @@ class BudgetApp(App):
         self._list_labels: Dict[str, List[str]] = {}
         # Parallel to the rows in #txns, so a cursor index maps back to a transaction.
         self._txns: List[queries.TxnRow] = []
+        # Multi-select on the transactions table: transaction *ids*, not row indices,
+        # because reload() re-queries and re-renders -- a row index would point at
+        # whatever happened to land there after a filter changed. Pruned in
+        # _fill_txns() to whatever is still in self._txns, so a selection never
+        # silently outlives the rows it was made on.
+        self._selected_ids: Set[int] = set()
         self._rules: List[queries.RuleRow] = []
         self._category_rules: List[queries.CategoryRuleRow] = []
         self._candidates: List[ImportCandidate] = []
@@ -287,8 +297,8 @@ class BudgetApp(App):
                 yield Static("", id="status")
         yield Input(
             placeholder=(
-                "command: import | unimport | filter | categorize | category | format | "
-                "stats | chart | pie | rates | rules | all | refresh | help | quit"
+                "command: import | unimport | filter | categorize | category | sel | "
+                "format | stats | chart | pie | rates | rules | all | refresh | help | quit"
             ),
             id="command",
         )
@@ -333,6 +343,12 @@ class BudgetApp(App):
                 and self.focused is not None
                 and self.focused.id == "chart"
             )
+        if action == "toggle_selected":
+            return (
+                self._panel == "txns"
+                and self.focused is not None
+                and self.focused.id == "txns"
+            )
         return True
 
     def on_mount(self) -> None:
@@ -340,15 +356,26 @@ class BudgetApp(App):
         table = self.query_one("#txns", DataTable)
         table.cursor_type = "row"
         table.zebra_stripes = True
+        # A row the multi-select feature can act on: "✓" when it is in
+        # self._selected_ids, blank otherwise.
+        table.add_column("", width=2)
         table.add_column("Date", width=10)
-        table.add_column("Description", width=26)
-        table.add_column("Vendor", width=18)
-        table.add_column("Category", width=12)
+        table.add_column("Description", width=30)
+        table.add_column("Vendor", width=20)
+        table.add_column("Category", width=16)
         # Wide enough for a three-character symbol (CHF) plus a signed six-figure
         # amount ("CHF-999,999.99" is 14) with a column to spare — see
         # test_txns_amount_column_fits_a_symbol_and_a_six_figure_amount.
         table.add_column("Amount", width=15)
         table.add_column("Account", width=18)
+        # Always blank for now -- tags don't exist yet. A later wave fills this from
+        # queries.TxnRow.tags/trip; the column exists early so that wave is additive.
+        table.add_column("Tags", width=22)
+        # 2 + 10 + 30 + 20 + 16 + 15 + 18 + 22 = 133, plus 2 columns of padding each
+        # (16) = 149. The main panel is ~175 wide at the terminal size the user
+        # actually runs (213 columns), not the 130-wide test default, so this fits
+        # with room to spare -- see the 2026-08-08 spec correction that replaced the
+        # earlier 92-column budget.
 
         rules = self.query_one("#rules", DataTable)
         rules.cursor_type = "row"
@@ -545,7 +572,40 @@ class BudgetApp(App):
     def _fill_txns(self, txns: List[queries.TxnRow]) -> None:
         table = self.query_one("#txns", DataTable)
         self._txns = txns
-        transactions.fill_txns(table, txns, self._currencies)
+        # Drop any selected id no longer among the rows just fetched -- see
+        # self._selected_ids.
+        self._selected_ids &= {txn.id for txn in txns}
+        transactions.fill_txns(table, txns, self._currencies, self._selected_ids)
+
+    def _toggle_txn_selected(self, row: int) -> None:
+        """Toggle the row under ``row`` in and out of the selection.
+
+        Used by both the ``x`` key and clicking/entering a row (see
+        ``on_data_table_row_selected``). Updates just the select column's cell rather
+        than re-rendering the whole table, so the cursor and scroll position the user
+        is looking at do not move.
+        """
+        if not 0 <= row < len(self._txns):
+            return
+        txn_id = self._txns[row].id
+        if txn_id in self._selected_ids:
+            self._selected_ids.discard(txn_id)
+            mark = ""
+        else:
+            self._selected_ids.add(txn_id)
+            mark = transactions.SELECTED_MARK
+        table = self.query_one("#txns", DataTable)
+        table.update_cell_at(Coordinate(row, 0), mark)
+        self._refresh_status()
+
+    def _render_selection(self) -> None:
+        """Redraw the select column and status line from ``self._selected_ids``.
+
+        For commands (``sel all`` / ``sel none``) rather than a single row: no query
+        needed, ``self._txns`` already holds every row currently on screen.
+        """
+        self._fill_txns(self._txns)
+        self._refresh_status()
 
     def _fill_rules(self) -> None:
         rules_panel.fill_rules(
@@ -773,11 +833,16 @@ class BudgetApp(App):
             if totals.unconverted_count
             else ""
         )
+        # Only when the selection is non-empty, so a line with nothing selected is
+        # byte-for-byte what it was before multi-select existed.
+        selected_label = (
+            f"   {len(self._selected_ids)} selected" if self._selected_ids else ""
+        )
         self.query_one("#status", Static).update(
             f"{totals.count} txns{scope_label}{transfers_label}{unconverted_label}   "
             f"net {_fmt_amount(totals.net_minor)}   "
             f"out {_fmt_amount(totals.outflow_minor)}   "
-            f"in {_fmt_amount(totals.inflow_minor)}"
+            f"in {_fmt_amount(totals.inflow_minor)}{selected_label}"
         )
 
     # ---------------------------------------------------------------- events
@@ -829,6 +894,11 @@ class BudgetApp(App):
                 self._ask_range()
             elif 0 <= row < len(stats.PRESETS):
                 self._open_period(stats.resolve(stats.PRESETS[row][0]))
+            return
+        if event.data_table.id == "txns":
+            # Enter and a mouse click both fire this event; either toggles the row's
+            # selection, same as 'x'. See _toggle_txn_selected().
+            self._toggle_txn_selected(event.cursor_row)
             return
         if event.data_table.id != "imports":
             return
@@ -1181,6 +1251,8 @@ class BudgetApp(App):
             self._do_categorize(arg)
         elif name == "category":
             self._do_category(arg)
+        elif name == "sel":
+            self._do_sel(arg)
         elif name == "transfers":
             self._do_transfers(arg)
         elif name == "merge":
@@ -1227,6 +1299,11 @@ class BudgetApp(App):
                 "category merge <source> = <target> — fold one category into another:\n"
                 "  repoints its transactions, rules, and children, then deletes it\n"
                 "  (asks for confirmation, naming what will move)\n"
+                "x, or clicking a row — select/deselect a transaction for bulk edits\n"
+                "sel all — select every transaction currently listed\n"
+                "sel none — clear the selection\n"
+                "  ctrl+n / ctrl+t prefill 'sel vendor = ' / 'sel category = ' once\n"
+                "  anything is selected, in place of their usual per-vendor behavior\n"
                 "transfers — pair up movements between your own accounts\n"
                 "transfers same-account — also pair legs within the same account;\n"
                 "  off by default, since it makes an accidental false pairing more\n"
@@ -1660,6 +1737,52 @@ class BudgetApp(App):
         self.notify(
             f"{pattern!r} → {value!r} ({changed} transactions categorised)", markup=False
         )
+
+    SEL_USAGE = (
+        "Usage: sel all | sel none | sel category = <name> | sel vendor = <name> | "
+        "sel tag = <name> | sel untag = <name> | sel trip = <name> | sel untrip"
+    )
+
+    def _do_sel(self, arg: str) -> None:
+        """Act on the multi-select: ``sel all`` / ``sel none`` this wave.
+
+        The rest of the grammar (``sel category = ...``, ``sel vendor = ...``,
+        ``sel tag = ...``, ``sel untag = ...``, ``sel trip = ...``, ``sel untrip``)
+        lands in a later wave, once tags exist. Parsed here in the shape it will need
+        — a bare subject, or ``<subject> = <value>`` — so adding those is a new branch
+        below, not a rewrite of this one. An unrecognized subcommand notifies rather
+        than crashing.
+        """
+        arg = arg.strip()
+        if not arg:
+            self.notify(self.SEL_USAGE, severity="warning")
+            return
+        subject, _, value = (part.strip() for part in arg.partition("="))
+        subject = subject.lower()
+        if subject == "all" and not value:
+            self._sel_all()
+            return
+        if subject == "none" and not value:
+            self._sel_none()
+            return
+        self.notify(
+            f"Unknown 'sel' command: {arg!r}\n{self.SEL_USAGE}",
+            severity="warning",
+            markup=False,
+        )
+
+    def _sel_all(self) -> None:
+        """Select every transaction the table is currently showing."""
+        self._selected_ids = {txn.id for txn in self._txns}
+        self._render_selection()
+        count = len(self._selected_ids)
+        self.notify(f"Selected {count} transaction{'s' if count != 1 else ''}.")
+
+    def _sel_none(self) -> None:
+        """Clear the selection."""
+        self._selected_ids = set()
+        self._render_selection()
+        self.notify("Selection cleared.")
 
     def _do_category(self, arg: str) -> None:
         """``category <path>`` builds/moves a category; bare or ``list`` shows the tree.
@@ -2171,6 +2294,14 @@ class BudgetApp(App):
         """``f`` on the statistics table: fold/unfold every group. See check_action()."""
         self._toggle_fold_all()
 
+    def action_toggle_selected(self) -> None:
+        """``x`` on the transactions table: select/deselect the row under the cursor.
+
+        See check_action() for the gate, and _toggle_txn_selected() for what it does.
+        """
+        table = self.query_one("#txns", DataTable)
+        self._toggle_txn_selected(table.cursor_row)
+
     def action_cycle_bucket(self) -> None:
         """``b``: on the chart, step day → week → month → day; on the pie, step
         week → month → year → week. See check_action() for which panel gets which.
@@ -2213,9 +2344,17 @@ class BudgetApp(App):
         self._refresh_status()
 
     def action_rename_vendor(self) -> None:
+        # A non-empty selection wins: bulk-editing several rows is what ctrl+n is for
+        # once any are checked, over renaming just the one under the cursor.
+        if self._selected_ids:
+            self._prefill_command("sel vendor = ")
+            return
         self._prefill_for_vendor("rename")
 
     def action_categorize_vendor(self) -> None:
+        if self._selected_ids:
+            self._prefill_command("sel category = ")
+            return
         self._prefill_for_vendor("categorize")
 
     def action_show_transactions(self) -> None:

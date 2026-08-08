@@ -22,7 +22,7 @@ Nothing here commits; callers own the transaction, as in :mod:`.vendors`.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -427,6 +427,45 @@ def _transactions_of(session: Session, vendor_ids: List[int]) -> List[Transactio
     )
 
 
+def set_category_for(session: Session, txn_ids: Sequence[int], value: str) -> int:
+    """Categorise the given transactions by hand. Returns rows written.
+
+    Per-row form of :func:`set_category`, for the multi-select UI, which picks
+    transactions rather than a vendor. An empty ``txn_ids`` is a no-op returning 0 --
+    never a query with ``IN ()``.
+    """
+    if not txn_ids:
+        return 0
+    category = get_or_create(session, value)
+    transactions = list(
+        session.scalars(select(Transaction).where(Transaction.id.in_(txn_ids)))
+    )
+    for txn in transactions:
+        txn.category_id = category.id
+        txn.category_source = MANUAL
+    session.flush()
+    return len(transactions)
+
+
+def clear_category_for(session: Session, txn_ids: Sequence[int]) -> int:
+    """Undo :func:`set_category_for` on the given transactions. Returns rows cleared.
+
+    Only rows this module set by hand are cleared, the same restriction
+    :func:`clear_category` makes.
+    """
+    if not txn_ids:
+        return 0
+    cleared = 0
+    for txn in session.scalars(select(Transaction).where(Transaction.id.in_(txn_ids))):
+        if txn.category_source != MANUAL:
+            continue
+        txn.category_id = None
+        txn.category_source = UNSET
+        cleared += 1
+    session.flush()
+    return cleared
+
+
 def set_category(session: Session, vendor: str, value: str) -> int:
     """Categorise every transaction of ``vendor`` by hand. Returns rows written.
 
@@ -437,13 +476,8 @@ def set_category(session: Session, vendor: str, value: str) -> int:
     The rows are stamped ``manual``, which protects them from rules, later imports and
     transfer detection.
     """
-    category = get_or_create(session, value)
-    transactions = _transactions_of(session, _vendor_ids(session, vendor))
-    for txn in transactions:
-        txn.category_id = category.id
-        txn.category_source = MANUAL
-    session.flush()
-    return len(transactions)
+    txn_ids = [t.id for t in _transactions_of(session, _vendor_ids(session, vendor))]
+    return set_category_for(session, txn_ids, value)
 
 
 def clear_category(session: Session, vendor: str) -> int:
@@ -452,15 +486,8 @@ def clear_category(session: Session, vendor: str) -> int:
     Only rows this module set by hand are cleared, so a bank-supplied or rule-owned
     category on the same vendor survives — as with :func:`transfers.clear_transfers`.
     """
-    cleared = 0
-    for txn in _transactions_of(session, _vendor_ids(session, vendor)):
-        if txn.category_source != MANUAL:
-            continue
-        txn.category_id = None
-        txn.category_source = UNSET
-        cleared += 1
-    session.flush()
-    return cleared
+    txn_ids = [t.id for t in _transactions_of(session, _vendor_ids(session, vendor))]
+    return clear_category_for(session, txn_ids)
 
 
 # ------------------------------------------------------------------------- rules

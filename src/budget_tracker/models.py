@@ -1,9 +1,9 @@
 """SQLAlchemy models.
 
-This is the minimal slice of the schema in README.md needed to import a CSV:
-``currency``, ``account``, ``category``, ``import`` and ``transaction``. The other
-tables (budget, rule, tag, transaction_tag, transaction_split, recurring,
-balance_snapshot, app_config) are deferred until their features exist.
+This is the minimal slice of the schema in README.md needed to import a CSV and tag
+transactions: ``currency``, ``account``, ``category``, ``import``, ``transaction``,
+``tag`` and ``transaction_tag``. The other tables (budget, rule, transaction_split,
+recurring, balance_snapshot, app_config) are deferred until their features exist.
 """
 
 from __future__ import annotations
@@ -244,3 +244,35 @@ class ExchangeRate(Base):
     quote: Mapped[str] = mapped_column(String)
     rate: Mapped[str] = mapped_column(String)
     source: Mapped[str] = mapped_column(String)
+
+
+class Tag(Base):
+    """A label a transaction can carry. ``kind`` splits the namespace in two.
+
+    ``TAG`` tags are free-form and a transaction may carry any number. ``TRIP`` tags
+    name a journey and a transaction carries at most one, so travel spending can be
+    summed without double-counting overlapping trips. That one-trip rule is enforced
+    in :mod:`.tags`, not by an index: SQLite cannot write a partial unique index whose
+    predicate reads another table.
+    """
+
+    __tablename__ = "tag"
+    __table_args__ = (UniqueConstraint("name", "kind", name="uq_tag_name_kind"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String)
+    kind: Mapped[str] = mapped_column(String, default="tag")  # "tag" | "trip"
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class TransactionTag(Base):
+    """Which transactions carry which tags. Composite primary key, no surrogate id."""
+
+    __tablename__ = "transaction_tag"
+
+    transaction_id: Mapped[int] = mapped_column(
+        ForeignKey("transactions.id", ondelete="CASCADE"), primary_key=True
+    )
+    tag_id: Mapped[int] = mapped_column(
+        ForeignKey("tag.id", ondelete="CASCADE"), primary_key=True
+    )

@@ -26,11 +26,14 @@ from .models import (
     Currency,
     ExchangeRate,
     Import,
+    Tag,
     Transaction,
+    TransactionTag,
     Vendor,
     VendorName,
     VendorRule,
 )
+from .tags import TAG, TRIP
 
 # Aggregates convert every amount into this currency before summing (see
 # ``rates.convert``). A module-level constant rather than hard-coding "USD" at each
@@ -86,7 +89,7 @@ class TextFilter:
 
 @dataclass(frozen=True)
 class Filters:
-    """The five filters that are always passed together and always mean the same thing:
+    """The filters that are always passed together and always mean the same thing:
     which transactions a query, report, or series should be scoped to.
 
     Every field defaults to ``None`` (no restriction), matching what leaving the
@@ -94,6 +97,9 @@ class Filters:
     (``home_currency`` was almost one) from having to be threaded through eight
     signatures individually -- see ``resolve_filters`` for how a function accepts either
     this or its old individual arguments without the two being able to disagree.
+
+    ``tag_id``/``trip_id`` were added last (after ``date_range``) so every positional
+    ``Filters(...)`` construction already in the tests keeps working.
     """
 
     account_id: Optional[int] = None
@@ -101,6 +107,8 @@ class Filters:
     vendor_filter: Optional[VendorFilter] = None
     text_filter: Optional[TextFilter] = None
     date_range: Optional[DateRange] = None
+    tag_id: Optional[int] = None
+    trip_id: Optional[int] = None
 
     def replace(self, **changes) -> "Filters":
         """The same filters with one or more fields swapped out.
@@ -118,6 +126,8 @@ def resolve_filters(
     vendor_filter: Optional[VendorFilter],
     text_filter: Optional[TextFilter],
     date_range: Optional[DateRange],
+    tag_id: Optional[int] = None,
+    trip_id: Optional[int] = None,
 ) -> Filters:
     """Reconcile a function's old individual filter arguments with its new optional
     ``Filters`` bundle, so every call site -- old or new -- ends up with exactly one.
@@ -132,6 +142,8 @@ def resolve_filters(
         vendor_filter=vendor_filter,
         text_filter=text_filter,
         date_range=date_range,
+        tag_id=tag_id,
+        trip_id=trip_id,
     )
     if filters is None:
         return individual
@@ -140,6 +152,7 @@ def resolve_filters(
             name
             for name in (
                 "account_id", "category_id", "vendor_filter", "text_filter", "date_range",
+                "tag_id", "trip_id",
             )
             if getattr(individual, name) is not None
         ]
@@ -201,6 +214,8 @@ class TxnRow:
     currency: str
     account: str = ""
     is_transfer: bool = False  # paired with a leg in another account, so not counted
+    tags: Tuple[str, ...] = ()  # normal (kind="tag") tags, sorted by name
+    trip: Optional[str] = None  # the trip (kind="trip") tag, if any
 
 
 @dataclass
@@ -325,6 +340,56 @@ def get_vendors(session: Session) -> List[VendorRow]:
 
     rows.sort(key=lambda v: (-v.count, v.name.lower()))
     return rows
+
+
+@dataclass(frozen=True)
+class TagRow:
+    id: int
+    name: str
+    kind: str
+    count: int
+    total_minor: int
+
+
+def get_tags(session: Session, kind: Optional[str] = None) -> List[TagRow]:
+    """The sidebar's tag list, each row counted over the transactions carrying it.
+
+    Sorted ``(-count, name.lower())``, matching :func:`get_vendors`. Unlike
+    :func:`get_categories`, a tag with no transactions still appears -- a freshly
+    created trip with nothing on it yet must be visible in the sidebar or the user has
+    no way to add anything to it.
+    """
+    counted = {
+        r[0]: (r[1], r[2])
+        for r in session.execute(
+            select(
+                TransactionTag.tag_id,
+                func.count(TransactionTag.transaction_id),
+                func.coalesce(func.sum(Transaction.value_minor), 0),
+            )
+            .join(Transaction, Transaction.id == TransactionTag.transaction_id)
+            .group_by(TransactionTag.tag_id)
+        ).all()
+    }
+    query = select(Tag)
+    if kind is not None:
+        query = query.where(Tag.kind == kind)
+    rows = [
+        TagRow(
+            id=tag.id, name=tag.name, kind=tag.kind,
+            count=counted.get(tag.id, (0, 0))[0],
+            total_minor=counted.get(tag.id, (0, 0))[1],
+        )
+        for tag in session.scalars(query)
+    ]
+    rows.sort(key=lambda r: (-r.count, r.name.lower()))
+    return rows
+
+
+def resolve_tag(session: Session, name: str, kind: str = TAG) -> Optional[int]:
+    return session.scalar(
+        select(Tag.id).where(Tag.name == name.strip(), Tag.kind == kind)
+    )
 
 
 def get_categories(session: Session) -> List[CategoryRow]:
@@ -566,6 +631,22 @@ def _txn_query(filters: Filters):
             query = query.where(Transaction.vendor_id == vendor_id)
     if filters.text_filter is not None and filters.text_filter.text.strip():
         query = query.where(_text_condition(filters.text_filter))
+    if filters.tag_id is not None:
+        query = query.where(
+            Transaction.id.in_(
+                select(TransactionTag.transaction_id).where(
+                    TransactionTag.tag_id == filters.tag_id
+                )
+            )
+        )
+    if filters.trip_id is not None:
+        query = query.where(
+            Transaction.id.in_(
+                select(TransactionTag.transaction_id).where(
+                    TransactionTag.tag_id == filters.trip_id
+                )
+            )
+        )
     return query
 
 
@@ -597,8 +678,26 @@ def get_transactions(
         .order_by(Transaction.posted_date.desc(), Transaction.id.desc())
         .limit(limit)
     )
+    txns = list(session.scalars(query))
+
+    # One extra query over the page about to be returned, not one per row -- see
+    # module notes on the ~900-query cost of doing this per-relationship above.
+    txn_ids = [txn.id for txn in txns]
+    tag_names: Dict[int, List[str]] = defaultdict(list)
+    trip_names: Dict[int, str] = {}
+    if txn_ids:
+        for txn_id, name, kind in session.execute(
+            select(TransactionTag.transaction_id, Tag.name, Tag.kind)
+            .join(Tag, Tag.id == TransactionTag.tag_id)
+            .where(TransactionTag.transaction_id.in_(txn_ids))
+        ).all():
+            if kind == TRIP:
+                trip_names[txn_id] = name
+            else:
+                tag_names[txn_id].append(name)
+
     result = []
-    for txn in session.scalars(query):
+    for txn in txns:
         result.append(
             TxnRow(
                 id=txn.id,
@@ -611,6 +710,8 @@ def get_transactions(
                 currency=txn.currency.value,
                 account=txn.account.name,
                 is_transfer=txn.transfer_group_id is not None,
+                tags=tuple(sorted(tag_names.get(txn.id, ()))),
+                trip=trip_names.get(txn.id),
             )
         )
     return result

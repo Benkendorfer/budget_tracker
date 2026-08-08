@@ -155,7 +155,8 @@ def _category_of(app, description):
     table = app.query_one("#txns", DataTable)
     for index, txn in enumerate(app._txns):
         if txn.description == description:
-            return str(table.get_row_at(index)[3])
+            # Column 4: select, date, description, vendor, then category.
+            return str(table.get_row_at(index)[4])
     return None
 
 

@@ -1229,3 +1229,210 @@ def test_rates_unknown_subcommand_warns(tmp_path, monkeypatch):
 
 
 # ------------------------------------------------------------------------- unimport
+
+
+# ---------------------------------------------------------------------- multi-select
+
+
+def test_x_toggles_the_row_under_the_transactions_cursor(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            table = app.query_one("#txns", DataTable)
+            table.focus()
+            table.move_cursor(row=0)
+            txn_id = app._txns[0].id
+            await pilot.press("x")
+            await pilot.pause()
+            after_first = set(app._selected_ids)
+            await pilot.press("x")
+            await pilot.pause()
+            after_second = set(app._selected_ids)
+            return txn_id, after_first, after_second
+
+    txn_id, after_first, after_second = asyncio.run(run())
+    assert after_first == {txn_id}
+    assert after_second == set()  # toggled back off
+
+
+def test_x_key_is_inert_outside_the_transactions_table(tmp_path, monkeypatch):
+    """'x' is a plain letter, so it must stay typeable everywhere else -- see check_action().
+
+    Mirrors test_the_chart_keys_are_inert_outside_the_chart (test_tui_chart.py) for 'b'/'m'.
+    """
+    _setup(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            # #command holds focus by default, even on the transactions panel.
+            await pilot.press("x")
+            await pilot.pause()
+            selected_while_typing = set(app._selected_ids)
+            typed = app.query_one("#command", Input).value
+
+            app._run_command("rules")
+            await pilot.pause()
+            app.query_one("#rules", DataTable).focus()
+            await pilot.press("x")
+            await pilot.pause()
+            selected_on_rules_panel = set(app._selected_ids)
+
+            return selected_while_typing, typed, selected_on_rules_panel
+
+    selected_while_typing, typed, selected_on_rules_panel = asyncio.run(run())
+    assert selected_while_typing == set()
+    assert typed == "x"  # reached the command bar as an ordinary character
+    assert selected_on_rules_panel == set()
+
+
+def test_enter_on_a_transaction_row_toggles_its_selection(tmp_path, monkeypatch):
+    """Enter reaches the same on_data_table_row_selected hook a mouse click does."""
+    _setup(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            table = app.query_one("#txns", DataTable)
+            table.focus()
+            table.move_cursor(row=1)
+            txn_id = app._txns[1].id
+            await pilot.press("enter")
+            await pilot.pause()
+            after_first = set(app._selected_ids)
+            await pilot.press("enter")
+            await pilot.pause()
+            after_second = set(app._selected_ids)
+            return txn_id, after_first, after_second
+
+    txn_id, after_first, after_second = asyncio.run(run())
+    assert after_first == {txn_id}
+    assert after_second == set()
+
+
+def test_reload_drops_selected_ids_no_longer_in_the_filtered_view(tmp_path, monkeypatch):
+    """A selection must not silently keep acting on rows the user can no longer see."""
+    _setup(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            all_ids = {t.id for t in app._txns}
+            app._selected_ids = set(all_ids)
+            app._run_command("filter vendor:COFFEE SHOP B")
+            await pilot.pause()
+            return all_ids, set(app._selected_ids), {t.id for t in app._txns}
+
+    all_ids, selected_after, filtered_ids = asyncio.run(run())
+    assert selected_after == filtered_ids
+    assert selected_after < all_ids  # COFFEE SHOP A's id(s) were dropped, not kept
+
+
+def test_sel_all_selects_every_listed_transaction_and_sel_none_clears_it(
+    tmp_path, monkeypatch
+):
+    _setup(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            listed_ids = {t.id for t in app._txns}
+            app._run_command("sel all")
+            await pilot.pause()
+            after_all = set(app._selected_ids)
+            status_after_all = str(app.query_one("#status", Static).content)
+
+            app._run_command("sel none")
+            await pilot.pause()
+            after_none = set(app._selected_ids)
+            status_after_none = str(app.query_one("#status", Static).content)
+
+            return listed_ids, after_all, status_after_all, after_none, status_after_none
+
+    (
+        listed_ids,
+        after_all,
+        status_after_all,
+        after_none,
+        status_after_none,
+    ) = asyncio.run(run())
+    assert after_all == listed_ids
+    assert f"{len(listed_ids)} selected" in status_after_all
+    assert after_none == set()
+    assert "selected" not in status_after_none
+
+
+def test_sel_with_no_argument_or_an_unrecognized_subcommand_warns(tmp_path, monkeypatch):
+    """Neither crashes -- the rest of the grammar (category/vendor/tag/trip) lands in
+    a later wave, and typing it now must notify, not raise."""
+    _setup(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._run_command("sel")
+            app._run_command("sel bogus")
+            app._run_command("sel category = Groceries")
+            await pilot.pause()
+            return [(n.message, n.severity) for n in app._notifications], set(
+                app._selected_ids
+            )
+
+    notifications, selected = asyncio.run(run())
+    assert len(notifications) == 3
+    assert all(severity == "warning" for _, severity in notifications)
+    assert selected == set()  # nothing about the selection changed
+
+
+def test_ctrl_n_and_ctrl_t_prefill_sel_commands_once_something_is_selected(
+    tmp_path, monkeypatch
+):
+    _setup(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._selected_ids = {app._txns[0].id}
+            await pilot.press("ctrl+n")
+            rename_prefill = app.query_one("#command", Input).value
+            app.query_one("#command", Input).value = ""
+            await pilot.press("ctrl+t")
+            categorize_prefill = app.query_one("#command", Input).value
+            return rename_prefill, categorize_prefill
+
+    rename_prefill, categorize_prefill = asyncio.run(run())
+    assert rename_prefill == "sel vendor = "
+    assert categorize_prefill == "sel category = "
+
+
+def test_status_line_with_a_selection_fits_the_main_panel(tmp_path, monkeypatch):
+    """Same 92-column concern as test_status_line_with_unconverted_marker_fits_the_
+    main_panel and test_drill_down_status_line_fits_the_main_panel (test_tui_stats.py),
+    now stressing '   N selected' against a year of six-figure transactions and a
+    three-digit selection -- the widest realistic count on its own. Stacking every
+    marker (transfers, unconverted, and a selection) at once is the same pre-existing,
+    already-acknowledged limit those two document; this only guards the new one.
+    """
+    _setup(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            width = app.query_one("#status", Static).size.width
+            app._selected_ids = set(range(1, 1000))  # 999: the worst realistic count
+            app._set_status(
+                queries.Totals(
+                    count=99_999,
+                    net_minor=0,
+                    outflow_minor=-99_999_999,
+                    inflow_minor=99_999_999,
+                )
+            )
+            status = str(app.query_one("#status", Static).content)
+            return status, width
+
+    status, width = asyncio.run(run())
+    assert len(status) <= width - 2
+    assert "999 selected" in status

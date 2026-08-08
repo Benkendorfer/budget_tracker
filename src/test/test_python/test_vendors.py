@@ -138,6 +138,87 @@ def test_text_filter_treats_like_wildcards_literally(tmp_path):
         )
 
 
+# ---------------------------------------------------------------------- set_vendor
+
+
+def test_set_vendor_repoints_only_the_given_transactions(tmp_path):
+    """The per-row form must not touch a sibling row of the same original vendor."""
+    session_factory = _setup(tmp_path)
+    with session_factory() as session:
+        shop_a_ids = [
+            t.id for t in queries.get_transactions(session)
+            if t.description == "COFFEE SHOP A"
+        ]
+        target_id = shop_a_ids[0]
+
+    with session_factory() as session:
+        assert vendors.set_vendor(session, [target_id], "Beanery") == 1
+        session.commit()
+
+    with session_factory() as session:
+        rows = {t.id: t.vendor for t in queries.get_transactions(session)}
+        assert rows[target_id] == "Beanery"
+        other_id = [i for i in shop_a_ids if i != target_id][0]
+        assert rows[other_id] == "COFFEE SHOP A"  # untouched
+
+
+def test_set_vendor_on_an_empty_selection_is_a_no_op(tmp_path):
+    session_factory = _setup(tmp_path)
+    with session_factory() as session:
+        assert vendors.set_vendor(session, [], "Beanery") == 0
+
+
+def test_set_vendor_joins_an_existing_display_group(tmp_path):
+    """A newly created raw vendor named after an existing display name aggregates
+    under it, rather than starting a rival group of the same name."""
+    session_factory = _setup(tmp_path)
+    with session_factory() as session:
+        vendors.set_override(session, "COFFEE SHOP B", "Coffee")
+        session.commit()
+
+    with session_factory() as session:
+        shop_a_id = next(
+            t.id for t in queries.get_transactions(session) if t.description == "COFFEE SHOP A"
+        )
+
+    with session_factory() as session:
+        assert vendors.set_vendor(session, [shop_a_id], "Coffee") == 1
+        session.commit()
+
+    with session_factory() as session:
+        rows = queries.get_vendors(session)
+        coffee = [r for r in rows if r.name == "Coffee"]
+        assert len(coffee) == 1
+        assert coffee[0].kind == "name"
+        assert coffee[0].count == 2  # SHOP B (override) + the repointed SHOP A row
+
+
+def test_set_vendor_does_not_disturb_an_existing_vendors_override(tmp_path):
+    """Repointing more rows at an already-existing raw vendor must not clobber a
+    manual rename or rule that vendor already carries."""
+    session_factory = _setup(tmp_path)
+    with session_factory() as session:
+        vendors.set_override(session, "COFFEE SHOP A", "My Coffee")
+        session.commit()
+
+    with session_factory() as session:
+        shop_b_id = next(
+            t.id for t in queries.get_transactions(session) if t.description == "COFFEE SHOP B"
+        )
+
+    with session_factory() as session:
+        # Repointing a row at the already-existing raw vendor "COFFEE SHOP A" must
+        # not disturb its existing manual override.
+        assert vendors.set_vendor(session, [shop_b_id], "COFFEE SHOP A") == 1
+        session.commit()
+
+    with session_factory() as session:
+        rows = queries.get_vendors(session)
+        my_coffee = [r for r in rows if r.name == "My Coffee"]
+        assert len(my_coffee) == 1
+        assert my_coffee[0].count == 3  # both original SHOP A rows plus the repointed one
+
+
 def test_text_filter_combines_with_other_filters(tmp_path):
     session_factory = _setup(tmp_path)
     with session_factory() as session:

@@ -5,7 +5,7 @@ from decimal import Decimal
 
 import pytest
 
-from sqlalchemy import event
+from sqlalchemy import event, select
 from sqlalchemy.engine import Engine
 
 from budget_tracker import categories, queries, rates, stats, transfers
@@ -1194,6 +1194,68 @@ def test_get_bucket_totals_filters_object_matches_individual_arguments(tmp_path)
 
     assert len(by_args) == 2
     assert by_args == by_filters
+
+
+# ------------------------------------------------------------------- tag_id / trip_id
+
+def test_get_totals_and_category_totals_scoped_by_tag_id(tmp_path):
+    """Every aggregate is built on _txn_query(...).subquery(), so a tag filter reaches
+    totals and the category breakdown for free -- this is the guard that it actually
+    does."""
+    from budget_tracker import tags as tags_module
+
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        accounts, cats, vendor = _seed_for_filters(session)
+        hit_id = session.scalar(
+            select(Transaction.id).where(Transaction.description == "Coffee shop")
+        )
+        tag = tags_module.get_or_create(session, "reimbursable")
+        tags_module.add_tag(session, [hit_id], "reimbursable")
+        session.commit()
+        tag_id = tag.id
+
+    with session_factory() as session:
+        totals = queries.get_totals(session, filters=queries.Filters(tag_id=tag_id))
+        assert totals.count == 1
+        assert totals.outflow_minor == -2500  # "Hardware" excluded by the tag filter
+
+        cat_totals = queries.get_category_totals(
+            session, filters=queries.Filters(tag_id=tag_id)
+        )
+        assert len(cat_totals) == 1
+        assert cat_totals[0].name == "Dining"
+        assert cat_totals[0].outflow_minor == -2500
+
+
+def test_resolve_filters_treats_tag_id_and_trip_id_like_the_other_fields():
+    resolved = queries.resolve_filters(None, None, None, None, None, None, tag_id=5)
+    assert resolved == queries.Filters(tag_id=5)
+
+    with pytest.raises(ValueError, match="tag_id"):
+        queries.resolve_filters(
+            queries.Filters(trip_id=9), None, None, None, None, None, tag_id=5
+        )
+
+
+def test_filters_tag_id_and_trip_id_default_to_none_for_old_positional_construction():
+    """tag_id/trip_id were added after date_range specifically so every positional
+    Filters(...) already in this file keeps meaning what it always meant."""
+    old_style = queries.Filters(
+        1, 2, ("raw", 3), queries.TextFilter("x"),
+        (date(2025, 1, 1), date(2025, 1, 31)),
+    )
+    assert old_style.tag_id is None
+    assert old_style.trip_id is None
+
+
+def test_filters_replace_can_swap_tag_id_without_disturbing_the_rest():
+    original = queries.Filters(account_id=1, trip_id=3)
+    swapped = original.replace(tag_id=7)
+    assert swapped.tag_id == 7
+    assert swapped.trip_id == 3
+    assert swapped.account_id == 1
+    assert original.tag_id is None  # frozen: the original is untouched
 
 
 def test_build_report_filters_object_matches_individual_arguments(tmp_path):

@@ -53,8 +53,20 @@ def _cmd_list(args: argparse.Namespace) -> int:
             if vendor_filter is None:
                 print(f"No vendor named {args.vendor!r}.")
                 return 1
+        tag_id = None
+        if args.tag:
+            tag_id = queries.resolve_tag(session, args.tag, queries.TAG)
+            if tag_id is None:
+                print(f"No tag named {args.tag!r}.")
+                return 1
+        trip_id = None
+        if args.trip:
+            trip_id = queries.resolve_tag(session, args.trip, queries.TRIP)
+            if trip_id is None:
+                print(f"No trip named {args.trip!r}.")
+                return 1
         text_filter = (
-queries.TextFilter(args.search, args.search_in) if args.search else None
+            queries.TextFilter(args.search, args.search_in) if args.search else None
         )
         # One value for both calls: the table and the totals under it must be scoped
         # identically or the figures will not describe the rows above them.
@@ -63,6 +75,8 @@ queries.TextFilter(args.search, args.search_in) if args.search else None
             category_id=category_id,
             vendor_filter=vendor_filter,
             text_filter=text_filter,
+            tag_id=tag_id,
+            trip_id=trip_id,
         )
         txns = queries.get_transactions(
             session,

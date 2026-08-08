@@ -85,6 +85,8 @@ listed. Type commands into the bar at the bottom:
 | `category Dining` | Move an existing category to the top level |
 | `category` / `category list` | Show the category tree, indented |
 | `category merge <source> = <target>` | Fold one category into another (see below) |
+| `sel all` | Select every transaction currently listed, for a bulk edit (see below) |
+| `sel none` | Clear the selection |
 | `filter <text>` | Search description, vendor name, and raw vendor name |
 | `filter <field>:<text>` | Search one of `description`, `vendor`, `raw` |
 | `filter` | Clear the text filter |
@@ -120,6 +122,16 @@ focused, that is the vendor of the transaction under the cursor — which works 
 vendors you have already grouped, because each row remembers the raw merchant string.
 Otherwise both fall back to the vendor sidebar: the active vendor filter if there is one,
 else the highlighted row.
+
+#### Selecting several transactions at once
+
+The leading blank column in the transaction table is a checkbox: press `x` on a row, or
+click it, to select it (`enter` does the same). `sel all` selects every transaction the
+table is currently showing and `sel none` clears the selection; the status line shows
+`N selected` whenever it is non-empty. Once anything is selected, `ctrl+n` and `ctrl+t`
+prefill `sel vendor = ` / `sel category = ` instead of their usual single-vendor
+commands, ready for the bulk vendor/category edit that fills in those commands in a
+later release.
 
 ### The command line
 
@@ -879,10 +891,12 @@ Conventions:
   `budget.period` & `recurring.cadence` (`weekly`/`monthly`/`quarterly`/`yearly`),
   `rule.match_field` (`description`/`amount`/`account`), `rule.match_type`
   (`contains`/`equals`/`regex`), `category_source` (`manual`/`rule`/`unset`).
-- Lookup `value` columns are UNIQUE (`account_type`, `currency`, `tag`, `vendor_name`,
+- Lookup `value` columns are UNIQUE (`account_type`, `currency`, `vendor_name`,
   marked `UK`); `vendor.name` is UNIQUE; `category.value` is UNIQUE across the whole
   tree, not just among siblings (see "Nesting categories" above).
   `exchange_rate` is unique on `(currency_id, base_currency_id, rate_date)`.
+  `tag` is unique on `(name, kind)` rather than on `name` alone, so a trip
+  `Japan 2026` and an ordinary tag `japan` can coexist (see "Tags and trips" below).
 - Lookup tables (`account_type`, `currency`, `tag`, `vendor`, `vendor_name`) and pure
   join tables (`transaction_tag`) omit `created_at`/`updated_at`.
 
@@ -981,7 +995,9 @@ erDiagram
     }
     tag {
         int id PK
-        str value UK
+        str name
+        str kind
+        datetime created_at
     }
     transaction_tag {
         int transaction_id PK, FK

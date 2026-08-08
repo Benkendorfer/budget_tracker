@@ -58,16 +58,16 @@ def test_transfer_rows_are_marked_in_the_table(tmp_path, monkeypatch):
             rows = {}
             for i in range(table.row_count):
                 cells = table.get_row_at(i)
-                rows[str(cells[1])] = cells
+                rows[str(cells[2])] = cells
             return rows
 
     rows = asyncio.run(run())
     transfer_row = rows["⇄ MOVE IN"]
-    assert "⇄" in str(transfer_row[1])  # flagged
-    assert "dim" in str(transfer_row[4].style)  # and greyed, not red/green
+    assert "⇄" in str(transfer_row[2])  # flagged
+    assert "dim" in str(transfer_row[5].style)  # and greyed, not red/green
     ordinary = next(v for k, v in rows.items() if "COFFEE" in k)
-    assert "⇄" not in str(ordinary[1])
-    assert "dim" not in str(ordinary[4].style)
+    assert "⇄" not in str(ordinary[2])
+    assert "dim" not in str(ordinary[5].style)
 
 
 def test_transaction_table_shows_the_account_after_the_amount(tmp_path, monkeypatch):
@@ -82,8 +82,18 @@ def test_transaction_table_shows_the_account_after_the_amount(tmp_path, monkeypa
             return headers, first
 
     headers, first = asyncio.run(run())
-    assert headers == ["Date", "Description", "Vendor", "Category", "Amount", "Account"]
-    assert first[-1] == "8207"  # the account each row belongs to
+    assert headers == [
+        "",
+        "Date",
+        "Description",
+        "Vendor",
+        "Category",
+        "Amount",
+        "Account",
+        "Tags",
+    ]
+    assert first[-2] == "8207"  # the account each row belongs to
+    assert first[-1] == ""  # the Tags column: nothing to show until tags exist
 
 
 def _seed_jpy_account(tmp_path, monkeypatch):
@@ -130,7 +140,7 @@ def test_zero_decimal_currency_shows_whole_units_not_cents(tmp_path, monkeypatch
     rows = asyncio.run(run())
     assert len(rows) == 1
     # Not "1.00" — JPY has no minor unit, so 100 minor units is 100 yen.
-    assert rows[0][4] == "¥100"
+    assert rows[0][5] == "¥100"
 
 
 def _seed_multi_currency(tmp_path, monkeypatch):
@@ -190,7 +200,7 @@ def test_txns_table_formats_each_row_in_its_own_currency(tmp_path, monkeypatch):
             return _rows_of(app, "txns")
 
     rows = asyncio.run(run())
-    by_description = {row[1]: row[4] for row in rows}
+    by_description = {row[2]: row[5] for row in rows}
     assert by_description["US coffee"] == "$-42.00"
     # JPY has no minor unit: 1,500 minor units is 1,500 yen, not 15.00.
     assert by_description["Japan lunch"] == "¥-1,500"
@@ -198,7 +208,9 @@ def test_txns_table_formats_each_row_in_its_own_currency(tmp_path, monkeypatch):
 
 
 def test_txns_amount_column_fits_a_symbol_and_a_six_figure_amount(tmp_path, monkeypatch):
-    """Renders the real compositor at 130 columns with a three-character symbol (CHF)
+    """Renders the real compositor at the terminal width the user actually runs
+    (213 columns; see the 2026-08-08 spec correction that widened the table's
+    columns past the old 130-wide test default) with a three-character symbol (CHF)
     beside a signed six-figure amount — the widest realistic value the widened Amount
     column has to hold without clipping the digits (see test_txns_table_formats_...
     above for the value itself; this checks it actually reaches the screen intact).
@@ -207,10 +219,10 @@ def test_txns_amount_column_fits_a_symbol_and_a_six_figure_amount(tmp_path, monk
 
     async def run():
         app = BudgetApp()
-        async with app.run_test(size=(130, 40)) as pilot:
+        async with app.run_test(size=(213, 40)) as pilot:
             await pilot.pause()
             buffer = io.StringIO()
-            Console(file=buffer, width=130).print(app.screen._compositor)
+            Console(file=buffer, width=213).print(app.screen._compositor)
             return buffer.getvalue()
 
     rendered = asyncio.run(run())
@@ -277,3 +289,46 @@ def test_status_line_with_unconverted_marker_fits_the_main_panel(tmp_path, monke
     status, width = asyncio.run(run())
     assert len(status) <= width - 2
     assert "999 unconverted" in status
+
+
+# ------------------------------------------------------------------- multi-select
+
+
+def test_txns_table_columns_fit_the_real_terminal(tmp_path, monkeypatch):
+    """Widths per the multi-select/tags spec correction of 2026-08-08: wider than the
+    old 26/18/12 so ``Public Tran…``/``Harvard FCU Check…`` stop truncating, plus the
+    new leading Sel and trailing Tags columns, all still comfortably inside the main
+    panel at the terminal size the user actually runs (213 columns, ~175 for the main
+    panel) -- not the 130-wide test default that bounded the old, narrower table.
+    """
+    _setup(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(213, 40)) as pilot:
+            table = app.query_one("#txns", DataTable)
+            widths = [c.width for c in table.columns.values()]
+            return widths, table.size.width
+
+    widths, panel_width = asyncio.run(run())
+    assert widths == [2, 10, 30, 20, 16, 15, 18, 22]
+    # Two cells of padding per column, plus the panel's own round border.
+    assert sum(widths) + 2 * len(widths) + 2 <= panel_width
+
+
+def test_selected_rows_show_a_checkmark_in_the_leading_column(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            txn_id = app._txns[0].id
+            app._selected_ids = {txn_id}
+            app._render_selection()
+            await pilot.pause()
+            return _rows_of(app, "txns")
+
+    rows = asyncio.run(run())
+    assert rows[0][0] == "✓"
+    assert all(row[0] == "" for row in rows[1:])
