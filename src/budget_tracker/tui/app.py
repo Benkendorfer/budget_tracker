@@ -1,7 +1,8 @@
 """Full-screen Textual TUI for the budget tracker.
 
-Layout: an accounts/categories sidebar (click a row to filter), a scrollable
-transactions table, a totals line, and a command bar at the bottom.
+Layout: an accordion sidebar (accounts, vendors, categories, tags, trips -- one
+section open at a time; click a row to filter), a scrollable transactions table, a
+totals line, and a command bar at the bottom.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.coordinate import Coordinate
+from textual.events import Click
 from textual.widgets import (
     DataTable,
     Footer,
@@ -89,7 +91,9 @@ _SHARE_BUCKETS = ("week", "month", "year")
 class BudgetApp(App):
     CSS = """
     #sidebar { width: 36; }
-    #accounts, #categories { border: round $accent; height: 1fr; }
+    #accounts, #vendors, #categories, #tags, #trips {
+        border: round $accent; height: 1fr;
+    }
     #txns, #rules, #imports, #setup, #periods { border: round $accent; height: 1fr; }
     #stats { height: 1fr; }
     #stats_table, #chart { border: round $accent; height: 1fr; }
@@ -101,6 +105,20 @@ class BudgetApp(App):
     """
 
     PANELS = ("txns", "rules", "imports", "setup", "periods", "stats", "chart", "pie")
+
+    # The sidebar's five collapsible sections, in the order they are stacked. Exactly
+    # one is expanded (its ListView shown) at a time; the rest collapse to their
+    # heading -- see _expand_section(). Accounts, vendors and categories were already
+    # crowded on their own; tags and trips only made a fixed-height sidebar worse, which
+    # is the entire reason this is an accordion rather than five plain lists.
+    SECTIONS = ("accounts", "vendors", "categories", "tags", "trips")
+    SECTION_TITLES = {
+        "accounts": "Accounts",
+        "vendors": "Vendors",
+        "categories": "Categories",
+        "tags": "Tags",
+        "trips": "Trips",
+    }
     # Panels whose widget is not itself focusable name the child that takes focus.
     PANEL_FOCUS = {"stats": "#stats_table"}
 
@@ -178,9 +196,18 @@ class BudgetApp(App):
         # Only the statistics drill-down sets this: the transactions it opens have to be
         # the window's, not all of history, or they will not add up to the row clicked.
         self.date_filter: Optional[queries.DateRange] = None
+        self.tag_filter: Optional[int] = None
+        self.trip_filter: Optional[int] = None
         self._accounts: List[queries.AccountRow] = []
         self._vendors: List[queries.VendorRow] = []
         self._categories: List[queries.CategoryRow] = []
+        # Zero-count tags/trips are kept (see queries.get_tags), unlike categories --
+        # a freshly created trip with nothing on it yet still needs a sidebar row.
+        self._tags: List[queries.TagRow] = []
+        self._trips: List[queries.TagRow] = []
+        # Which sidebar section is expanded; the rest collapse to their heading. See
+        # _expand_section() and SECTIONS.
+        self._expanded_section: str = "accounts"
         # By ISO code, so a per-row currency (queries.TxnRow.currency) can be formatted
         # in its own decimal places and symbol rather than always assuming two decimal
         # places — see _fmt_amount_for().
@@ -278,12 +305,20 @@ class BudgetApp(App):
         yield Header(show_clock=True)
         with Horizontal():
             with Vertical(id="sidebar"):
-                yield Label("Accounts", classes="heading")
+                # Headings start collapsed except Accounts (see on_mount()'s call to
+                # _expand_section, which also fills in the real "▼"/"▶" text and any
+                # collapsed filter summary) -- the literal text here is only what shows
+                # for the instant before that runs.
+                yield Static("Accounts", id="head_accounts", classes="heading")
                 yield ListView(id="accounts")
-                yield Label("Vendors", classes="heading")
+                yield Static("Vendors", id="head_vendors", classes="heading")
                 yield ListView(id="vendors")
-                yield Label("Categories", classes="heading")
+                yield Static("Categories", id="head_categories", classes="heading")
                 yield ListView(id="categories")
+                yield Static("Tags", id="head_tags", classes="heading")
+                yield ListView(id="tags")
+                yield Static("Trips", id="head_trips", classes="heading")
+                yield ListView(id="trips")
             with Vertical(id="main"):
                 yield DataTable(id="txns")
                 yield DataTable(id="rules")
@@ -299,7 +334,8 @@ class BudgetApp(App):
         yield Input(
             placeholder=(
                 "command: import | unimport | filter | categorize | category | sel | "
-                "format | stats | chart | pie | rates | rules | all | refresh | help | quit"
+                "section | format | stats | chart | pie | rates | rules | all | refresh | "
+                "help | quit"
             ),
             id="command",
         )
@@ -351,6 +387,19 @@ class BudgetApp(App):
                 and self.focused.id == "txns"
             )
         return True
+
+    def on_click(self, event: Click) -> None:
+        """Clicking a sidebar heading expands its section, collapsing the rest.
+
+        ``Click`` always bubbles to the App if nothing below it stops it, and a plain
+        ``Static`` never does, so this is the one place that needs to know about the
+        five ``#head_<section>`` widgets at all.
+        """
+        widget = event.widget
+        if widget is None or widget.id is None:
+            return
+        if widget.id.startswith("head_"):
+            self._expand_section(widget.id[len("head_") :])
 
     def on_mount(self) -> None:
         self.title = "Budget Tracker"
@@ -450,6 +499,10 @@ class BudgetApp(App):
         pie.can_focus = True
         self.query_one("#prompt", Static).display = False
 
+        # Accounts starts expanded; every other section collapses to its heading. See
+        # SECTIONS and _expand_section().
+        self._expand_section("accounts")
+
         self.reload()
         self.query_one("#command", Input).focus()
 
@@ -457,8 +510,8 @@ class BudgetApp(App):
     def _active_filters(self) -> queries.Filters:
         """The app's active filters as one value.
 
-        These five always travel together and always mean the same thing; passing them
-        one at a time is what made adding a sixth touch every signature. Named
+        These always travel together and always mean the same thing; passing them one
+        at a time is what made adding a sixth touch every signature. Named
         ``_active_filters`` rather than the obvious ``_filters`` because Textual's own
         ``App`` already owns that attribute -- a list of line filters -- and shadowing it
         replaces the method with a list the moment the app initialises. A caller that
@@ -472,6 +525,8 @@ class BudgetApp(App):
             vendor_filter=self.vendor_filter,
             text_filter=self.text_filter,
             date_range=self.date_filter,
+            tag_id=self.tag_filter,
+            trip_id=self.trip_filter,
         )
 
     def reload(self) -> None:
@@ -479,6 +534,8 @@ class BudgetApp(App):
             self._accounts = queries.get_accounts(session)
             self._vendors = queries.get_vendors(session)
             self._categories = queries.get_categories(session)
+            self._tags = queries.get_tags(session, kind=tags_module.TAG)
+            self._trips = queries.get_tags(session, kind=tags_module.TRIP)
             self._currencies = {c.code: c for c in queries.get_currencies(session)}
             self._rules = queries.get_rules(session)
             self._category_rules = queries.get_category_rules(session)
@@ -503,6 +560,8 @@ class BudgetApp(App):
                 for c in self._categories
             ],
         )
+        self._fill_list("#tags", [f"{t.name} ({t.count})" for t in self._tags])
+        self._fill_list("#trips", [f"{t.name} ({t.count})" for t in self._trips])
         self._fill_txns(txns)
         self._fill_rules()
         self._totals = totals
@@ -523,6 +582,10 @@ class BudgetApp(App):
             self._build_report()
             self._build_pie()
             self._fill_pie()
+        # A collapsed heading's summary names whichever filter is active on it, so it
+        # has to be redrawn whenever a filter (or the sidebar's own contents) changes --
+        # not just when a section expands or collapses.
+        self._update_section_headings()
         self._refresh_status()
 
     def _fill_list(self, selector: str, labels: List[str]) -> None:
@@ -548,6 +611,68 @@ class BudgetApp(App):
             [ListItem(Label("— All —"))] + [ListItem(Label(label)) for label in labels]
         )
 
+    def _expand_section(self, name: str) -> None:
+        """Expand ``name``'s sidebar section, collapsing every other one.
+
+        Only ``display`` moves -- the ListView itself, its rows, its cursor and its
+        scroll position are untouched, so collapsing and re-expanding a section leaves
+        it exactly as the user left it. See SECTIONS for the five valid names.
+        """
+        if name not in self.SECTIONS:
+            return
+        self._expanded_section = name
+        for section in self.SECTIONS:
+            self.query_one(f"#{section}", ListView).display = section == name
+        self._update_section_headings()
+
+    def _section_filter_label(self, section: str) -> Optional[str]:
+        """The name of whatever ``section``'s filter is currently scoped to, if any.
+
+        Used only by a *collapsed* heading -- see _update_section_headings() -- so a
+        filter set from a section the user has since closed is still visible rather
+        than silently forgotten.
+        """
+        if section == "accounts" and self.account_filter is not None:
+            return next(
+                (a.name for a in self._accounts if a.id == self.account_filter), None
+            )
+        if section == "vendors" and self.vendor_filter is not None:
+            kind, vendor_id = self.vendor_filter
+            return next(
+                (v.name for v in self._vendors if (v.kind, v.id) == (kind, vendor_id)),
+                None,
+            )
+        if section == "categories" and self.category_filter is not None:
+            return next(
+                (c.name for c in self._categories if c.id == self.category_filter), None
+            )
+        if section == "tags" and self.tag_filter is not None:
+            return next((t.name for t in self._tags if t.id == self.tag_filter), None)
+        if section == "trips" and self.trip_filter is not None:
+            return next((t.name for t in self._trips if t.id == self.trip_filter), None)
+        return None
+
+    def _update_section_headings(self) -> None:
+        """Redraw every heading: "▼ Section" expanded, "▶ Section" collapsed, or
+        "▶ Section — Filter" collapsed with a filter still active on it.
+
+        That summary is the entire point of collapsing a section -- a filter the user
+        cannot see is a filter they will not remember they set. Truncated to the
+        sidebar's own content width (36 minus the heading's own padding).
+
+        ``Text()``, not a plain string: a vendor, category, or tag name is user data
+        and may hold brackets that ``Static``'s default markup parsing would silently
+        eat (the same reason ``notify()`` calls elsewhere pass ``markup=False``).
+        """
+        for section in self.SECTIONS:
+            title = self.SECTION_TITLES[section]
+            if section == self._expanded_section:
+                text = f"▼ {title}"
+            else:
+                filter_label = self._section_filter_label(section)
+                text = f"▶ {title} — {filter_label}" if filter_label else f"▶ {title}"
+            self.query_one(f"#head_{section}", Static).update(Text(_truncate(text, 34)))
+
     def _vendor_shown_count(self) -> int:
         """How many real vendor rows the sidebar has mounted -- see VENDOR_SIDEBAR_CAP."""
         return min(len(self._vendors), self.VENDOR_SIDEBAR_CAP)
@@ -563,10 +688,13 @@ class BudgetApp(App):
         shown = self._vendor_shown_count()
         if shown < len(labels):
             hidden = len(labels) - shown
-            # 34: the sidebar's item content width (36 minus the ListView's own
-            # padding) -- see test_vendor_sidebar_more_row_fits_the_sidebar_width.
+            # 32: the sidebar's item content width once its own round border (1 column
+            # each side, now on every section -- see SECTIONS) and a vertical
+            # scrollbar (1 column, always present once the list is this long) are
+            # taken out of the 36-wide sidebar -- see
+            # test_vendor_sidebar_more_row_fits_the_sidebar_width.
             labels = labels[:shown] + [
-                _truncate(f"… {hidden} more, try 'filter vendor:'", 34)
+                _truncate(f"… {hidden} more, try 'filter vendor:'", 32)
             ]
         return labels
 
@@ -808,6 +936,10 @@ class BudgetApp(App):
             scope.append("vendor")
         if self.category_filter is not None:
             scope.append("category")
+        if self.tag_filter is not None:
+            scope.append("tag")
+        if self.trip_filter is not None:
+            scope.append("trip")
         if self.date_filter is not None:
             # Spelled out rather than labelled "date": the drill-down from a statistics
             # row is the only thing that sets it, and the user needs to see which window
@@ -873,6 +1005,10 @@ class BudgetApp(App):
                 self.vendor_filter = (vendor.kind, vendor.id)
         elif list_id == "categories":
             self.category_filter = None if index == 0 else self._categories[index - 1].id
+        elif list_id == "tags":
+            self.tag_filter = None if index == 0 else self._tags[index - 1].id
+        elif list_id == "trips":
+            self.trip_filter = None if index == 0 else self._trips[index - 1].id
         self.reload()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
@@ -1236,6 +1372,8 @@ class BudgetApp(App):
             self.notify("Refreshed.")
         elif name in {"all", "clear"}:
             self.action_clear_filters()
+        elif name == "section":
+            self._do_section(arg)
         elif name == "import":
             self._do_import(arg)
         elif name == "unimport":
@@ -1300,6 +1438,9 @@ class BudgetApp(App):
                 "category merge <source> = <target> — fold one category into another:\n"
                 "  repoints its transactions, rules, and children, then deletes it\n"
                 "  (asks for confirmation, naming what will move)\n"
+                "section <name> — expand that sidebar section (accounts, vendors,\n"
+                "  categories, tags, trips), collapsing the rest; any unambiguous\n"
+                "  prefix works, e.g. section cat. Click a heading to do the same\n"
                 "x, or clicking a row — select/deselect a transaction for bulk edits\n"
                 "sel all — select every transaction currently listed\n"
                 "sel none — clear the selection\n"
@@ -1344,7 +1485,8 @@ class BudgetApp(App):
                 "  on file, over its whole date range; runs in the background so the\n"
                 "  app stays responsive (an import does this on its own already)\n"
                 "all — clear filters   refresh — reload   quit — exit\n"
-                "Click an account/vendor/category to filter.\n"
+                "Click a row in an open sidebar section — account, vendor, category,\n"
+                "  tag, or trip — to filter by it.\n"
                 "ctrl+n / ctrl+t — prefill rename / categorize for the selected\n"
                 "  transaction's vendor, or for the selected vendor in the sidebar.",
                 title="Commands",
@@ -1578,6 +1720,35 @@ class BudgetApp(App):
         table = self.query_one("#imports", DataTable)
         if table.row_count:
             table.move_cursor(row=0)
+
+    def _do_section(self, arg: str) -> None:
+        """``section <name>`` expands that sidebar section, collapsing the rest.
+
+        ``<name>`` may be any unambiguous prefix of accounts/vendors/categories/tags/
+        trips, case-insensitive -- e.g. ``section cat`` for Categories, ``section tr``
+        for Trips (the only section starting "tr", since "tags" does not). A prefix
+        matching more than one name, like bare ``section t`` (tags and trips both
+        qualify), is refused rather than guessed at.
+        """
+        name = arg.strip().lower()
+        if not name:
+            self.notify(
+                "Usage: section <name>  (accounts, vendors, categories, tags, trips)",
+                severity="warning",
+            )
+            return
+        matches = [section for section in self.SECTIONS if section.startswith(name)]
+        if len(matches) == 1:
+            self._expand_section(matches[0])
+            return
+        if not matches:
+            self.notify(f"Unknown section: {arg!r}", severity="warning", markup=False)
+            return
+        self.notify(
+            f"Ambiguous section {arg!r}: matches {', '.join(matches)}.",
+            severity="warning",
+            markup=False,
+        )
 
     def _do_filter(self, arg: str) -> None:
         """`filter text` searches everything; `filter vendor:text` narrows the field."""
@@ -2395,6 +2566,8 @@ class BudgetApp(App):
         self.category_filter = None
         self.text_filter = None
         self.date_filter = None
+        self.tag_filter = None
+        self.trip_filter = None
         self.reload()
         self.notify("Filters cleared.")
 

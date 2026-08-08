@@ -300,8 +300,8 @@ def test_sidebar_is_not_rebuilt_when_only_the_filters_changed(tmp_path, monkeypa
             return at_startup, after_drill, after_filter, sidebar
 
     at_startup, after_drill, after_filter, sidebar = asyncio.run(run())
-    # All three lists are populated once when the app opens.
-    assert sorted(at_startup) == ["accounts", "categories", "vendors"]
+    # All five lists are populated once when the app opens.
+    assert sorted(at_startup) == ["accounts", "categories", "tags", "trips", "vendors"]
     assert after_drill == []  # a full round trip rebuilds nothing
     assert after_filter == []
     # ...but a change to the underlying data still reaches the screen.

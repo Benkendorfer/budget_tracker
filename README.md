@@ -60,12 +60,16 @@ Running `budget` with no arguments launches the full-screen TUI:
 budget          # equivalent to: budget tui
 ```
 
-The sidebar lists accounts, vendors, and categories — click any row to filter the
-transaction table, and the totals line updates to match. The vendor list shows your 200
-most active vendors (already sorted by transaction count); past that it shows a count of
-how many more there are rather than mounting one row per vendor, which is what keeps a
-years-long history feeling instant — `filter vendor:<text>` still reaches any vendor not
-listed. Type commands into the bar at the bottom:
+The sidebar is an accordion of five sections — Accounts, Vendors, Categories, Tags, and
+Trips — with exactly one expanded at a time (Accounts to start); click a heading to
+expand it and collapse the rest, or use `section <name>`. Click any row in the open
+section to filter the transaction table, and the totals line updates to match. A
+collapsed heading still shows a filter set on it, e.g. `▶ Categories — Dining`, so
+closing a section never hides that it is still narrowing the view. The vendor list shows
+your 200 most active vendors (already sorted by transaction count); past that it shows a
+count of how many more there are rather than mounting one row per vendor, which is what
+keeps a years-long history feeling instant — `filter vendor:<text>` still reaches any
+vendor not listed. Type commands into the bar at the bottom:
 
 | Command | Effect |
 | --- | --- |
@@ -85,6 +89,7 @@ listed. Type commands into the bar at the bottom:
 | `category Dining` | Move an existing category to the top level |
 | `category` / `category list` | Show the category tree, indented |
 | `category merge <source> = <target>` | Fold one category into another (see below) |
+| `section <name>` | Expand that sidebar section (accounts, vendors, categories, tags, trips), collapsing the rest; any unambiguous prefix works, e.g. `section cat` |
 | `sel all` | Select every transaction currently listed, for a bulk edit (see below) |
 | `sel none` | Clear the selection |
 | `filter <text>` | Search description, vendor name, and raw vendor name |
