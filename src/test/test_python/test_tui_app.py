@@ -15,10 +15,11 @@ from decimal import Decimal
 
 import pytest
 from rich.console import Console
+from sqlalchemy import select
 from sqlalchemy import text as sql_text
 from textual.widgets import DataTable, Input, ListView, Static
 
-from budget_tracker import categories, queries, rates, stats, transfers, vendors
+from budget_tracker import categories, queries, rates, stats, tags, transfers, vendors
 from budget_tracker.db import DuplicateCategoryNamesError, get_engine, get_sessionmaker, init_db
 from budget_tracker.importer import import_csv
 from budget_tracker.models import Account, Currency, Transaction
@@ -234,6 +235,11 @@ def test_vendor_sidebar_more_row_fits_the_sidebar_width(tmp_path, monkeypatch):
     async def run():
         app = BudgetApp()
         async with app.run_test(size=(130, 40)) as pilot:
+            await pilot.pause()
+            # Vendors is not the sidebar's default section (see BudgetApp.SECTIONS);
+            # it has to be expanded before its content is actually laid out and has a
+            # real width to measure.
+            app._expand_section("vendors")
             await pilot.pause()
             item = app.query_one("#vendors", ListView).children[-1]
             label = str(item.children[0].content)
@@ -1436,3 +1442,313 @@ def test_status_line_with_a_selection_fits_the_main_panel(tmp_path, monkeypatch)
     status, width = asyncio.run(run())
     assert len(status) <= width - 2
     assert "999 selected" in status
+
+
+# ------------------------------------------------------------- sidebar accordion
+
+
+def _headings(app):
+    return {
+        section: str(app.query_one(f"#head_{section}", Static).content)
+        for section in BudgetApp.SECTIONS
+    }
+
+
+def _displays(app):
+    return {
+        section: app.query_one(f"#{section}", ListView).display
+        for section in BudgetApp.SECTIONS
+    }
+
+
+def _tag_the_first_transaction(session_factory, name, kind=tags.TAG):
+    """Tag (or, for tags.TRIP, put on a trip) the earliest transaction. Returns its id."""
+    with session_factory() as session:
+        txn_id = session.scalar(select(Transaction.id).order_by(Transaction.id))
+        if kind == tags.TRIP:
+            tags.set_trip(session, [txn_id], name)
+        else:
+            tags.add_tag(session, [txn_id], name)
+        session.commit()
+    return txn_id
+
+
+def test_sidebar_defaults_to_accounts_expanded(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            return _displays(app), _headings(app)
+
+    displays, headings = asyncio.run(run())
+    assert displays == {
+        "accounts": True,
+        "vendors": False,
+        "categories": False,
+        "tags": False,
+        "trips": False,
+    }
+    assert headings["accounts"] == "▼ Accounts"
+    assert headings["vendors"] == "▶ Vendors"
+    assert headings["categories"] == "▶ Categories"
+    assert headings["tags"] == "▶ Tags"
+    assert headings["trips"] == "▶ Trips"
+
+
+def test_clicking_a_heading_expands_its_section_and_collapses_the_rest(
+    tmp_path, monkeypatch
+):
+    _setup(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.click("#head_categories")
+            await pilot.pause()
+            return _displays(app), _headings(app)
+
+    displays, headings = asyncio.run(run())
+    assert displays == {
+        "accounts": False,
+        "vendors": False,
+        "categories": True,
+        "tags": False,
+        "trips": False,
+    }
+    assert headings["categories"] == "▼ Categories"
+    assert headings["accounts"] == "▶ Accounts"
+
+
+def test_collapsed_heading_shows_its_active_filter(tmp_path, monkeypatch):
+    """A filter set from a section the user then closes must not go invisible."""
+    _setup(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            dining = next(c for c in app._categories if c.name == "Dining")
+            app.category_filter = dining.id
+            app.reload()
+            # Categories is still the default-collapsed section; expanding somewhere
+            # else proves the summary survives being closed, not just being set.
+            app._expand_section("vendors")
+            await pilot.pause()
+            return _headings(app)
+
+    headings = asyncio.run(run())
+    assert headings["categories"] == "▶ Categories — Dining"
+
+
+def test_section_command_expands_by_unambiguous_prefix(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._run_command("section cat")
+            await pilot.pause()
+            return _displays(app)
+
+    displays = asyncio.run(run())
+    assert displays["categories"] is True
+    assert displays["accounts"] is False
+
+
+def test_section_command_tr_resolves_to_trips_not_tags(tmp_path, monkeypatch):
+    """"trips" is the only section starting "tr" -- "tags" does not qualify."""
+    _setup(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._run_command("section tr")
+            await pilot.pause()
+            return _displays(app)
+
+    displays = asyncio.run(run())
+    assert displays["trips"] is True
+    assert displays["tags"] is False
+
+
+def test_section_command_refuses_an_ambiguous_prefix(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._run_command("section t")  # matches both tags and trips
+            await pilot.pause()
+            return _displays(app), [
+                (n.message, n.severity) for n in app._notifications
+            ]
+
+    displays, notifications = asyncio.run(run())
+    assert displays["accounts"] is True  # unchanged: the ambiguous command did nothing
+    assert any(
+        severity == "warning" and "Ambiguous" in message
+        for message, severity in notifications
+    )
+
+
+def test_section_command_unknown_name_warns(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._run_command("section bogus")
+            await pilot.pause()
+            return [(n.message, n.severity) for n in app._notifications]
+
+    notifications = asyncio.run(run())
+    assert any(
+        severity == "warning" and "Unknown section" in message
+        for message, severity in notifications
+    )
+
+
+def test_clicking_a_tag_row_filters_the_transactions(tmp_path, monkeypatch):
+    session_factory = _setup(tmp_path, monkeypatch)
+    _tag_the_first_transaction(session_factory, "reimbursable")
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._expand_section("tags")
+            await pilot.pause()
+            tags_list = app.query_one("#tags", ListView)
+            tags_list.focus()
+            tags_list.index = 1  # "reimbursable (1)", past the "— All —" row
+            await pilot.press("enter")
+            await pilot.pause()
+            return app.tag_filter, len(app._txns)
+
+    tag_filter, txn_count = asyncio.run(run())
+    assert tag_filter is not None
+    assert txn_count == 1
+
+
+def test_clicking_a_trip_row_filters_the_transactions(tmp_path, monkeypatch):
+    session_factory = _setup(tmp_path, monkeypatch)
+    _tag_the_first_transaction(session_factory, "Japan 2026", kind=tags.TRIP)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._expand_section("trips")
+            await pilot.pause()
+            trips_list = app.query_one("#trips", ListView)
+            trips_list.focus()
+            trips_list.index = 1
+            await pilot.press("enter")
+            await pilot.pause()
+            return app.trip_filter, len(app._txns)
+
+    trip_filter, txn_count = asyncio.run(run())
+    assert trip_filter is not None
+    assert txn_count == 1
+
+
+def test_a_trip_with_no_transactions_yet_still_appears_in_the_sidebar(
+    tmp_path, monkeypatch
+):
+    """queries.get_tags keeps zero-count rows -- a freshly created trip must be
+    visible in the sidebar or there is no way to add anything to it."""
+    session_factory = _setup(tmp_path, monkeypatch)
+    with session_factory() as session:
+        tags.get_or_create(session, "Someday Trip", tags.TRIP)
+        session.commit()
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._expand_section("trips")
+            await pilot.pause()
+            return [
+                str(item.children[0].content)
+                for item in app.query_one("#trips", ListView).children
+            ]
+
+    labels = asyncio.run(run())
+    assert "Someday Trip (0)" in labels
+
+
+def test_clear_filters_clears_the_tag_and_trip_filters(tmp_path, monkeypatch):
+    session_factory = _setup(tmp_path, monkeypatch)
+    _tag_the_first_transaction(session_factory, "reimbursable")
+    _tag_the_first_transaction(session_factory, "Japan 2026", kind=tags.TRIP)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.tag_filter = app._tags[0].id
+            app.trip_filter = app._trips[0].id
+            app.reload()
+            app.action_clear_filters()
+            await pilot.pause()
+            return app.tag_filter, app.trip_filter
+
+    tag_filter, trip_filter = asyncio.run(run())
+    assert tag_filter is None
+    assert trip_filter is None
+
+
+def test_status_line_names_a_tag_and_trip_filter(tmp_path, monkeypatch):
+    session_factory = _setup(tmp_path, monkeypatch)
+    _tag_the_first_transaction(session_factory, "reimbursable")
+    _tag_the_first_transaction(session_factory, "Japan 2026", kind=tags.TRIP)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.tag_filter = app._tags[0].id
+            app.trip_filter = app._trips[0].id
+            app.reload()
+            await pilot.pause()
+            return str(app.query_one("#status", Static).content)
+
+    status = asyncio.run(run())
+    assert "tag" in status
+    assert "trip" in status
+
+
+def test_collapsed_heading_truncates_a_long_filter_name_to_fit_the_sidebar(
+    tmp_path, monkeypatch
+):
+    """Same concern as test_vendor_sidebar_more_row_fits_the_sidebar_width, applied to
+    a collapsed heading's filter summary: it must never run past the heading's own
+    content width, or Textual hard-clips it mid-word with no ellipsis.
+    """
+    session_factory = _setup(tmp_path, monkeypatch)
+    long_name = "A Very Long Trip Name That Runs Well Past The Sidebar Width Limit"
+    _tag_the_first_transaction(session_factory, long_name, kind=tags.TRIP)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(130, 40)) as pilot:
+            await pilot.pause()
+            app.trip_filter = app._trips[0].id
+            app.reload()
+            app._expand_section("accounts")  # collapse trips
+            await pilot.pause()
+            head = app.query_one("#head_trips", Static)
+            label = str(head.content)
+            width = head.content_size.width
+            return label, width
+
+    label, width = asyncio.run(run())
+    assert "Trips —" in label
+    assert len(label) <= width

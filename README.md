@@ -60,12 +60,16 @@ Running `budget` with no arguments launches the full-screen TUI:
 budget          # equivalent to: budget tui
 ```
 
-The sidebar lists accounts, vendors, and categories — click any row to filter the
-transaction table, and the totals line updates to match. The vendor list shows your 200
-most active vendors (already sorted by transaction count); past that it shows a count of
-how many more there are rather than mounting one row per vendor, which is what keeps a
-years-long history feeling instant — `filter vendor:<text>` still reaches any vendor not
-listed. Type commands into the bar at the bottom:
+The sidebar is an accordion of five sections — Accounts, Vendors, Categories, Tags, and
+Trips — with exactly one expanded at a time (Accounts to start); click a heading to
+expand it and collapse the rest, or use `section <name>`. Click any row in the open
+section to filter the transaction table, and the totals line updates to match. A
+collapsed heading still shows a filter set on it, e.g. `▶ Categories — Dining`, so
+closing a section never hides that it is still narrowing the view. The vendor list shows
+your 200 most active vendors (already sorted by transaction count); past that it shows a
+count of how many more there are rather than mounting one row per vendor, which is what
+keeps a years-long history feeling instant — `filter vendor:<text>` still reaches any
+vendor not listed. Type commands into the bar at the bottom:
 
 | Command | Effect |
 | --- | --- |
@@ -85,8 +89,13 @@ listed. Type commands into the bar at the bottom:
 | `category Dining` | Move an existing category to the top level |
 | `category` / `category list` | Show the category tree, indented |
 | `category merge <source> = <target>` | Fold one category into another (see below) |
+| `section <name>` | Expand that sidebar section (accounts, vendors, categories, tags, trips), collapsing the rest; any unambiguous prefix works, e.g. `section cat` |
 | `sel all` | Select every transaction currently listed, for a bulk edit (see below) |
 | `sel none` | Clear the selection |
+| `sel category = <name>` | Categorize everything selected; a blank name undoes it |
+| `sel vendor = <name>` | Point everything selected at that vendor |
+| `sel tag = <name>` / `sel untag = <name>` | Add or remove a tag across the selection (see below) |
+| `sel trip = <name>` / `sel untrip` | Put the selection on a trip, or take it off one |
 | `filter <text>` | Search description, vendor name, and raw vendor name |
 | `filter <field>:<text>` | Search one of `description`, `vendor`, `raw` |
 | `filter` | Clear the text filter |
@@ -130,8 +139,28 @@ click it, to select it (`enter` does the same). `sel all` selects every transact
 table is currently showing and `sel none` clears the selection; the status line shows
 `N selected` whenever it is non-empty. Once anything is selected, `ctrl+n` and `ctrl+t`
 prefill `sel vendor = ` / `sel category = ` instead of their usual single-vendor
-commands, ready for the bulk vendor/category edit that fills in those commands in a
-later release.
+commands.
+
+The `sel` commands then edit everything selected at once:
+
+```text
+sel category = Groceries    sel category =           (blank undoes it)
+sel vendor = Blue Bottle
+sel tag = reimbursable      sel untag = reimbursable
+sel trip = Japan 2026       sel untrip
+```
+
+These are the only writes in the app that act on the rows you picked. Everything else —
+`rename`, `categorize`, both kinds of rule — keys off a *vendor* and hits every
+transaction that vendor has, which is exactly what you cannot use when two rows share a
+vendor and only one of them belongs on the trip. `sel vendor` is the per-row counterpart
+of `rename`: it repoints just the selected transactions, and joins them to an existing
+display group if one already has that name.
+
+The selection survives an edit, so you can set a category and then a tag on the same rows
+without reselecting. It does not survive rows leaving the table: after any reload,
+anything no longer listed is dropped from the selection, so a bulk edit can never reach
+transactions you cannot see.
 
 ### The command line
 
@@ -164,6 +193,8 @@ budget list --category "Food > Dining"   # a full path, once categories are nest
 budget list --vendor Coffee          # accepts a raw name or an override name
 budget list --search cava            # substring, across all three text fields
 budget list --search Kindle --search-in vendor
+budget list --tag reimbursable       # combines with --trip (see "Tags and trips")
+budget list --trip "Japan 2026"
 
 # Give a raw vendor string a readable display name.
 budget rename "COFFEE SHOP A" "Coffee"
@@ -175,6 +206,12 @@ budget categorize "COFFEE SHOP A" --clear
 # Categorise by pattern instead, now and on every future import.
 budget category-rule add "*COFFEE*" "Dining"
 budget category-rule list
+
+# Tags and trips: list, rename, delete (tagging itself is the app's multi-select).
+budget tags list
+budget tags list --kind trip
+budget tags rename japan "Japan 2026"
+budget tags delete japan --yes    # without --yes, says what it would unlink
 budget category-rule remove "*COFFEE*"
 budget category-rule apply
 
@@ -397,6 +434,70 @@ number next to its own children.
 
 `budget list --category` and the `category` command both accept either a bare name or a
 full path (`"Food > Dining"`, using `>` as the separator).
+
+### Tags and trips
+
+A category answers "what was this?" and every transaction has exactly one. A **tag**
+answers anything else you want to ask later — `reimbursable`, `gift`, `one-off` — and a
+transaction can carry as many as you like, or none.
+
+A **trip** is a tag with one extra rule: a transaction can be on **at most one**. Trips
+name a journey (`Japan 2026`), and travel spending is only worth totaling if each
+transaction belongs to one trip and no more; overlapping trips would double-count the
+same money. Putting a transaction on a second trip therefore moves it rather than adding
+to it, so a trip's total is always the real total.
+
+Tags and trips share a table but not a namespace: uniqueness is on the name *and* the
+kind, so a trip `Japan 2026` and an ordinary tag `japan` can both exist without either
+shadowing the other. Every lookup says which kind it means.
+
+Tagging happens through the multi-select — see "Selecting several transactions at once"
+above. Pick the rows, then:
+
+```text
+sel tag = reimbursable      sel untag = reimbursable
+sel trip = Japan 2026       sel untrip
+```
+
+Naming a tag or trip that does not exist yet creates it, so there is no separate "make a
+trip" step; a trip with nothing on it still appears in the sidebar, because otherwise
+there would be no way to fill it.
+
+The sidebar's **Tags** and **Trips** sections filter the table the same way Accounts,
+Vendors, and Categories do, and they combine: a tag filter and a trip filter together
+show what you tagged `reimbursable` *on* the `Japan 2026` trip. Because every total in
+the app is built on the same filtered query, a tag or trip filter also scopes the totals
+line, the statistics breakdown, the chart, and the share panel — so `stats` under a trip
+filter is that trip's spending by category.
+
+Each row's trip and tags show in the transaction table's last column, the trip first with
+a `✈` and ordinary tags with a `#`:
+
+```text
+Tags
+✈Japan 2026 #reimbursable
+```
+
+From the command line:
+
+```bash
+budget tags list                      # name, kind, count, total
+budget tags list --kind trip          # just the trips
+budget tags rename japan "Japan 2026"
+budget tags delete japan --yes        # without --yes, says what it would unlink
+
+budget list --tag reimbursable        # filter, and combine with --trip
+budget list --trip "Japan 2026"
+```
+
+There is deliberately no command-line way to *put* a tag on a transaction: the CLI has no
+way to pick individual transactions, which is what the app's multi-select is for.
+
+One thing to know about the counts and totals shown next to a tag in the sidebar and in
+`budget tags list`: like the category sidebar, they sum raw amounts across currencies and
+do not exclude transfers, so they will not always match the totals line, which converts
+to your home currency and leaves transfers out. Use the totals line, `stats`, or
+`budget list --tag` for a figure you intend to rely on.
 
 ### Statistics
 
