@@ -554,6 +554,18 @@ category with no mapping of its own inherits its nearest mapped ancestor's bucke
 `Food` covers `Food > Dining` without a row of its own), or falls back to `misc` if nothing
 above it is mapped either.
 
+A **Cost/day** column divides each trip's cost by how long it lasted, both ends counted,
+and each bucket's cost by the same denominator — so a trip's `food` line reads as what you
+spent on food per day of it. It is blank for a trip with no dates: that is no denominator
+at all, not a daily cost of zero. This is another reason the dates are worth correcting —
+a flight booked months ahead does not just move the start, it stretches the denominator
+and halves the apparent daily cost.
+
+A closing **TOTAL** row sums every trip: all travel in one line, with its own bar. Its
+Cost/day divides by the days actually *traveled*, added up per trip, rather than by the
+span from the first trip to the last — the months at home in between are not days that
+money was spent over.
+
 A trip's **start and end are two separate columns**, and both are taken from the earliest
 and latest transaction on it. That is right most of the time and wrong in the two cases
 that matter: a flight booked months ahead drags the start back to the booking, and a trip

@@ -862,3 +862,56 @@ def test_setting_one_end_is_checked_against_the_other_as_it_stands(tmp_path):
     with session_factory() as session:
         with pytest.raises(ValueError, match="cannot end before it starts"):
             tags.set_trip_dates(session, "Japan 2026", start=date(2026, 4, 1))
+
+
+# ------------------------------------------------------------------- days / cost per day
+
+
+def test_days_counts_both_ends(tmp_path):
+    """Inclusive, so a trip that left and returned the same day is one day, not zero --
+    it is the denominator of a cost per day."""
+    session_factory = _session_factory(tmp_path)
+    _one_txn_trip(session_factory)
+    with session_factory() as session:
+        assert queries.get_trips(session)[0].days == 1
+        tags.set_trip_dates(session, "Japan 2026", date(2026, 3, 1), date(2026, 3, 10))
+        session.commit()
+    with session_factory() as session:
+        assert queries.get_trips(session)[0].days == 10
+
+
+def test_days_is_none_without_dates(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        tags.get_or_create(session, "Someday", tags.TRIP)
+        session.commit()
+    with session_factory() as session:
+        assert queries.get_trips(session)[0].days is None
+
+
+def test_correcting_a_start_changes_the_daily_cost(tmp_path):
+    """The point of being able to fix the dates: a booking months early does not just
+    move the start, it stretches the denominator and halves the apparent daily cost."""
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        currency, accounts = _seed(session)
+        checking = accounts["Checking"]
+        booking = _txn(session, currency, checking, date(2026, 1, 5), -60_000, "Flight")
+        onsite = _txn(session, currency, checking, date(2026, 3, 10), -40_000, "Hotel")
+        session.commit()
+        ids = [booking.id, onsite.id]
+
+    with session_factory() as session:
+        tags.set_trip(session, ids, "Japan 2026")
+        session.commit()
+
+    with session_factory() as session:
+        derived = queries.get_trips(session)[0]
+        assert derived.days == 65  # 2026-01-05 .. 2026-03-10, dragged back by the booking
+        tags.set_trip_dates(session, "Japan 2026", date(2026, 3, 8), date(2026, 3, 12))
+        session.commit()
+
+    with session_factory() as session:
+        corrected = queries.get_trips(session)[0]
+        assert corrected.days == 5
+        assert corrected.total_minor == derived.total_minor  # the cost never moved

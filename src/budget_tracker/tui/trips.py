@@ -59,6 +59,21 @@ def _cost_cell(minor: int) -> Text:
     return Text(_fmt_amount(minor), style="green" if minor < 0 else "red", justify="right")
 
 
+def _per_day_cell(minor: int, days: Optional[int]) -> Text:
+    """Cost per day of the trip, or blank when there are no dates to divide by.
+
+    Blank rather than zero: a trip with no dates has no *unknown* daily cost, it has
+    no denominator at all, and a "0.00" would read as a trip that cost nothing a day.
+    Colored like the cost beside it (see :func:`_cost_cell`) so the two agree.
+    """
+    if not days:
+        return Text("")
+    per_day = round(minor / days)
+    return Text(
+        _fmt_amount(per_day), style="green" if per_day < 0 else "red", justify="right"
+    )
+
+
 class TripTable(DataTable):
     """The trips table, which opens with no trip highlighted.
 
@@ -100,7 +115,12 @@ class TripTable(DataTable):
 START_WIDTH = 11
 END_WIDTH = 11
 TRIP_WIDTH = 22
-COST_WIDTH = 12
+# 10 rather than 12: a trip is not a lifetime of spending, and "99,999.99" is already
+# well past any of them. The two columns the trim pays for -- Cost/day -- land the bar
+# back on exactly 100 at the user's terminal, which is worth more than headroom no trip
+# will use (see bar_width, and the render test that checks this rather than trusting it).
+COST_WIDTH = 10
+COST_PER_DAY_WIDTH = 9
 # DataTable pads every column two cells (one each side), matching every other table's
 # own column-budget comments in this app (see e.g. tui/chart.py's fill_chart).
 COLUMN_PADDING = 2
@@ -130,6 +150,7 @@ def bar_width(main_panel_width: int) -> int:
         - (END_WIDTH + COLUMN_PADDING)
         - (TRIP_WIDTH + COLUMN_PADDING)
         - (COST_WIDTH + COLUMN_PADDING)
+        - (COST_PER_DAY_WIDTH + COLUMN_PADDING)
         - COLUMN_PADDING  # Breakdown's own
     )
     for width in BAR_WIDTHS:
@@ -257,6 +278,7 @@ def fill_trips(
     table.add_column("End", width=END_WIDTH)
     table.add_column("Trip", width=TRIP_WIDTH)
     table.add_column("Cost", width=COST_WIDTH)
+    table.add_column("Cost/day", width=COST_PER_DAY_WIDTH)
     table.add_column("Breakdown", width=width)
 
     foldable_ids = {row.id for row in rows}
@@ -270,6 +292,7 @@ def fill_trips(
             _date_cell(row.end, row.end_is_manual),
             _truncate(label, TRIP_WIDTH),
             _cost_cell(row.total_minor),
+            _per_day_cell(row.total_minor, row.days),
             _bar_text(row.buckets, width),
         )
         if not is_expanded:
@@ -294,9 +317,45 @@ def fill_trips(
                 "",  # End
                 Text(f"  {bucket}", style=BUCKET_COLORS[index]),
                 _cost_cell(cost),
+                _per_day_cell(cost, row.days),
                 Text(_fmt_share(share), style=BUCKET_COLORS[index], justify="right"),
             )
+    _add_total_row(table, rows, width)
     return panel_rows, foldable_ids
+
+
+def _add_total_row(table: DataTable, rows: List[TripRow], width: int) -> None:
+    """A closing row summing every trip: all travel, in one line.
+
+    Deliberately **not** appended to ``panel_rows``, exactly as
+    ``stats._add_stats_total_row`` is left out of ``stats_rows``: every bounds check
+    that maps a cursor row back to a trip then rejects it for free, so the total cannot
+    be folded or drilled into and no caller needs a special case for it.
+
+    Its Cost/day divides by the total number of days *traveled*, summed per trip, not
+    by the span from the first trip to the last -- the months at home between trips are
+    not days anyone spent this money over. Trips without dates contribute their cost but
+    no days, which is the honest treatment: leaving them out of the total entirely would
+    make it disagree with the column above it.
+
+    No trips, no total: a lone "TOTAL 0.00" reads as a result, where an empty table
+    plainly says there is nothing here.
+    """
+    if not rows:
+        return
+    total = sum(row.total_minor for row in rows)
+    buckets = tuple(
+        sum(row.buckets[index] for row in rows) for index in range(len(trips_module.BUCKETS))
+    )
+    days = sum(row.days or 0 for row in rows)
+    table.add_row(
+        "",
+        "",
+        Text("TOTAL", style="bold"),
+        _cost_cell(total),
+        _per_day_cell(total, days),
+        _bar_text(buckets, width),
+    )
 
 
 def _fmt_share(share: float) -> str:

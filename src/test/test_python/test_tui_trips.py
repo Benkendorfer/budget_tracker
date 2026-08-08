@@ -162,7 +162,13 @@ def _seed_trip_with_uncategorized(tmp_path, monkeypatch):
 # so the trip's own name sits at 2 rather than 1.
 TRIP_CELL = 2
 COST_CELL = 3
-SHARE_CELL = 4
+PER_DAY_CELL = 4
+SHARE_CELL = 5
+
+# fill_trips closes with a TOTAL row that is deliberately absent from the parallel
+# panel_rows list (see trips_panel._add_total_row), so rendered rows are one more than
+# the trips-and-buckets the cursor can actually land on.
+TOTAL_ROWS = 1
 
 
 def _trip_rows(app):
@@ -266,6 +272,7 @@ def test_trips_command_opens_the_panel_and_lists_every_trip(tmp_path, monkeypatc
     assert [row[TRIP_CELL] for row in rows] == [
         f"{FOLD_INDICATOR} Japan 2026",
         f"{FOLD_INDICATOR} Peru 2025",
+        "TOTAL",  # the closing summary row -- see trips_panel._add_total_row
     ]
     # Both derived from the transactions, so both marked.
     assert rows[0][0] == "2026-03-02*"
@@ -324,10 +331,11 @@ def test_space_unfolds_a_trip_into_its_buckets(tmp_path, monkeypatch):
     # printed as rows of zeros. Peru 2025 stays folded (it was never toggled), so it
     # keeps its own indicator.
     assert _bucket_names(unfolded) == [trips_module.AIRFARE, trips_module.HOTEL]
-    assert len(unfolded) == 1 + 2 + 1
+    assert len(unfolded) == 1 + 2 + 1 + TOTAL_ROWS
     unfolded_names = [row[TRIP_CELL].strip() for row in unfolded]
     assert unfolded_names[0] == "Japan 2026"
-    assert unfolded_names[-1] == f"{FOLD_INDICATOR} Peru 2025"
+    assert unfolded_names[-2] == f"{FOLD_INDICATOR} Peru 2025"
+    assert unfolded_names[-1] == "TOTAL"
     assert refolded == folded
 
 
@@ -381,10 +389,14 @@ def test_f_folds_and_unfolds_every_trip_at_once(tmp_path, monkeypatch):
     # Airfare and a Hotel transaction, and Peru 2025 has none at all, so it unfolds to
     # nothing. None of the rows carry the FOLD_INDICATOR while everything is open.
     assert _bucket_names(unfolded_all) == [trips_module.AIRFARE, trips_module.HOTEL]
-    assert len(unfolded_all) == 2 + 2
+    assert len(unfolded_all) == 2 + 2 + TOTAL_ROWS
     assert all(FOLD_INDICATOR not in row[TRIP_CELL] for row in unfolded_all)
-    assert len(folded_all) == 2
-    assert all(FOLD_INDICATOR in row[TRIP_CELL] for row in folded_all)
+    assert len(folded_all) == 2 + TOTAL_ROWS
+    assert all(
+        FOLD_INDICATOR in row[TRIP_CELL]
+        for row in folded_all
+        if row[TRIP_CELL] != "TOTAL"
+    )
 
 
 def test_folding_does_not_change_any_numbers(tmp_path, monkeypatch):
@@ -1288,3 +1300,94 @@ def test_a_start_past_the_derived_end_warns_but_is_kept(tmp_path, monkeypatch):
     assert "start is now after its end" not in settled.message
     assert row[0] == "2026-04-01"  # kept, not rejected
     assert row[1] == "2026-04-10"
+
+
+# ------------------------------------------------------------- cost/day and the total
+
+
+def test_the_panel_shows_a_cost_per_day(tmp_path, monkeypatch):
+    _seed_trips(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(213, 40)) as pilot:
+            app._run_command("trips")
+            await pilot.pause()
+            headers = [str(c.label) for c in app.query_one("#trip_table", DataTable).columns.values()]
+            return headers, _trip_rows(app)
+
+    headers, rows = asyncio.run(run())
+    assert headers == ["Start", "End", "Trip", "Cost", "Cost/day", "Breakdown"]
+    # 800.00 over 2026-03-02..03-14, both ends counted -> 13 days.
+    assert rows[0][COST_CELL] == "800.00"
+    assert rows[0][PER_DAY_CELL] == "61.54"
+    # A trip with no dates has no denominator, so the cell is blank rather than 0.00.
+    assert rows[1][PER_DAY_CELL] == ""
+
+
+def test_the_total_row_sums_every_trip(tmp_path, monkeypatch):
+    _seed_trips(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(213, 40)) as pilot:
+            app._run_command("trips")
+            await pilot.pause()
+            return _trip_rows(app)
+
+    rows = asyncio.run(run())
+    total = rows[-1]
+    assert total[TRIP_CELL] == "TOTAL"
+    assert total[COST_CELL] == "800.00"  # the empty trip contributes nothing
+    # Days are the days actually traveled, summed per trip -- not the span from the
+    # first trip to the last, which would include the months at home in between.
+    assert total[PER_DAY_CELL] == "61.54"
+    assert total[0] == "" and total[1] == ""
+
+
+def test_the_total_row_cannot_be_folded_or_drilled_into(tmp_path, monkeypatch):
+    """It is deliberately absent from panel_rows, so every bounds check rejects it and
+    no caller needs a special case."""
+    _seed_trips(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(213, 40)) as pilot:
+            app._run_command("trips")
+            await pilot.pause()
+            table = app.query_one("#trip_table", DataTable)
+            table.focus()
+            table.move_cursor(row=table.row_count - 1)  # the TOTAL row
+            await pilot.press("space")
+            await pilot.pause()
+            after_space = (app._panel, len(_trip_rows(app)))
+            await pilot.press("right")
+            await pilot.pause()
+            return after_space, app._panel
+
+    after_space, panel_after_right = asyncio.run(run())
+    assert after_space == ("trips", 3)  # unchanged: 2 trips + TOTAL
+    assert panel_after_right == "trips"  # right arrow did not drill anywhere
+
+
+def test_a_bucket_row_shows_its_own_cost_per_day(tmp_path, monkeypatch):
+    """Same denominator as the trip, so the bucket figures add up to the trip's."""
+    _seed_trips(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(213, 40)) as pilot:
+            app._run_command("trips")
+            await pilot.pause()
+            table = app.query_one("#trip_table", DataTable)
+            table.focus()
+            table.move_cursor(row=0)
+            await pilot.press("space")
+            await pilot.pause()
+            return _trip_rows(app)
+
+    rows = asyncio.run(run())
+    airfare = _bucket_row(rows, trips_module.AIRFARE)
+    hotel = _bucket_row(rows, trips_module.HOTEL)
+    assert airfare[COST_CELL] == "500.00" and airfare[PER_DAY_CELL] == "38.46"
+    assert hotel[COST_CELL] == "300.00" and hotel[PER_DAY_CELL] == "23.08"

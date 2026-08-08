@@ -332,3 +332,55 @@ def test_trips_dates_warns_when_one_end_lands_past_the_derived_other(
     # Finishing the correction clears it.
     assert cli.main(["trips", "dates", "Coffee Trip", "--end", "2025-08-10"]) == 0
     assert "start is now after its end" not in capsys.readouterr().out
+
+
+def test_trips_list_shows_a_cost_per_day_and_a_total(tmp_path, monkeypatch, capsys):
+    session_factory = _setup(tmp_path, monkeypatch)
+    _trip_fixture(session_factory, _txn_ids(session_factory, "COFFEE SHOP A"), "Coffee Trip")
+
+    assert cli.main(["trips"]) == 0
+    out = capsys.readouterr().out
+    header, trip, total = [line for line in out.splitlines() if line.strip()][:3]
+    assert "Cost/day" in header
+    # 6.50 over 2025-07-02..07-04, both ends counted -> 3 days.
+    assert "2.17" in trip
+    assert total.strip().startswith("TOTAL")
+    assert "6.50" in total
+    assert "2.17" in total
+
+
+def test_the_cli_total_divides_by_days_traveled_not_the_whole_span(
+    tmp_path, monkeypatch, capsys
+):
+    """Two short trips months apart: the months at home in between are not days this
+    money was spent over."""
+    session_factory = _setup(tmp_path, monkeypatch)
+    _trip_fixture(session_factory, _txn_ids(session_factory, "COFFEE SHOP A"), "Trip One")
+    _trip_fixture(session_factory, _txn_ids(session_factory, "COFFEE SHOP B"), "Trip Two")
+
+    assert cli.main(["trips"]) == 0
+    total = [l for l in capsys.readouterr().out.splitlines() if "TOTAL" in l][0]
+    # Trip One: 6.50 over 3 days. Trip Two: 4.00 over 1 day, so 4 days traveled --
+    # not the 3 weeks between them. 1050 / 4 = 262.5 minor units, which Python's
+    # round() takes to the even 262; the panel shares the same rounding, so the two
+    # surfaces cannot disagree.
+    assert "10.50" in total
+    assert "2.62" in total
+
+
+def test_a_trip_with_no_dates_contributes_cost_but_no_days(tmp_path, monkeypatch, capsys):
+    """Leaving it out of the total entirely would make the total disagree with the
+    column above it."""
+    session_factory = _setup(tmp_path, monkeypatch)
+    _trip_fixture(session_factory, _txn_ids(session_factory, "COFFEE SHOP A"), "Coffee Trip")
+    with session_factory() as session:
+        tags.get_or_create(session, "Someday", tags.TRIP)
+        session.commit()
+
+    assert cli.main(["trips"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    someday = [l for l in lines if "Someday" in l][0]
+    total = [l for l in lines if "TOTAL" in l][0]
+    assert someday.split()[-1] == "txns" or "0 txns" in someday
+    assert "6.50" in total  # unchanged by the dateless trip
+    assert "2.17" in total  # and its missing days did not dilute the rate

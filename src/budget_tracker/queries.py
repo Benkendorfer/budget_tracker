@@ -1244,6 +1244,21 @@ class TripRow:
     start_is_manual: bool = False
     end_is_manual: bool = False
 
+    @property
+    def days(self) -> Optional[int]:
+        """How long the trip lasted, both ends counted -- ``None`` without dates.
+
+        Inclusive, so a trip that left and returned on the same day is one day and not
+        zero: it is the denominator of a cost per day, and a zero would make that
+        undefined for the shortest trips rather than for none of them. This is one more
+        reason the dates are worth correcting by hand -- a booking months early does not
+        just move the start, it stretches the denominator and halves the apparent daily
+        cost.
+        """
+        if self.start is None or self.end is None:
+            return None
+        return (self.end - self.start).days + 1
+
 
 def get_trips(session: Session, home_currency: str = HOME_CURRENCY) -> List[TripRow]:
     """Every trip with its dates, cost, and per-bucket breakdown.

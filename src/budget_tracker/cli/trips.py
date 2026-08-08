@@ -30,7 +30,7 @@ def _format_date(day: Optional[date]) -> str:
     return day.isoformat() if day is not None else ""
 
 
-def _format_breakdown(row: queries.TripRow) -> str:
+def _format_breakdown(buckets) -> str:
     """Per-bucket percentages, skipping any bucket the trip spent nothing in.
 
     A bucket whose net is a refund (negative -- see ``queries.get_trips``) is clamped
@@ -41,7 +41,7 @@ def _format_breakdown(row: queries.TripRow) -> str:
     to ``0%``, which reads as a bug rather than as "small", so it prints ``<1%``. The
     panel does the same thing at its own precision (``<0.1%``).
     """
-    clamped = [max(cost, 0) for cost in row.buckets]
+    clamped = [max(cost, 0) for cost in buckets]
     denominator = sum(clamped)
     if denominator <= 0:
         return ""
@@ -58,8 +58,11 @@ def _print_trips(rows) -> None:
     if not rows:
         print("No trips yet.")
         return
-    name_width = max(len(r.name) for r in rows)
-    print(f"  {'Start':<11} {'End':<11} {'Trip':<{name_width}}")
+    name_width = max([len(r.name) for r in rows] + [len("TOTAL")])
+    print(
+        f"  {'Start':<11} {'End':<11} {'Trip':<{name_width}}  "
+        f"{'Txns':>11}  {'Cost':>12}  {'Cost/day':>9}"
+    )
     for row in rows:
         # A trailing "*" marks a date *derived* from the trip's transactions rather than
         # set by hand -- the flag belongs on the app's guess, which may well be wrong,
@@ -72,8 +75,42 @@ def _print_trips(rows) -> None:
         print(
             f"  {start:<11} {end:<11} {row.name:<{name_width}}  "
             f"{row.count:>6} txns  {row.total_minor / 100:>12,.2f}  "
-            f"{_format_breakdown(row)}"
+            f"{_per_day(row.total_minor, row.days):>9}  "
+            f"{_format_breakdown(row.buckets)}"
         )
+    _print_total(rows, name_width)
+
+
+def _per_day(minor: int, days: Optional[int]) -> str:
+    """Cost per day, or blank without dates to divide by -- see ``queries.TripRow.days``.
+
+    Blank rather than ``0.00``: a trip with no dates has no denominator at all, and a
+    zero would read as a trip that cost nothing a day.
+    """
+    return f"{round(minor / days) / 100:,.2f}" if days else ""
+
+
+def _print_total(rows, name_width: int) -> None:
+    """A closing row summing every trip -- all travel, in one line.
+
+    Cost/day divides by the days actually *traveled*, summed per trip, not by the span
+    from the first trip to the last: the months at home in between are not days this
+    money was spent over. A trip with no dates contributes its cost but no days, so the
+    total still agrees with the column above it.
+    """
+    total = sum(row.total_minor for row in rows)
+    days = sum(row.days or 0 for row in rows)
+    count = sum(row.count for row in rows)
+    totals = [
+        sum(row.buckets[index] for row in rows)
+        for index in range(len(trips_module.BUCKETS))
+    ]
+    print(
+        f"  {'':<11} {'':<11} {'TOTAL':<{name_width}}  "
+        f"{count:>6} txns  {total / 100:>12,.2f}  "
+        f"{_per_day(total, days):>9}  "
+        f"{_format_breakdown(totals)}"
+    )
 
 
 def _print_buckets(grouped) -> None:
