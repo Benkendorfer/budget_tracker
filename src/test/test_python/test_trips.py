@@ -811,3 +811,54 @@ def test_manual_dates_survive_on_a_database_that_predates_the_columns(tmp_path):
     with session_factory() as session:
         row = queries.get_trips(session)[0]
         assert (row.start, row.end) == (date(2026, 3, 8), date(2026, 3, 20))
+
+
+def test_set_trip_dates_leaves_an_end_it_is_not_given(tmp_path):
+    """KEEP, None and a date are three different instructions, not two: leaving an end
+    alone is not the same as forgetting its override."""
+    session_factory = _session_factory(tmp_path)
+    _one_txn_trip(session_factory)
+    with session_factory() as session:
+        tags.set_trip_dates(session, "Japan 2026", date(2026, 3, 1), date(2026, 3, 20))
+        session.commit()
+
+    with session_factory() as session:
+        # Only the start named: the end's override must survive untouched.
+        tags.set_trip_dates(session, "Japan 2026", start=date(2026, 3, 5))
+        session.commit()
+
+    with session_factory() as session:
+        row = queries.get_trips(session)[0]
+        assert (row.start, row.end) == (date(2026, 3, 5), date(2026, 3, 20))
+        assert (row.start_is_manual, row.end_is_manual) == (True, True)
+
+
+def test_clearing_one_end_leaves_the_other_overridden(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    _one_txn_trip(session_factory)
+    with session_factory() as session:
+        tags.set_trip_dates(session, "Japan 2026", date(2026, 3, 1), date(2026, 3, 20))
+        session.commit()
+
+    with session_factory() as session:
+        tags.set_trip_dates(session, "Japan 2026", start=None)  # derive the start again
+        session.commit()
+
+    with session_factory() as session:
+        row = queries.get_trips(session)[0]
+        assert row.start == date(2026, 3, 10)  # back to the transaction's own date
+        assert row.end == date(2026, 3, 20)  # still overridden
+        assert (row.start_is_manual, row.end_is_manual) == (False, True)
+
+
+def test_setting_one_end_is_checked_against_the_other_as_it_stands(tmp_path):
+    """Otherwise setting one end could quietly invert it against the other's override."""
+    session_factory = _session_factory(tmp_path)
+    _one_txn_trip(session_factory)
+    with session_factory() as session:
+        tags.set_trip_dates(session, "Japan 2026", None, date(2026, 3, 5))
+        session.commit()
+
+    with session_factory() as session:
+        with pytest.raises(ValueError, match="cannot end before it starts"):
+            tags.set_trip_dates(session, "Japan 2026", start=date(2026, 4, 1))

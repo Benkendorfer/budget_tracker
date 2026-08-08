@@ -61,12 +61,14 @@ def _print_trips(rows) -> None:
     name_width = max(len(r.name) for r in rows)
     print(f"  {'Start':<11} {'End':<11} {'Trip':<{name_width}}")
     for row in rows:
-        # A trailing "*" marks a date set by hand rather than derived from the trip's
-        # transactions, so a corrected date is distinguishable from one that happened to
-        # line up -- otherwise the override is invisible and unexplainable later. Marked
-        # per end, since overriding one and leaving the other derived is the usual case.
-        start = _format_date(row.start) + ("*" if row.start_is_manual else "")
-        end = _format_date(row.end) + ("*" if row.end_is_manual else "")
+        # A trailing "*" marks a date *derived* from the trip's transactions rather than
+        # set by hand -- the flag belongs on the app's guess, which may well be wrong,
+        # not on the one fact on the row nobody needs to check. Marked per end, since
+        # correcting one and leaving the other derived is the usual case.
+        # A trip with no transactions and no override has nothing to mark, so the
+        # marker is appended only where there is a date to qualify.
+        start = _format_date(row.start) + ("*" if row.start and not row.start_is_manual else "")
+        end = _format_date(row.end) + ("*" if row.end and not row.end_is_manual else "")
         print(
             f"  {start:<11} {end:<11} {row.name:<{name_width}}  "
             f"{row.count:>6} txns  {row.total_minor / 100:>12,.2f}  "
@@ -134,18 +136,30 @@ def _cmd_trips(args: argparse.Namespace) -> int:
             return 0
 
         if command == "dates":
+            # --start/--end are separate flags, not two positionals, so either end can
+            # be set on its own without the user having to restate the other. An end
+            # not named is left exactly as it is (tags.KEEP), which is different from
+            # --clear, which forgets both overrides and derives them again.
             if args.clear:
                 start = end = None
             else:
-                if args.start is None or args.end is None:
+                if args.start is None and args.end is None:
                     print(
-                        "Usage: budget trips dates <trip> <start> <end>, "
-                        "or --clear to go back to deriving them."
+                        "Usage: budget trips dates <trip> [--start YYYY-MM-DD] "
+                        "[--end YYYY-MM-DD], or --clear to derive them again."
                     )
                     return 1
                 try:
-                    start = date.fromisoformat(args.start)
-                    end = date.fromisoformat(args.end)
+                    start = (
+                        date.fromisoformat(args.start)
+                        if args.start is not None
+                        else tags_module.KEEP
+                    )
+                    end = (
+                        date.fromisoformat(args.end)
+                        if args.end is not None
+                        else tags_module.KEEP
+                    )
                 except ValueError:
                     print("Dates must be YYYY-MM-DD.")
                     return 1
@@ -160,8 +174,22 @@ def _cmd_trips(args: argparse.Namespace) -> int:
             session.commit()
             if args.clear:
                 print(f"{args.trip!r}: dates back to whatever its transactions say.")
+            elif end is tags_module.KEEP:
+                print(f"{args.trip!r}: starts {start}.")
+            elif start is tags_module.KEEP:
+                print(f"{args.trip!r}: ends {end}.")
             else:
                 print(f"{args.trip!r}: {start} .. {end}.")
+            # Setting one end is checked against the other's *override*, which is where
+            # to refuse outright. The end shown may still be the derived one, though,
+            # and a manual start after a derived end reads as a trip that ended before
+            # it began. Refusing would make correcting both ends one at a time
+            # impossible, so say so and let the user finish.
+            shown = next(
+                (r for r in queries.get_trips(session) if r.name == args.trip), None
+            )
+            if shown and shown.start and shown.end and shown.start > shown.end:
+                print("  Its start is now after its end; set the other end too.")
             return 0
 
         # "list"

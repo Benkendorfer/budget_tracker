@@ -235,15 +235,15 @@ def test_trips_dates_overrides_the_derived_dates(tmp_path, monkeypatch, capsys):
     ids = _txn_ids(session_factory, "COFFEE SHOP A")
     _trip_fixture(session_factory, ids, "Coffee Trip")
 
-    assert cli.main(["trips", "dates", "Coffee Trip", "2025-06-30", "2025-07-10"]) == 0
+    assert cli.main(["trips", "dates", "Coffee Trip", "--start", "2025-06-30", "--end", "2025-07-10"]) == 0
     capsys.readouterr()
 
     assert cli.main(["trips"]) == 0
     out = capsys.readouterr().out
     assert "2025-06-30" in out
     assert "2025-07-10" in out
-    # A trailing marker distinguishes a corrected trip from one that happened to line up.
-    assert "2025-07-10*" in out
+    # The marker is on the app's guess, not the correction, so a hand-set date is plain.
+    assert "2025-07-10*" not in out
 
 
 def test_trips_list_has_separate_start_and_end_columns(tmp_path, monkeypatch, capsys):
@@ -260,7 +260,7 @@ def test_trips_list_has_separate_start_and_end_columns(tmp_path, monkeypatch, ca
 def test_trips_dates_clear_goes_back_to_deriving_them(tmp_path, monkeypatch, capsys):
     session_factory = _setup(tmp_path, monkeypatch)
     _trip_fixture(session_factory, _txn_ids(session_factory, "COFFEE SHOP A"), "Coffee Trip")
-    assert cli.main(["trips", "dates", "Coffee Trip", "2020-01-01", "2020-01-02"]) == 0
+    assert cli.main(["trips", "dates", "Coffee Trip", "--start", "2020-01-01", "--end", "2020-01-02"]) == 0
     capsys.readouterr()
 
     assert cli.main(["trips", "dates", "Coffee Trip", "--clear"]) == 0
@@ -268,15 +268,14 @@ def test_trips_dates_clear_goes_back_to_deriving_them(tmp_path, monkeypatch, cap
     assert cli.main(["trips"]) == 0
     out = capsys.readouterr().out
     assert "2020-01-01" not in out
-    assert "2025-07-02" in out  # the derived start is back
-    assert "*" not in out
+    assert "2025-07-02*" in out  # the derived start is back, and flagged as derived
 
 
 def test_trips_dates_rejects_an_end_before_the_start(tmp_path, monkeypatch, capsys):
     session_factory = _setup(tmp_path, monkeypatch)
     _trip_fixture(session_factory, _txn_ids(session_factory, "COFFEE SHOP A"), "Coffee Trip")
 
-    assert cli.main(["trips", "dates", "Coffee Trip", "2025-08-01", "2025-07-01"]) == 1
+    assert cli.main(["trips", "dates", "Coffee Trip", "--start", "2025-08-01", "--end", "2025-07-01"]) == 1
     assert "cannot end before it starts" in capsys.readouterr().out
 
 
@@ -284,19 +283,52 @@ def test_trips_dates_rejects_a_malformed_date(tmp_path, monkeypatch, capsys):
     session_factory = _setup(tmp_path, monkeypatch)
     _trip_fixture(session_factory, _txn_ids(session_factory, "COFFEE SHOP A"), "Coffee Trip")
 
-    assert cli.main(["trips", "dates", "Coffee Trip", "last tuesday", "2025-07-01"]) == 1
+    assert cli.main(["trips", "dates", "Coffee Trip", "--start", "last tuesday"]) == 1
     assert "YYYY-MM-DD" in capsys.readouterr().out
 
 
 def test_trips_dates_reports_an_unknown_trip(tmp_path, monkeypatch, capsys):
     _setup(tmp_path, monkeypatch)
-    assert cli.main(["trips", "dates", "Nowhere", "2025-01-01", "2025-01-02"]) == 1
+    assert cli.main(["trips", "dates", "Nowhere", "--start", "2025-01-01"]) == 1
     assert "No trip named 'Nowhere'." in capsys.readouterr().out
 
 
-def test_trips_dates_without_both_dates_is_a_usage_error(tmp_path, monkeypatch, capsys):
+def test_trips_dates_with_neither_end_named_is_a_usage_error(tmp_path, monkeypatch, capsys):
     session_factory = _setup(tmp_path, monkeypatch)
     _trip_fixture(session_factory, _txn_ids(session_factory, "COFFEE SHOP A"), "Coffee Trip")
 
-    assert cli.main(["trips", "dates", "Coffee Trip", "2025-07-01"]) == 1
+    assert cli.main(["trips", "dates", "Coffee Trip"]) == 1
     assert "Usage:" in capsys.readouterr().out
+
+
+def test_trips_dates_can_set_just_one_end(tmp_path, monkeypatch, capsys):
+    """--start and --end are independent; the end not named is left exactly as it is,
+    which is different from --clear, which forgets both."""
+    session_factory = _setup(tmp_path, monkeypatch)
+    _trip_fixture(session_factory, _txn_ids(session_factory, "COFFEE SHOP A"), "Coffee Trip")
+
+    assert cli.main(["trips", "dates", "Coffee Trip", "--start", "2025-06-30"]) == 0
+    assert "starts 2025-06-30" in capsys.readouterr().out
+
+    assert cli.main(["trips"]) == 0
+    out = capsys.readouterr().out
+    assert "2025-06-30" in out  # set, so unmarked
+    assert "2025-07-04*" in out  # end untouched, still derived and flagged
+
+
+def test_trips_dates_warns_when_one_end_lands_past_the_derived_other(
+    tmp_path, monkeypatch, capsys
+):
+    """Refusing would make correcting both ends one at a time impossible, which is the
+    reason for setting them separately at all -- so it warns and stores."""
+    session_factory = _setup(tmp_path, monkeypatch)
+    _trip_fixture(session_factory, _txn_ids(session_factory, "COFFEE SHOP A"), "Coffee Trip")
+
+    # Derived end is 2025-07-04; a start past it is stored, with a warning.
+    assert cli.main(["trips", "dates", "Coffee Trip", "--start", "2025-08-01"]) == 0
+    out = capsys.readouterr().out
+    assert "start is now after its end" in out
+
+    # Finishing the correction clears it.
+    assert cli.main(["trips", "dates", "Coffee Trip", "--end", "2025-08-10"]) == 0
+    assert "start is now after its end" not in capsys.readouterr().out

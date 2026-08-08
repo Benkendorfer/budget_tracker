@@ -334,8 +334,10 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     trips_dates.add_argument("trip", help="The trip's name.")
-    trips_dates.add_argument("start", nargs="?", help="Start date, YYYY-MM-DD.")
-    trips_dates.add_argument("end", nargs="?", help="End date, YYYY-MM-DD.")
+    # Flags rather than positionals so either end can be set on its own; the end not
+    # named is left exactly as it is, which --clear does not do.
+    trips_dates.add_argument("--start", help="Start date, YYYY-MM-DD.")
+    trips_dates.add_argument("--end", help="End date, YYYY-MM-DD.")
     trips_dates.add_argument(
         "--clear",
         action="store_true",

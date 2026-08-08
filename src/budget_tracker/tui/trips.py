@@ -139,19 +139,22 @@ def bar_width(main_panel_width: int) -> int:
 
 
 def _date_cell(day, is_manual: bool) -> Text:
-    """One end of a trip, with a ``*`` when it was set by hand.
+    """One end of a trip: dimmed with a ``*`` when it was *derived* rather than set.
 
-    Blank for a trip with nothing to derive it from and no override. The marker is what
-    distinguishes a date the user corrected from one that happened to line up; without
-    it an override is invisible, and a figure nobody can account for is worse than an
-    unfamiliar one. Styled dim as well as marked, so the eye can pick the corrected
-    trips out of a column without reading every row. Matches ``budget trips``'s own
-    ``*``, so a trip reads the same in both.
+    The marker is on the guess, not on the correction. A date taken from the earliest
+    or latest transaction is the app's inference and may well be wrong -- a flight
+    booked months ahead, a last purchase days before flying home -- while a date the
+    user typed is the one fact on the row nobody needs to check. Marking the derived
+    one puts the flag on what still wants attention, and lets a column be scanned for
+    trips that have not been confirmed yet.
+
+    Blank for a trip with nothing to derive it from and no override. Matches
+    ``budget trips``'s own ``*``, so a trip reads the same in both.
     """
     if day is None:
         return Text("")
-    text = day.isoformat() + ("*" if is_manual else "")
-    return Text(text, style="dim" if is_manual else "")
+    text = day.isoformat() + ("" if is_manual else "*")
+    return Text(text, style="" if is_manual else "dim")
 
 
 def _apportion(shares: List[float], width: int) -> List[int]:

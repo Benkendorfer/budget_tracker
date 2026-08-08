@@ -1001,7 +1001,8 @@ class BudgetApp(App):
     TRIP_USAGE = (
         "Usage: trip bucket <category>[, <category>...] = <bucket>   "
         "(blank bucket unmaps it) | trip buckets | "
-        "trip dates <trip> = <start>..<end>   (blank derives them again)"
+        "trip dates <trip> = <start>..<end>   (leave either side of the '..' empty to "
+        "set just the other; blank derives both again)"
     )
 
     def _do_trip(self, arg: str) -> None:
@@ -1041,11 +1042,26 @@ class BudgetApp(App):
             if not separator:
                 self.notify(self.TRIP_USAGE, severity="warning")
                 return
+            # An empty side of the ".." leaves that end alone rather than clearing it,
+            # so "= 2026-05-14.." fixes a start without the user having to restate an
+            # end that was already right. Clearing both is the bare "trip dates X ="
+            # below, matching how every other blank right-hand side in this app undoes.
             try:
-                start = date.fromisoformat(start_text.strip())
-                end = date.fromisoformat(end_text.strip())
+                start = (
+                    date.fromisoformat(start_text.strip())
+                    if start_text.strip()
+                    else tags_module.KEEP
+                )
+                end = (
+                    date.fromisoformat(end_text.strip())
+                    if end_text.strip()
+                    else tags_module.KEEP
+                )
             except ValueError:
                 self.notify("Dates must be YYYY-MM-DD.", severity="error")
+                return
+            if start is tags_module.KEEP and end is tags_module.KEEP:
+                self.notify(self.TRIP_USAGE, severity="warning")
                 return
         else:
             start = end = None
@@ -1064,12 +1080,37 @@ class BudgetApp(App):
             self._build_trips()
             self._fill_trips()
         self.reload()
-        message = (
-            f"{name}: {start} .. {end}"
-            if start
-            else f"{name}: dates back to whatever its transactions say."
-        )
+        if start is None and end is None:
+            message = f"{name}: dates back to whatever its transactions say."
+        elif end is tags_module.KEEP:
+            message = f"{name}: starts {start}."
+        elif start is tags_module.KEEP:
+            message = f"{name}: ends {end}."
+        else:
+            message = f"{name}: {start} .. {end}."
+        # Setting one end is checked against the other's *override*, which is the right
+        # place to refuse outright. But the end the user actually sees may still be the
+        # derived one, and a manual start after a derived end reads as a trip that ended
+        # before it began. Refusing that would make correcting both ends impossible one
+        # at a time -- the reason for setting them separately at all -- so say so and
+        # let them finish.
+        if self._trip_dates_are_inverted(name):
+            message += " Its start is now after its end; set the other end too."
+            self.notify(message, severity="warning", markup=False)
+            return
         self.notify(message, markup=False)
+
+    def _trip_dates_are_inverted(self, name: str) -> bool:
+        """Whether ``name`` now *shows* a start after its end, override or derived."""
+        with self.session_factory() as session:
+            for row in queries.get_trips(session):
+                if row.name == name:
+                    return (
+                        row.start is not None
+                        and row.end is not None
+                        and row.start > row.end
+                    )
+        return False
 
     def _do_trip_bucket(self, arg: str) -> None:
         """``trip bucket <categories> = <bucket>`` -- category (or comma-separated
@@ -1774,6 +1815,11 @@ class BudgetApp(App):
                 "  travel bucket; comma-separate several categories at once, e.g.\n"
                 "  trip bucket Car Rental, Taxi = car — a blank bucket unmaps it\n"
                 "trip buckets — show the bucket map, grouped by bucket\n"
+                "trip dates <trip> = <start>..<end> — set a trip's dates by hand, when\n"
+                "  the ones taken from its transactions are wrong (a flight booked\n"
+                "  months ahead drags the start back). Leave either side of the '..'\n"
+                "  empty to set just the other; a blank right-hand side derives both\n"
+                "  again. Derived dates show dimmed with a '*'\n"
                 "rates — list cached exchange rates (pair, source, span, count)\n"
                 "rates fetch — cache ECB reference rates for every foreign currency\n"
                 "  on file, over its whole date range; runs in the background so the\n"

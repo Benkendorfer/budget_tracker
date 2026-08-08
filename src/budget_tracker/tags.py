@@ -162,29 +162,52 @@ def tags_for(session: Session, txn_ids: Sequence[int]) -> Dict[int, List[Tag]]:
     return result
 
 
+class _Keep:
+    """Sentinel: leave this end of the trip exactly as it is."""
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid only
+        return "KEEP"
+
+
+KEEP = _Keep()
+
+
 def set_trip_dates(
     session: Session,
     name: str,
-    start: Optional[date],
-    end: Optional[date],
+    start=KEEP,
+    end=KEEP,
 ) -> bool:
-    """Override a trip's dates. ``None`` for either goes back to deriving that end.
+    """Override a trip's dates. Returns ``False`` if no trip called ``name`` exists.
 
-    Returns ``False`` if no trip called ``name`` exists. The two ends are independent:
-    passing a start and ``None`` for the end fixes the start and leaves the end derived
-    from the transactions, which is the common case (a flight booked months ahead drags
-    a start back; the end was right all along).
+    Each end takes one of three things, and they are genuinely three, not two:
+
+    :data:`KEEP` (the default)
+        Leave it alone. This is what makes "set only the start" possible without the
+        caller having to know, and restate, whatever the end currently is.
+    ``None``
+        Forget any override and go back to deriving it from the transactions.
+    a ``date``
+        Use this instead of the derived one.
+
+    The ends are independent because correcting one and leaving the other is the
+    ordinary case: a flight booked months ahead drags the derived start back to the
+    booking while the end was right all along.
 
     A start after the end is refused rather than stored -- it would invert the panel's
-    sort and read as a trip that ended before it began.
+    sort and read as a trip that ended before it began. That check is made against the
+    values the trip will actually end up with, not just the arguments, so setting one
+    end cannot quietly produce an inverted pair with the other end's existing override.
     """
     trip = resolve(session, name, TRIP)
     if trip is None:
         return False
-    if start is not None and end is not None and start > end:
-        raise ValueError(f"A trip cannot end before it starts: {start} .. {end}.")
-    trip.start_date = start
-    trip.end_date = end
+    new_start = trip.start_date if start is KEEP else start
+    new_end = trip.end_date if end is KEEP else end
+    if new_start is not None and new_end is not None and new_start > new_end:
+        raise ValueError(f"A trip cannot end before it starts: {new_start} .. {new_end}.")
+    trip.start_date = new_start
+    trip.end_date = new_end
     session.flush()
     return True
 

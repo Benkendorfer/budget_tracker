@@ -108,7 +108,7 @@ vendor not listed. Type commands into the bar at the bottom:
 | `trips` | See each trip's dates, cost, and travel-bucket breakdown as a color bar (see below) |
 | `trip bucket <categories> = <bucket>` | Map one or more categories to a travel bucket; a blank bucket unmaps it (see below) |
 | `trip buckets` | Show the bucket map, grouped by bucket |
-| `trip dates <trip> = <start>..<end>` | Set a trip's dates by hand; a blank right-hand side derives them from its transactions again (see below) |
+| `trip dates <trip> = <start>..<end>` | Set a trip's dates by hand; leave either side of the `..` empty to set just the other, or the whole right-hand side to derive both again (see below) |
 | `transfers` | Pair up movements between your own accounts (`transfers reset` undoes it) |
 | `transfers same-account` | Also pair legs within the same account (see below); off by default |
 | `rates` | List cached exchange rates: pair, source, date span, count (see below) |
@@ -562,14 +562,23 @@ editing a transaction, so either end can be set by hand:
 
 ```text
 trip dates Hamburg 2026-05 = 2026-05-14..2026-05-26
-trip dates Hamburg 2026-05 =              blank derives them from transactions again
+trip dates Hamburg 2026-05 = 2026-05-14..    just the start; the end is left alone
+trip dates Hamburg 2026-05 = ..2026-05-26    just the end
+trip dates Hamburg 2026-05 =                 blank derives both again
 ```
 
-A date set by hand is marked with a `*` and dimmed, so a corrected trip is distinguishable
-from one that happened to line up — an override you cannot see is one you cannot account
-for later. The two ends are independent: fixing a start leaves an end that was already
-right derived, and only the corrected one is marked. Setting dates also gives a trip that
-has no transactions yet a place in the order, rather than leaving it permanently last.
+A date that was **derived** — taken from the trip's earliest or latest transaction — is
+marked with a `*` and dimmed. The flag is on the app's guess rather than on your
+correction: the guess is the one that may be wrong and still wants checking, while a date
+you typed is the one fact on the row nobody needs to verify. A column of `*`s is the list
+of trips you have not confirmed yet.
+
+The two ends are independent, and leaving one out of a `trip dates` command leaves it
+exactly as it was — which is not the same as `trip dates X =`, which forgets both
+overrides. Correcting one end at a time can briefly leave a start after an end; that is
+allowed, with a warning, because refusing it would make the two-step correction
+impossible. Setting dates also gives a trip that has no transactions yet a place in the
+order, rather than leaving it permanently last.
 
 From the command line:
 
@@ -577,8 +586,9 @@ From the command line:
 budget trips                              # the same table, breakdown as percentages
 budget trips buckets                      # the map, grouped by bucket
 budget trips bucket "Car Rental" car      # category first, then the bucket
-budget trips dates "Hamburg 2026-05" 2026-05-14 2026-05-26
-budget trips dates "Hamburg 2026-05" --clear
+budget trips dates "Hamburg 2026-05" --start 2026-05-14 --end 2026-05-26
+budget trips dates "Hamburg 2026-05" --start 2026-05-14   # either end on its own
+budget trips dates "Hamburg 2026-05" --clear              # derive both again
 ```
 
 ### Statistics

@@ -201,16 +201,19 @@ def _bucket_names(rows):
 # ------------------------------------------------------------------- pure helpers
 
 
-def test_a_date_cell_is_a_plain_iso_date():
-    """Start and end are separate columns now, so each cell is one date -- there is no
-    range to elide a year out of."""
-    assert str(_date_cell(datetime.date(2026, 3, 2), False)) == "2026-03-02"
-
-
-def test_a_manual_date_is_marked_and_dimmed():
-    """Otherwise an override is invisible, and a date nobody can account for is worse
-    than an unfamiliar one."""
+def test_a_hand_set_date_is_plain():
+    """A date the user typed is the one fact on the row nobody needs to check, so it
+    carries no marker at all."""
     cell = _date_cell(datetime.date(2026, 3, 2), True)
+    assert str(cell) == "2026-03-02"
+    assert "dim" not in str(cell.style)
+
+
+def test_a_derived_date_is_marked_and_dimmed():
+    """The flag belongs on the app's guess, not the correction: a date taken from the
+    earliest or latest transaction may well be wrong, and is what still wants
+    attention."""
+    cell = _date_cell(datetime.date(2026, 3, 2), False)
     assert str(cell) == "2026-03-02*"
     assert "dim" in str(cell.style)
 
@@ -264,8 +267,9 @@ def test_trips_command_opens_the_panel_and_lists_every_trip(tmp_path, monkeypatc
         f"{FOLD_INDICATOR} Japan 2026",
         f"{FOLD_INDICATOR} Peru 2025",
     ]
-    assert rows[0][0] == "2026-03-02"
-    assert rows[0][1] == "2026-03-14"
+    # Both derived from the transactions, so both marked.
+    assert rows[0][0] == "2026-03-02*"
+    assert rows[0][1] == "2026-03-14*"
     assert rows[0][COST_CELL] == "800.00"
     assert rows[1][0] == ""  # no transactions yet, and no manual override
     assert rows[1][1] == ""
@@ -1120,8 +1124,9 @@ def test_trip_dates_overrides_what_the_transactions_say(tmp_path, monkeypatch):
             return _trip_rows(app)[0]
 
     row = asyncio.run(run())
-    assert row[0] == "2026-03-10*"  # marked, so the override is not invisible
-    assert row[1] == "2026-03-20*"
+    # Set by hand, so unmarked: the marker is on the derived guess, not the correction.
+    assert row[0] == "2026-03-10"
+    assert row[1] == "2026-03-20"
 
 
 def test_trip_dates_marks_only_the_end_that_was_set(tmp_path, monkeypatch):
@@ -1146,8 +1151,8 @@ def test_trip_dates_marks_only_the_end_that_was_set(tmp_path, monkeypatch):
             return _trip_rows(app)[0]
 
     row = asyncio.run(run())
-    assert row[0] == "2026-03-01*"  # overridden
-    assert row[1] == "2026-03-14"  # still derived, unmarked
+    assert row[0] == "2026-03-01"  # set by hand, so unmarked
+    assert row[1] == "2026-03-14*"  # still derived, so still flagged
 
 
 def test_trip_dates_with_a_blank_value_derives_them_again(tmp_path, monkeypatch):
@@ -1165,8 +1170,8 @@ def test_trip_dates_with_a_blank_value_derives_them_again(tmp_path, monkeypatch)
             return _trip_rows(app)[0]
 
     row = asyncio.run(run())
-    assert row[0] == "2026-03-02"
-    assert row[1] == "2026-03-14"
+    assert row[0] == "2026-03-02*"
+    assert row[1] == "2026-03-14*"
 
 
 def test_trip_dates_reports_a_bad_date_and_an_unknown_trip(tmp_path, monkeypatch):
@@ -1192,4 +1197,94 @@ def test_trip_dates_reports_a_bad_date_and_an_unknown_trip(tmp_path, monkeypatch
     assert "YYYY-MM-DD" in messages[0]
     assert "No trip named 'Nowhere'." == messages[1]
     assert "cannot end before it starts" in messages[2]
-    assert row[0] == "2026-03-02"  # nothing was written by any of the three
+    assert row[0] == "2026-03-02*"  # nothing was written by any of the three
+
+
+def test_trip_dates_can_set_just_one_end(tmp_path, monkeypatch):
+    """An empty side of the ".." leaves that end alone, so correcting a start does not
+    mean restating an end that was already right."""
+    _seed_trips(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(213, 40)) as pilot:
+            app._run_command("trips")
+            await pilot.pause()
+            app._run_command("trip dates Japan 2026 = 2026-03-01..")
+            await pilot.pause()
+            start_only = _trip_rows(app)[0]
+            app._run_command("trip dates Japan 2026 = ..2026-03-25")
+            await pilot.pause()
+            both = _trip_rows(app)[0]
+            return start_only, both
+
+    start_only, both = asyncio.run(run())
+    assert start_only[0] == "2026-03-01"  # set
+    assert start_only[1] == "2026-03-14*"  # untouched, still derived
+    # Setting the end afterwards must not disturb the start set a moment ago.
+    assert both[0] == "2026-03-01"
+    assert both[1] == "2026-03-25"
+
+
+def test_setting_one_end_cannot_produce_an_inverted_pair(tmp_path, monkeypatch):
+    """The start/end check runs against what the trip will end up with, not just the
+    argument, or setting one end could quietly invert it against the other's override."""
+    _seed_trips(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(213, 40)) as pilot:
+            app._run_command("trips")
+            await pilot.pause()
+            app._run_command("trip dates Japan 2026 = ..2026-03-05")
+            await pilot.pause()
+            app._run_command("trip dates Japan 2026 = 2026-04-01..")
+            await pilot.pause()
+            return list(app._notifications)[-1].message, _trip_rows(app)[0]
+
+    message, row = asyncio.run(run())
+    assert "cannot end before it starts" in message
+    assert row[0] == "2026-03-02*"  # start never took, still derived
+    assert row[1] == "2026-03-05"
+
+
+def test_trip_dates_with_both_sides_empty_is_a_usage_error(tmp_path, monkeypatch):
+    """`= ..` says nothing; clearing both is the bare `trip dates X =`."""
+    _seed_trips(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(213, 40)) as pilot:
+            app._run_command("trips")
+            await pilot.pause()
+            app._run_command("trip dates Japan 2026 = ..")
+            await pilot.pause()
+            return list(app._notifications)[-1].message
+
+    assert "Usage:" in asyncio.run(run())
+
+
+def test_a_start_past_the_derived_end_warns_but_is_kept(tmp_path, monkeypatch):
+    """The hard refusal compares overrides; the end shown may still be derived, and a
+    two-step correction has to be able to pass through that state."""
+    _seed_trips(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test(size=(213, 40)) as pilot:
+            app._run_command("trips")
+            await pilot.pause()
+            app._run_command("trip dates Japan 2026 = 2026-04-01..")
+            await pilot.pause()
+            warned = list(app._notifications)[-1]
+            app._run_command("trip dates Japan 2026 = ..2026-04-10")
+            await pilot.pause()
+            settled = list(app._notifications)[-1]
+            return warned, settled, _trip_rows(app)[0]
+
+    warned, settled, row = asyncio.run(run())
+    assert "start is now after its end" in warned.message
+    assert warned.severity == "warning"
+    assert "start is now after its end" not in settled.message
+    assert row[0] == "2026-04-01"  # kept, not rejected
+    assert row[1] == "2026-04-10"
