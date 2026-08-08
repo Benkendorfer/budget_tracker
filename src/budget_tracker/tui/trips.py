@@ -20,15 +20,16 @@ shape, not a shared import.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from rich.text import Text
+from textual import events
 from textual.widgets import DataTable
 
 from .. import trips as trips_module
 from ..charts import BLOCK
 from ..queries import TripRow
-from .formatting import FOLD_INDICATOR, OTHER_COLOR, PIE_COLORS, _amount_cell, _fmt_amount, _truncate
+from .formatting import FOLD_INDICATOR, OTHER_COLOR, PIE_COLORS, _fmt_amount, _truncate
 
 # One color per bucket, in trips.BUCKETS order: every PIE_COLORS entry, in order, for
 # the real buckets, and the shared neutral gray for the trailing misc -- the same
@@ -38,16 +39,66 @@ from .formatting import FOLD_INDICATOR, OTHER_COLOR, PIE_COLORS, _amount_cell, _
 # instead of silently wrapping onto one already in use -- PIE_COLORS itself would need
 # to grow first if the real-bucket count ever exceeds it (see too_many_colors() in
 # tui/pie.py for how that same situation is flagged there rather than left ambiguous).
-# A bucket is the same color in every trip's bar and in the legend beneath the table.
+# A bucket is the same color in every trip's bar and in the legend above the table.
 BUCKET_COLORS: Tuple[str, ...] = PIE_COLORS[: len(trips_module.BUCKETS) - 1] + (OTHER_COLOR,)
 
+
+def _cost_cell(minor: int) -> Text:
+    """A trip's cost, red.
+
+    This is the one column in the app where the sign convention is inverted, so it
+    cannot use ``formatting._amount_cell``. Everywhere else a figure is a signed
+    balance and red means it went negative; here every figure is already a *cost*,
+    reported positive (see ``queries.get_trips``), and money spent should read the same
+    red it does everywhere else rather than green for being a positive number.
+
+    A bucket whose refunds outran its spending is the genuine exception -- that is
+    money that came back -- so a negative cost stays green, which keeps red/green
+    meaning "out"/"in" throughout the app even though the sign flipped.
+    """
+    return Text(_fmt_amount(minor), style="green" if minor < 0 else "red", justify="right")
+
+
+class TripTable(DataTable):
+    """The trips table, which opens with no trip highlighted.
+
+    A ``DataTable`` always has a cursor somewhere, so the panel would otherwise open
+    with the first trip lit up -- which reads as "this one is selected" when the user
+    has not chosen anything, and is actively misleading on a screen whose whole job is
+    comparing trips against each other.
+
+    The cursor is therefore hidden until the user touches the table, and from that
+    point on the table behaves exactly like every other one in the app. Revealing on
+    *any* key rather than only on the arrows is deliberate: ``space`` folds whichever
+    trip the cursor is on, and folding a row the user cannot see would be worse than
+    showing the cursor a keystroke early.
+    """
+
+    def hide_cursor(self) -> None:
+        """Called when the panel is (re)built, so reopening it starts clean again."""
+        self.show_cursor = False
+
+    async def _on_key(self, event: events.Key) -> None:
+        self.show_cursor = True
+
+    async def _on_click(self, event: events.Click) -> None:
+        self.show_cursor = True
+
+
 # Column widths, fixed regardless of terminal size -- see bar_width() for the one
-# column that is not. DATES_WIDTH covers the cross-year worst case
-# ("2026-03-02..2027-01-05", 22 characters); TRIP_WIDTH matches the sidebar's own
-# vendor-name magnitude, long names truncated with an ellipsis; COST_WIDTH fits a
-# signed six-figure home-currency amount ("-999,999.99" is 12) with nothing to spare,
-# same magnitude as the chart's own money columns.
-DATES_WIDTH = 22
+# column that is not. START_WIDTH/END_WIDTH each hold an ISO date (10) plus the "*"
+# that marks one set by hand; TRIP_WIDTH matches the sidebar's own vendor-name
+# magnitude, long names truncated with an ellipsis; COST_WIDTH fits a signed six-figure
+# home-currency amount ("-999,999.99" is 12) with nothing to spare, same magnitude as
+# the chart's own money columns.
+#
+# Start and end are two columns rather than one combined "2026-03-02..03-14" field:
+# they are two facts, each independently overridable (models.Tag.start_date/end_date),
+# and a combined field cannot be scanned down a column. The pair costs 26 columns
+# against the old 24, which the Breakdown column absorbs without dropping to the
+# narrower bar -- see bar_width().
+START_WIDTH = 11
+END_WIDTH = 11
 TRIP_WIDTH = 22
 COST_WIDTH = 12
 # DataTable pads every column two cells (one each side), matching every other table's
@@ -75,7 +126,8 @@ def bar_width(main_panel_width: int) -> int:
     available = (
         main_panel_width
         - BORDER_OVERHEAD
-        - (DATES_WIDTH + COLUMN_PADDING)
+        - (START_WIDTH + COLUMN_PADDING)
+        - (END_WIDTH + COLUMN_PADDING)
         - (TRIP_WIDTH + COLUMN_PADDING)
         - (COST_WIDTH + COLUMN_PADDING)
         - COLUMN_PADDING  # Breakdown's own
@@ -86,21 +138,20 @@ def bar_width(main_panel_width: int) -> int:
     return BAR_WIDTHS[-1]
 
 
-def _format_dates(start, end) -> str:
-    """``"YYYY-MM-DD..MM-DD"``, eliding only the end's year when it matches the
-    start's -- the month stays, since a trip is usually inside one. A single-day trip
-    (``start == end``) prints just the one date, and a trip with no transactions is
-    blank (both ``None``). Matches ``budget trips``'s own formatting exactly, so a trip
-    reads the same in both -- see the shared spec's correction: §4's own example,
-    ``2026-03-02..03-14``, elides only the year even though its wording says "year and
-    month"; the example is what both this and the CLI actually implement.
+def _date_cell(day, is_manual: bool) -> Text:
+    """One end of a trip, with a ``*`` when it was set by hand.
+
+    Blank for a trip with nothing to derive it from and no override. The marker is what
+    distinguishes a date the user corrected from one that happened to line up; without
+    it an override is invisible, and a figure nobody can account for is worse than an
+    unfamiliar one. Styled dim as well as marked, so the eye can pick the corrected
+    trips out of a column without reading every row. Matches ``budget trips``'s own
+    ``*``, so a trip reads the same in both.
     """
-    if start is None or end is None:
-        return ""
-    if start == end:
-        return start.isoformat()
-    tail = end.strftime("%m-%d") if end.year == start.year else end.isoformat()
-    return f"{start.isoformat()}..{tail}"
+    if day is None:
+        return Text("")
+    text = day.isoformat() + ("*" if is_manual else "")
+    return Text(text, style="dim" if is_manual else "")
 
 
 def _apportion(shares: List[float], width: int) -> List[int]:
@@ -167,6 +218,26 @@ class TripPanelRow:
     bucket_index: Optional[int] = None  # index into trips.BUCKETS / trip.buckets, else None
 
 
+def bucket_category_ids(mapping: Dict[int, str], bucket: str) -> Tuple[Optional[int], ...]:
+    """Every category id ``mapping`` (trips_module.resolve_buckets) resolves to
+    ``bucket``, for BudgetApp's own bucket-row drill-down (see app._drill_into_trip_row).
+
+    Plain filtering, not aggregation, so it stays here rather than in trips.py: the
+    domain module already hands back the resolved map, and this only picks the ids a
+    bucket drill-down needs out of it. ``None`` is appended for
+    :data:`trips_module.MISC` -- an uncategorized transaction falls into misc the same
+    way ``queries.get_trips`` already treats it (see that function's own docstring), so
+    misc's own drill-down has to reach those rows too, or every uncategorized
+    transaction on the trip would silently vanish from its own breakdown.
+    """
+    ids: Tuple[Optional[int], ...] = tuple(
+        category_id for category_id, resolved in mapping.items() if resolved == bucket
+    )
+    if bucket == trips_module.MISC:
+        ids = ids + (None,)
+    return ids
+
+
 def fill_trips(
     table: DataTable, rows: List[TripRow], expanded: Set[int], width: int
 ) -> Tuple[List[TripPanelRow], Set[int]]:
@@ -179,7 +250,8 @@ def fill_trips(
     see toggle_fold(), which depends on it.
     """
     table.clear(columns=True)
-    table.add_column("Dates", width=DATES_WIDTH)
+    table.add_column("Start", width=START_WIDTH)
+    table.add_column("End", width=END_WIDTH)
     table.add_column("Trip", width=TRIP_WIDTH)
     table.add_column("Cost", width=COST_WIDTH)
     table.add_column("Breakdown", width=width)
@@ -191,9 +263,10 @@ def fill_trips(
         is_expanded = row.id in expanded
         label = row.name if is_expanded else f"{FOLD_INDICATOR} {row.name}"
         table.add_row(
-            _format_dates(row.start, row.end),
+            _date_cell(row.start, row.start_is_manual),
+            _date_cell(row.end, row.end_is_manual),
             _truncate(label, TRIP_WIDTH),
-            _amount_cell(row.total_minor),
+            _cost_cell(row.total_minor),
             _bar_text(row.buckets, width),
         )
         if not is_expanded:
@@ -214,9 +287,10 @@ def fill_trips(
             # bucket reads 0.0% here even though its cost beside it is still negative.
             share = max(0, cost) / clamped_total if clamped_total else 0.0
             table.add_row(
-                "",
+                "",  # Start
+                "",  # End
                 Text(f"  {bucket}", style=BUCKET_COLORS[index]),
-                _amount_cell(cost),
+                _cost_cell(cost),
                 Text(_fmt_share(share), style=BUCKET_COLORS[index], justify="right"),
             )
     return panel_rows, foldable_ids

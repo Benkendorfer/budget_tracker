@@ -108,6 +108,7 @@ vendor not listed. Type commands into the bar at the bottom:
 | `trips` | See each trip's dates, cost, and travel-bucket breakdown as a color bar (see below) |
 | `trip bucket <categories> = <bucket>` | Map one or more categories to a travel bucket; a blank bucket unmaps it (see below) |
 | `trip buckets` | Show the bucket map, grouped by bucket |
+| `trip dates <trip> = <start>..<end>` | Set a trip's dates by hand; a blank right-hand side derives them from its transactions again (see below) |
 | `transfers` | Pair up movements between your own accounts (`transfers reset` undoes it) |
 | `transfers same-account` | Also pair legs within the same account (see below); off by default |
 | `rates` | List cached exchange rates: pair, source, date span, count (see below) |
@@ -119,16 +120,16 @@ vendor not listed. Type commands into the bar at the bottom:
 | `quit` | Exit |
 
 Keyboard shortcuts: `ctrl+l` clears filters, `ctrl+r` refreshes, `escape` returns to the
-transactions from the rules panel, and `ctrl+c` quits. On a statistics row **or a chart
-bar**, the right arrow drills into its transactions (same as `enter`); the left arrow
-goes back to the breakdown or chart it came from, once you have drilled into one;
-`space` folds or unfolds a category's subtree; and `f` folds or unfolds every group at
-once — see "Statistics" below (the same two keys fold and unfold a trip's bucket
-breakdown on the trips panel — see "Trips"). On the chart, `b` cycles the bar width
-between day, week, and month, and `m` cycles what the bars measure between net, spending,
-and income — see "Charts". On the pie panel, `b` cycles the bucket between week, month,
-and year (no daily — see "Pie chart"). The footer shows the arrows only while they do
-something.
+transactions from the rules panel, and `ctrl+c` quits. On a statistics row, **a chart
+bar**, or **a trips-panel row**, the right arrow drills into its transactions (same as
+`enter`); the left arrow goes back to the breakdown, chart, or trips panel it came from,
+once you have drilled into one; `space` folds or unfolds a category's subtree; and `f`
+folds or unfolds every group at once — see "Statistics" below (the same two keys fold and
+unfold a trip's bucket breakdown on the trips panel — see "Trips"). On the chart, `b`
+cycles the bar width between day, week, and month, and `m` cycles what the bars measure
+between net, spending, and income — see "Charts". On the pie panel, `b` cycles the bucket
+between week, month, and year (no daily — see "Pie chart"). The footer shows the arrows
+only while they do something.
 
 `ctrl+n` prefills a `rename` command for whichever vendor you are pointing at, and
 `ctrl+t` prefills a `categorize` command for the same vendor. With the transaction table
@@ -527,6 +528,15 @@ negative cost even though a negative segment has no length to draw in the bar: t
 allowed to disagree in that one case rather than the bar quietly claiming a positive
 length it did not earn.
 
+Press `enter`, or the right arrow, on a trip's own row to see every transaction on that
+trip; on one of its unfolded bucket rows, only that bucket's — a bucket is several
+unrelated categories at once (`Airfare` and `Rail Travel` share a bucket but not a
+parent), so this is not the same as filtering by one category in the sidebar. `misc`'s
+drill-down reaches uncategorized transactions too, not just categories nothing else
+claimed. The left arrow goes back to the trips panel exactly as you left it — fold
+state and cursor both — the same "back" the statistics and chart panels offer (see
+"Statistics").
+
 Which category counts toward which bucket is a map, not a fixed rule — opening the panel
 seeds it with a guess from common category names (`Airfare`, `Hotel`, `Food`, and so on)
 the first time, and you correct the rest:
@@ -544,12 +554,31 @@ category with no mapping of its own inherits its nearest mapped ancestor's bucke
 `Food` covers `Food > Dining` without a row of its own), or falls back to `misc` if nothing
 above it is mapped either.
 
+A trip's **start and end are two separate columns**, and both are taken from the earliest
+and latest transaction on it. That is right most of the time and wrong in the two cases
+that matter: a flight booked months ahead drags the start back to the booking, and a trip
+whose last purchase came days before flying home ends early. Neither can be fixed by
+editing a transaction, so either end can be set by hand:
+
+```text
+trip dates Hamburg 2026-05 = 2026-05-14..2026-05-26
+trip dates Hamburg 2026-05 =              blank derives them from transactions again
+```
+
+A date set by hand is marked with a `*` and dimmed, so a corrected trip is distinguishable
+from one that happened to line up — an override you cannot see is one you cannot account
+for later. The two ends are independent: fixing a start leaves an end that was already
+right derived, and only the corrected one is marked. Setting dates also gives a trip that
+has no transactions yet a place in the order, rather than leaving it permanently last.
+
 From the command line:
 
 ```bash
 budget trips                              # the same table, breakdown as percentages
 budget trips buckets                      # the map, grouped by bucket
 budget trips bucket "Car Rental" car      # category first, then the bucket
+budget trips dates "Hamburg 2026-05" 2026-05-14 2026-05-26
+budget trips dates "Hamburg 2026-05" --clear
 ```
 
 ### Statistics

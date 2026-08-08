@@ -56,6 +56,10 @@ def get_engine(db_path: Optional[Path] = None) -> Engine:
 # missing *tables*, so these are applied by hand; SQLite ADD COLUMN is cheap and safe.
 _ADDED_COLUMNS = {
     "vendor": {"vendor_name_source": "VARCHAR"},
+    # Manual overrides for a trip's dates, which otherwise come from the transactions
+    # on it. NULL means "derive it", so an existing database needs no backfill: every
+    # trip made before this column existed keeps behaving exactly as it did.
+    "tag": {"start_date": "DATE", "end_date": "DATE"},
     "csv_format": {
         "invert_amount": "BOOLEAN NOT NULL DEFAULT 0",
         # A format that predates this column carried no currency of its own, and every

@@ -254,6 +254,14 @@ class Tag(Base):
     summed without double-counting overlapping trips. That one-trip rule is enforced
     in :mod:`.tags`, not by an index: SQLite cannot write a partial unique index whose
     predicate reads another table.
+
+    ``start_date``/``end_date`` are **overrides**, and only meaningful on a trip. A trip
+    otherwise takes its dates from the transactions on it, which is right most of the
+    time and wrong in the two cases that matter: a flight booked months ahead drags the
+    start back to the booking, and a trip whose last purchase was two days before flying
+    home ends early. Either can be corrected without inventing a transaction. NULL means
+    "derive it", and the two are independent -- fixing the end does not force the user to
+    restate a start that was already right. See :func:`.queries.get_trips`.
     """
 
     __tablename__ = "tag"
@@ -262,6 +270,8 @@ class Tag(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String)
     kind: Mapped[str] = mapped_column(String, default="tag")  # "tag" | "trip"
+    start_date: Mapped[Optional[date]] = mapped_column(default=None)
+    end_date: Mapped[Optional[date]] = mapped_column(default=None)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 

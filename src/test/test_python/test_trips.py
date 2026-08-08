@@ -558,3 +558,256 @@ def test_get_trips_sorts_most_recent_first_dateless_last(tmp_path):
         rows = queries.get_trips(session)
 
     assert [r.name for r in rows] == ["June Trip", "January Trip", "Someday Trip"]
+
+
+def test_get_trips_sorts_by_when_a_trip_ended_not_when_it_began(tmp_path):
+    """The two disagree once trips overlap: a long trip that began in April and ran
+    into late June belongs above a short one that began later in June and was over
+    first. This panel is read as "most recently back"."""
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        currency, accounts = _seed(session)
+        checking = accounts["Checking"]
+        # Long trip: starts earliest, ends latest.
+        long_start = _txn(session, currency, checking, date(2026, 4, 10), -1000, "LongA")
+        long_end = _txn(session, currency, checking, date(2026, 6, 23), -1000, "LongB")
+        # Short trip: starts later than the long one, but finishes before it.
+        short_start = _txn(session, currency, checking, date(2026, 6, 19), -1000, "ShortA")
+        short_end = _txn(session, currency, checking, date(2026, 6, 22), -1000, "ShortB")
+        ids = (long_start.id, long_end.id, short_start.id, short_end.id)
+        session.commit()
+
+    with session_factory() as session:
+        tags.set_trip(session, [ids[0], ids[1]], "Long Trip")
+        tags.set_trip(session, [ids[2], ids[3]], "Short Trip")
+        session.commit()
+
+    with session_factory() as session:
+        rows = {r.name: r for r in queries.get_trips(session)}
+        order = [r.name for r in queries.get_trips(session)]
+
+    # Sanity: the two orderings really do disagree on this data.
+    assert rows["Long Trip"].start < rows["Short Trip"].start
+    assert rows["Long Trip"].end > rows["Short Trip"].end
+    assert order == ["Long Trip", "Short Trip"]
+
+
+# --------------------------------------------------------- Filters.category_ids
+#
+# A travel bucket is several unrelated categories at once -- Airfare and Rail Travel
+# share a bucket but not a parent -- so drilling into one cannot be a subtree filter.
+
+
+def test_category_ids_filters_to_an_explicit_set(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        currency, accounts = _seed(session)
+        checking = accounts["Checking"]
+        air = categories.ensure_path(session, "Airfare")
+        rail = categories.ensure_path(session, "Rail Travel")
+        food = categories.ensure_path(session, "Dining")
+        session.flush()
+        _txn(session, currency, checking, date(2026, 1, 1), -100, "Flight", air.id)
+        _txn(session, currency, checking, date(2026, 1, 2), -200, "Train", rail.id)
+        _txn(session, currency, checking, date(2026, 1, 3), -300, "Lunch", food.id)
+        session.commit()
+        wanted = (air.id, rail.id)
+
+    with session_factory() as session:
+        rows = queries.get_transactions(
+            session, filters=queries.Filters(category_ids=wanted)
+        )
+        assert sorted(r.description for r in rows) == ["Flight", "Train"]
+
+
+def test_a_none_in_category_ids_reaches_uncategorized_rows(tmp_path):
+    """How the misc bucket picks up transactions with no category at all, rather than
+    silently dropping them out of the trip they are on."""
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        currency, accounts = _seed(session)
+        checking = accounts["Checking"]
+        shop = categories.ensure_path(session, "Merchandise")
+        session.flush()
+        _txn(session, currency, checking, date(2026, 1, 1), -100, "Souvenir", shop.id)
+        _txn(session, currency, checking, date(2026, 1, 2), -200, "Mystery", None)
+        session.commit()
+        shop_id = shop.id
+
+    with session_factory() as session:
+        rows = queries.get_transactions(
+            session, filters=queries.Filters(category_ids=(shop_id, None))
+        )
+        assert sorted(r.description for r in rows) == ["Mystery", "Souvenir"]
+
+        only_none = queries.get_transactions(
+            session, filters=queries.Filters(category_ids=(None,))
+        )
+        assert [r.description for r in only_none] == ["Mystery"]
+
+
+def test_an_empty_category_ids_matches_nothing_rather_than_everything(tmp_path):
+    """The honest reading of "these categories" when there are none -- degrading to
+    "all" would silently show a bucket's drill-down as the whole trip."""
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        currency, accounts = _seed(session)
+        _txn(session, currency, accounts["Checking"], date(2026, 1, 1), -100, "A")
+        session.commit()
+
+    with session_factory() as session:
+        rows = queries.get_transactions(
+            session, filters=queries.Filters(category_ids=())
+        )
+        assert rows == []
+        totals = queries.get_totals(session, filters=queries.Filters(category_ids=()))
+        assert totals.count == 0
+
+
+def test_category_ids_combines_with_a_trip_filter(tmp_path):
+    """The actual drill-down: one bucket, within one trip."""
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        currency, accounts = _seed(session)
+        checking = accounts["Checking"]
+        air = categories.ensure_path(session, "Airfare")
+        session.flush()
+        on_trip = _txn(session, currency, checking, date(2026, 1, 1), -100, "Flight", air.id)
+        off_trip = _txn(session, currency, checking, date(2026, 1, 2), -900, "Other flight", air.id)
+        session.commit()
+        air_id, on_trip_id = air.id, on_trip.id
+        assert off_trip.id != on_trip_id
+
+    with session_factory() as session:
+        tags.set_trip(session, [on_trip_id], "Japan 2026")
+        session.commit()
+
+    with session_factory() as session:
+        trip_id = queries.resolve_tag(session, "Japan 2026", tags.TRIP)
+        rows = queries.get_transactions(
+            session,
+            filters=queries.Filters(trip_id=trip_id, category_ids=(air_id,)),
+        )
+        assert [r.description for r in rows] == ["Flight"]
+
+
+# ------------------------------------------------------------- manual trip dates
+
+
+def _one_txn_trip(session_factory, name="Japan 2026", day=date(2026, 3, 10)):
+    with session_factory() as session:
+        currency, accounts = _seed(session)
+        txn = _txn(session, currency, accounts["Checking"], day, -1000, "Flight")
+        session.commit()
+        txn_id = txn.id
+    with session_factory() as session:
+        tags.set_trip(session, [txn_id], name)
+        session.commit()
+
+
+def test_a_trip_derives_its_dates_from_its_transactions_by_default(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    _one_txn_trip(session_factory)
+    with session_factory() as session:
+        row = queries.get_trips(session)[0]
+        assert (row.start, row.end) == (date(2026, 3, 10), date(2026, 3, 10))
+        assert (row.start_is_manual, row.end_is_manual) == (False, False)
+
+
+def test_a_manual_start_overrides_the_derived_one(tmp_path):
+    """The case this exists for: a flight booked months ahead drags the derived start
+    back to the booking, while the end was right all along."""
+    session_factory = _session_factory(tmp_path)
+    _one_txn_trip(session_factory)
+    with session_factory() as session:
+        assert tags.set_trip_dates(session, "Japan 2026", date(2026, 3, 8), None)
+        session.commit()
+
+    with session_factory() as session:
+        row = queries.get_trips(session)[0]
+        assert row.start == date(2026, 3, 8)  # overridden
+        assert row.end == date(2026, 3, 10)  # still derived
+        # Marked per end: only the start was set, so only the start is manual.
+        assert (row.start_is_manual, row.end_is_manual) == (True, False)
+
+
+def test_clearing_an_override_goes_back_to_the_derived_date(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    _one_txn_trip(session_factory)
+    with session_factory() as session:
+        tags.set_trip_dates(session, "Japan 2026", date(2020, 1, 1), date(2020, 1, 2))
+        session.commit()
+    with session_factory() as session:
+        tags.set_trip_dates(session, "Japan 2026", None, None)
+        session.commit()
+
+    with session_factory() as session:
+        row = queries.get_trips(session)[0]
+        assert (row.start, row.end) == (date(2026, 3, 10), date(2026, 3, 10))
+        assert (row.start_is_manual, row.end_is_manual) == (False, False)
+
+
+def test_manual_dates_give_a_trip_with_no_transactions_a_place_in_the_order(tmp_path):
+    """A trip planned but not yet paid for has no derived dates at all; setting them by
+    hand is the only way it can sit anywhere but last."""
+    session_factory = _session_factory(tmp_path)
+    _one_txn_trip(session_factory, "Past Trip", date(2026, 1, 5))
+    with session_factory() as session:
+        tags.get_or_create(session, "Future Trip", tags.TRIP)
+        session.commit()
+    with session_factory() as session:
+        tags.set_trip_dates(session, "Future Trip", date(2026, 9, 1), date(2026, 9, 20))
+        session.commit()
+
+    with session_factory() as session:
+        rows = queries.get_trips(session)
+        assert [r.name for r in rows] == ["Future Trip", "Past Trip"]
+        assert rows[0].count == 0
+        assert rows[0].total_minor == 0
+
+
+def test_a_trip_cannot_end_before_it_starts(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    _one_txn_trip(session_factory)
+    with session_factory() as session:
+        with pytest.raises(ValueError, match="cannot end before it starts"):
+            tags.set_trip_dates(session, "Japan 2026", date(2026, 5, 1), date(2026, 4, 1))
+
+
+def test_setting_dates_on_a_trip_that_does_not_exist_reports_rather_than_raises(tmp_path):
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        assert tags.set_trip_dates(session, "Nowhere", date(2026, 1, 1), None) is False
+
+
+def test_manual_dates_survive_on_a_database_that_predates_the_columns(tmp_path):
+    """The columns are added by db._ADDED_COLUMNS, not create_all, since `tag` already
+    exists in any database that has ever been opened."""
+    import sqlalchemy
+
+    db_path = tmp_path / "old.db"
+    engine = get_engine(db_path)
+    init_db(engine)
+    # Drop back to the pre-override shape, then reopen.
+    with engine.begin() as connection:
+        connection.execute(sqlalchemy.text("DROP TABLE transaction_tag"))
+        connection.execute(sqlalchemy.text("DROP TABLE tag"))
+        connection.execute(
+            sqlalchemy.text(
+                "CREATE TABLE tag (id INTEGER PRIMARY KEY, name VARCHAR, kind VARCHAR, "
+                "created_at DATETIME)"
+            )
+        )
+        connection.execute(
+            sqlalchemy.text("INSERT INTO tag (name, kind) VALUES ('Japan 2026', 'trip')")
+        )
+
+    reopened = get_engine(db_path)
+    init_db(reopened)
+    session_factory = get_sessionmaker(reopened)
+    with session_factory() as session:
+        assert tags.set_trip_dates(session, "Japan 2026", date(2026, 3, 8), date(2026, 3, 20))
+        session.commit()
+    with session_factory() as session:
+        row = queries.get_trips(session)[0]
+        assert (row.start, row.end) == (date(2026, 3, 8), date(2026, 3, 20))

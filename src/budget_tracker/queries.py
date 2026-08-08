@@ -15,7 +15,7 @@ from dataclasses import dataclass, replace
 from datetime import date
 from typing import Dict, List, Optional, Set, Tuple
 
-from sqlalchemy import case, func, or_, select, true
+from sqlalchemy import case, false, func, or_, select, true
 from sqlalchemy.orm import Session, selectinload
 
 from . import rates, trips
@@ -98,8 +98,17 @@ class Filters:
     signatures individually -- see ``resolve_filters`` for how a function accepts either
     this or its old individual arguments without the two being able to disagree.
 
-    ``tag_id``/``trip_id`` were added last (after ``date_range``) so every positional
-    ``Filters(...)`` construction already in the tests keeps working.
+    ``tag_id``/``trip_id``/``category_ids`` were added last (after ``date_range``) so
+    every positional ``Filters(...)`` construction already in the tests keeps working.
+
+    ``category_ids`` is an explicit *set* of categories, where ``category_id`` is one
+    category and everything beneath it. It exists because a travel bucket is many
+    unrelated categories at once (see :mod:`.trips`) -- ``Airfare`` and ``Rail Travel``
+    share a bucket but not a parent -- so drilling into one cannot be expressed as a
+    subtree. The ids are taken as given and not expanded: whoever builds the set has
+    already resolved the whole tree. A ``None`` *inside* the tuple means uncategorized
+    transactions, which is how the ``misc`` bucket reaches the rows that have no
+    category at all rather than silently dropping them.
     """
 
     account_id: Optional[int] = None
@@ -109,6 +118,7 @@ class Filters:
     date_range: Optional[DateRange] = None
     tag_id: Optional[int] = None
     trip_id: Optional[int] = None
+    category_ids: Optional[Tuple[Optional[int], ...]] = None
 
     def replace(self, **changes) -> "Filters":
         """The same filters with one or more fields swapped out.
@@ -634,6 +644,17 @@ def _txn_query(filters: Filters):
         query = query.where(
             Transaction.category_id.in_(_subtree_ids(filters.category_id))
         )
+    if filters.category_ids is not None:
+        # An explicit set, not a subtree -- a travel bucket is several unrelated
+        # categories at once. A None in the tuple means "uncategorized", which is the
+        # only way the misc bucket reaches rows with no category rather than dropping
+        # them. An empty tuple matches nothing, which is the honest reading of "these
+        # categories" when there are none, and is what stops it degrading into "all".
+        wanted = [value for value in filters.category_ids if value is not None]
+        conditions = [Transaction.category_id.in_(wanted)] if wanted else []
+        if None in filters.category_ids:
+            conditions.append(Transaction.category_id.is_(None))
+        query = query.where(or_(*conditions) if conditions else false())
     if filters.vendor_filter is not None:
         kind, vendor_id = filters.vendor_filter
         if kind == "name":
@@ -1210,11 +1231,18 @@ class TripRow:
 
     id: int
     name: str
-    start: Optional[date]  # earliest posted_date on the trip; None if it has none
-    end: Optional[date]  # latest; both None for a trip with no transactions
+    start: Optional[date]  # the manual override if set, else the earliest posted_date
+    end: Optional[date]  # likewise; both None for a trip with no transactions or dates
     count: int  # every transaction on the trip, transfers included
     total_minor: int  # cost, in home_currency -- see get_trips
     buckets: Tuple[int, ...]  # one entry per trips.BUCKETS, same order, same units
+    # Whether each end was set by hand (models.Tag.start_date/end_date) rather than
+    # derived. Tracked per end, not as one flag for the pair, because overriding one and
+    # leaving the other derived is the ordinary case -- a flight booked months ahead
+    # drags the start back while the end was right -- and a single flag would mark a
+    # derived date as manual.
+    start_is_manual: bool = False
+    end_is_manual: bool = False
 
 
 def get_trips(session: Session, home_currency: str = HOME_CURRENCY) -> List[TripRow]:
@@ -1235,7 +1263,10 @@ def get_trips(session: Session, home_currency: str = HOME_CURRENCY) -> List[Trip
     A transaction with no category, or one no ancestor of which is mapped, falls into
     ``trips.MISC``, same as ``trips.resolve_buckets``. Trips with no transactions still
     appear (dates ``None``, cost 0) -- same reasoning as ``get_tags``: a trip you cannot
-    see is one you cannot fill. Sorted by ``start`` descending, dateless trips last.
+    see is one you cannot fill. Sorted by ``end`` descending -- most recently back
+    first -- with dateless trips last. The sidebar's own trip list is sorted by name
+    instead (see :func:`get_tags`): it is a place to find one trip, where this is a
+    list to read down.
     """
     trip_tags = list(session.scalars(select(Tag).where(Tag.kind == TRIP)))
     if not trip_tags:
@@ -1327,18 +1358,33 @@ def get_trips(session: Session, home_currency: str = HOME_CURRENCY) -> List[Trip
     rows = []
     for tag in trip_tags:
         start, end, count = dates.get(tag.id, (None, None, 0))
+        # A manual override wins over the transactions, per end independently: a flight
+        # booked months ahead drags the derived start back to the booking, while that
+        # trip's end was right all along. NULL still means "derive it", so a trip nobody
+        # has edited behaves exactly as it did before the columns existed.
         bucket_costs = tuple(-nets[tag.id][bucket] for bucket in trips.BUCKETS)
         rows.append(
             TripRow(
-                id=tag.id, name=tag.name, start=start, end=end, count=count,
-                total_minor=sum(bucket_costs), buckets=bucket_costs,
+                id=tag.id,
+                name=tag.name,
+                start=tag.start_date or start,
+                end=tag.end_date or end,
+                count=count,
+                total_minor=sum(bucket_costs),
+                buckets=bucket_costs,
+                start_is_manual=tag.start_date is not None,
+                end_is_manual=tag.end_date is not None,
             )
         )
 
     def _sort_key(row: TripRow) -> Tuple[int, int, str]:
-        if row.start is None:
+        # By when the trip *ended*, not when it began. The two disagree whenever trips
+        # overlap or one is much longer than another -- a long spring trip that ran
+        # into June belongs above a short one that started later in June and finished
+        # before it. "Most recently back" is the order this panel is read in.
+        if row.end is None:
             return (1, 0, row.name.lower())
-        return (0, -row.start.toordinal(), row.name.lower())
+        return (0, -row.end.toordinal(), row.name.lower())
 
     rows.sort(key=_sort_key)
     return rows

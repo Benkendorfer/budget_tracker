@@ -44,7 +44,10 @@ def test_trips_list_shows_dates_name_count_total_and_breakdown(tmp_path, monkeyp
     assert cli.main(["trips"]) == 0  # bare command defaults to "list"
     out = capsys.readouterr().out
     assert "Coffee Trip" in out
-    assert "2025-07-02..07-04" in out
+    # Start and end are separate columns, not one combined field -- they are two facts
+    # and are independently overridable (see the `dates` tests below).
+    assert "2025-07-02" in out
+    assert "2025-07-04" in out
     assert "2 txns" in out
     assert "6.50" in out
     assert "food 100%" in out
@@ -219,4 +222,81 @@ def test_trips_bucket_without_a_bucket_or_clear_reports_usage(tmp_path, monkeypa
     _setup(tmp_path, monkeypatch)
 
     assert cli.main(["trips", "bucket", "Dining"]) == 1
+    assert "Usage:" in capsys.readouterr().out
+
+
+# -------------------------------------------------------------------------- dates
+
+
+def test_trips_dates_overrides_the_derived_dates(tmp_path, monkeypatch, capsys):
+    """The case this exists for: a flight booked months ahead drags the derived start
+    back to the booking, and there is no transaction to correct."""
+    session_factory = _setup(tmp_path, monkeypatch)
+    ids = _txn_ids(session_factory, "COFFEE SHOP A")
+    _trip_fixture(session_factory, ids, "Coffee Trip")
+
+    assert cli.main(["trips", "dates", "Coffee Trip", "2025-06-30", "2025-07-10"]) == 0
+    capsys.readouterr()
+
+    assert cli.main(["trips"]) == 0
+    out = capsys.readouterr().out
+    assert "2025-06-30" in out
+    assert "2025-07-10" in out
+    # A trailing marker distinguishes a corrected trip from one that happened to line up.
+    assert "2025-07-10*" in out
+
+
+def test_trips_list_has_separate_start_and_end_columns(tmp_path, monkeypatch, capsys):
+    session_factory = _setup(tmp_path, monkeypatch)
+    _trip_fixture(session_factory, _txn_ids(session_factory, "COFFEE SHOP A"), "Coffee Trip")
+
+    assert cli.main(["trips"]) == 0
+    out = capsys.readouterr().out
+    header = out.splitlines()[0]
+    assert "Start" in header and "End" in header
+    assert header.index("Start") < header.index("End")
+
+
+def test_trips_dates_clear_goes_back_to_deriving_them(tmp_path, monkeypatch, capsys):
+    session_factory = _setup(tmp_path, monkeypatch)
+    _trip_fixture(session_factory, _txn_ids(session_factory, "COFFEE SHOP A"), "Coffee Trip")
+    assert cli.main(["trips", "dates", "Coffee Trip", "2020-01-01", "2020-01-02"]) == 0
+    capsys.readouterr()
+
+    assert cli.main(["trips", "dates", "Coffee Trip", "--clear"]) == 0
+    capsys.readouterr()
+    assert cli.main(["trips"]) == 0
+    out = capsys.readouterr().out
+    assert "2020-01-01" not in out
+    assert "2025-07-02" in out  # the derived start is back
+    assert "*" not in out
+
+
+def test_trips_dates_rejects_an_end_before_the_start(tmp_path, monkeypatch, capsys):
+    session_factory = _setup(tmp_path, monkeypatch)
+    _trip_fixture(session_factory, _txn_ids(session_factory, "COFFEE SHOP A"), "Coffee Trip")
+
+    assert cli.main(["trips", "dates", "Coffee Trip", "2025-08-01", "2025-07-01"]) == 1
+    assert "cannot end before it starts" in capsys.readouterr().out
+
+
+def test_trips_dates_rejects_a_malformed_date(tmp_path, monkeypatch, capsys):
+    session_factory = _setup(tmp_path, monkeypatch)
+    _trip_fixture(session_factory, _txn_ids(session_factory, "COFFEE SHOP A"), "Coffee Trip")
+
+    assert cli.main(["trips", "dates", "Coffee Trip", "last tuesday", "2025-07-01"]) == 1
+    assert "YYYY-MM-DD" in capsys.readouterr().out
+
+
+def test_trips_dates_reports_an_unknown_trip(tmp_path, monkeypatch, capsys):
+    _setup(tmp_path, monkeypatch)
+    assert cli.main(["trips", "dates", "Nowhere", "2025-01-01", "2025-01-02"]) == 1
+    assert "No trip named 'Nowhere'." in capsys.readouterr().out
+
+
+def test_trips_dates_without_both_dates_is_a_usage_error(tmp_path, monkeypatch, capsys):
+    session_factory = _setup(tmp_path, monkeypatch)
+    _trip_fixture(session_factory, _txn_ids(session_factory, "COFFEE SHOP A"), "Coffee Trip")
+
+    assert cli.main(["trips", "dates", "Coffee Trip", "2025-07-01"]) == 1
     assert "Usage:" in capsys.readouterr().out

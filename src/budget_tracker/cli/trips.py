@@ -14,22 +14,20 @@ from datetime import date
 from typing import Optional
 
 from .. import queries
+from .. import tags as tags_module
 from .. import trips as trips_module
 from ..db import get_engine, get_sessionmaker, init_db
 
 
-def _format_dates(start: Optional[date], end: Optional[date]) -> str:
-    """``2026-03-02..03-14`` -- the end's year elided when it matches the start's,
-    since a trip is usually inside one stretch of the calendar. Blank for a trip with
-    no transactions (both ``None``); a single date for a one-day trip.
+def _format_date(day: Optional[date]) -> str:
+    """One end of a trip, or blank when there is nothing to derive it from.
+
+    Start and end are separate columns rather than one ``2026-03-02..03-14`` field:
+    they are two facts, they are independently overridable (see
+    ``tags.set_trip_dates``), and a combined field cannot be scanned down a column or
+    sorted by eye.
     """
-    if start is None or end is None:
-        return ""
-    if start == end:
-        return start.isoformat()
-    if end.year == start.year:
-        return f"{start.isoformat()}..{end:%m-%d}"
-    return f"{start.isoformat()}..{end.isoformat()}"
+    return day.isoformat() if day is not None else ""
 
 
 def _format_breakdown(row: queries.TripRow) -> str:
@@ -60,12 +58,17 @@ def _print_trips(rows) -> None:
     if not rows:
         print("No trips yet.")
         return
-    date_width = max((len(_format_dates(r.start, r.end)) for r in rows), default=0)
     name_width = max(len(r.name) for r in rows)
+    print(f"  {'Start':<11} {'End':<11} {'Trip':<{name_width}}")
     for row in rows:
-        dates = _format_dates(row.start, row.end)
+        # A trailing "*" marks a date set by hand rather than derived from the trip's
+        # transactions, so a corrected date is distinguishable from one that happened to
+        # line up -- otherwise the override is invisible and unexplainable later. Marked
+        # per end, since overriding one and leaving the other derived is the usual case.
+        start = _format_date(row.start) + ("*" if row.start_is_manual else "")
+        end = _format_date(row.end) + ("*" if row.end_is_manual else "")
         print(
-            f"  {dates:<{date_width}}  {row.name:<{name_width}}  "
+            f"  {start:<11} {end:<11} {row.name:<{name_width}}  "
             f"{row.count:>6} txns  {row.total_minor / 100:>12,.2f}  "
             f"{_format_breakdown(row)}"
         )
@@ -128,6 +131,37 @@ def _cmd_trips(args: argparse.Namespace) -> int:
             session.commit()
             noun = "category" if written == 1 else "categories"
             print(f"Set {written} {noun} to {bucket!r}.")
+            return 0
+
+        if command == "dates":
+            if args.clear:
+                start = end = None
+            else:
+                if args.start is None or args.end is None:
+                    print(
+                        "Usage: budget trips dates <trip> <start> <end>, "
+                        "or --clear to go back to deriving them."
+                    )
+                    return 1
+                try:
+                    start = date.fromisoformat(args.start)
+                    end = date.fromisoformat(args.end)
+                except ValueError:
+                    print("Dates must be YYYY-MM-DD.")
+                    return 1
+            try:
+                found = tags_module.set_trip_dates(session, args.trip, start, end)
+            except ValueError as error:
+                print(error)
+                return 1
+            if not found:
+                print(f"No trip named {args.trip!r}.")
+                return 1
+            session.commit()
+            if args.clear:
+                print(f"{args.trip!r}: dates back to whatever its transactions say.")
+            else:
+                print(f"{args.trip!r}: {start} .. {end}.")
             return 0
 
         # "list"

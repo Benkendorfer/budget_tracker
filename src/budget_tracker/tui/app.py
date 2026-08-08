@@ -8,8 +8,9 @@ totals line, and a command bar at the bottom.
 from __future__ import annotations
 
 import re
+from datetime import date
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Set
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from rich.text import Text
 from sqlalchemy.orm import Session
@@ -211,6 +212,10 @@ class BudgetApp(App):
         self.date_filter: Optional[queries.DateRange] = None
         self.tag_filter: Optional[int] = None
         self.trip_filter: Optional[int] = None
+        # Only a trips-panel bucket drill-down sets this: an explicit set of category
+        # ids (a bucket is several unrelated categories at once, not a subtree -- see
+        # queries.Filters.category_ids). None means no bucket restriction.
+        self.category_ids_filter: Optional[Tuple[Optional[int], ...]] = None
         self._accounts: List[queries.AccountRow] = []
         self._vendors: List[queries.VendorRow] = []
         self._categories: List[queries.CategoryRow] = []
@@ -325,6 +330,12 @@ class BudgetApp(App):
         # simply whatever was already there.
         self._pre_drill_category_filter: Optional[int] = None
         self._pre_drill_date_filter: Optional[queries.DateRange] = None
+        # Only a trips drill-down (into a trip, or into one of its buckets) touches
+        # these two -- a stats/chart drill-down leaves them recording their own
+        # unchanged value, so _go_back_from_drill can restore all four unconditionally
+        # rather than knowing which drill-down set which.
+        self._pre_drill_trip_filter: Optional[int] = None
+        self._pre_drill_category_ids_filter: Optional[Tuple[Optional[int], ...]] = None
         self._drill_source_row: Optional[int] = None  # table row to land back on
 
     def compose(self) -> ComposeResult:
@@ -357,8 +368,11 @@ class BudgetApp(App):
                 yield DataTable(id="chart")
                 yield Static("", id="pie")
                 with Vertical(id="trips_view"):
-                    yield DataTable(id="trip_table")
+                    # The legend goes above the table: the bars are the thing being
+                    # read, and a key underneath them is one the eye has to travel
+                    # past the whole table to find and then back again.
                     yield Static("", id="trips_legend")
+                    yield trips_panel.TripTable(id="trip_table")
                 yield Static("", id="status")
         yield Input(
             placeholder=(
@@ -380,6 +394,11 @@ class BudgetApp(App):
         """True only right after a chart drill-down — see ``_drill_origin``."""
         return self._drill_origin == "chart"
 
+    @property
+    def _drilled_from_trips(self) -> bool:
+        """True only right after a trips-panel drill-down — see ``_drill_origin``."""
+        return self._drill_origin == "trips"
+
     def check_action(self, action: str, parameters: tuple) -> Optional[bool]:
         """Gate the priority left/right bindings so they only act where they mean something.
 
@@ -389,7 +408,7 @@ class BudgetApp(App):
         hint outside the panel it applies to.
         """
         if action == "drill_down":
-            return self._panel in ("stats", "chart")
+            return self._panel in ("stats", "chart", "trips")
         if action == "drill_up":
             return self._drill_origin is not None
         if action in ("toggle_stats_fold", "toggle_all_stats_folds"):
@@ -572,6 +591,7 @@ class BudgetApp(App):
             date_range=self.date_filter,
             tag_id=self.tag_filter,
             trip_id=self.trip_filter,
+            category_ids=self.category_ids_filter,
         )
 
     def reload(self) -> None:
@@ -973,15 +993,20 @@ class BudgetApp(App):
             session.commit()
         self._build_trips()
         self._fill_trips()
+        # Opening the panel starts with nothing highlighted, however the table was left
+        # last time -- see trips_panel.TripTable.
+        self.query_one("#trip_table", trips_panel.TripTable).hide_cursor()
         self._set_panel("trips")
 
     TRIP_USAGE = (
         "Usage: trip bucket <category>[, <category>...] = <bucket>   "
-        "(blank bucket unmaps it) | trip buckets"
+        "(blank bucket unmaps it) | trip buckets | "
+        "trip dates <trip> = <start>..<end>   (blank derives them again)"
     )
 
     def _do_trip(self, arg: str) -> None:
-        """``trip bucket ... = ...`` sets the map; ``trip buckets`` shows it."""
+        """``trip bucket ... = ...`` sets the map; ``trip buckets`` shows it;
+        ``trip dates ... = ...`` overrides a trip's dates."""
         arg = arg.strip()
         head, _, rest = arg.partition(" ")
         if head.lower() == "buckets":
@@ -990,7 +1015,61 @@ class BudgetApp(App):
         if head.lower() == "bucket":
             self._do_trip_bucket(rest.strip())
             return
+        if head.lower() == "dates":
+            self._do_trip_dates(rest.strip())
+            return
         self.notify(self.TRIP_USAGE, severity="warning")
+
+    def _do_trip_dates(self, arg: str) -> None:
+        """``trip dates <trip> = <start>..<end>``, overriding the derived dates.
+
+        A trip takes its dates from its transactions, which is wrong in the two cases
+        that matter: a flight booked months ahead drags the start back to the booking,
+        and a trip whose last purchase was days before flying home ends early. Neither
+        can be fixed by editing a transaction. A blank right-hand side goes back to
+        deriving them, the way every other ``=`` command in this app undoes.
+        """
+        if "=" not in arg:
+            self.notify(self.TRIP_USAGE, severity="warning")
+            return
+        name, value = (part.strip() for part in arg.split("=", 1))
+        if not name:
+            self.notify(self.TRIP_USAGE, severity="warning")
+            return
+        if value:
+            start_text, separator, end_text = value.partition("..")
+            if not separator:
+                self.notify(self.TRIP_USAGE, severity="warning")
+                return
+            try:
+                start = date.fromisoformat(start_text.strip())
+                end = date.fromisoformat(end_text.strip())
+            except ValueError:
+                self.notify("Dates must be YYYY-MM-DD.", severity="error")
+                return
+        else:
+            start = end = None
+
+        with self.session_factory() as session:
+            try:
+                found = tags_module.set_trip_dates(session, name, start, end)
+            except ValueError as error:
+                self.notify(str(error), severity="error", markup=False)
+                return
+            if not found:
+                self.notify(f"No trip named {name!r}.", severity="error", markup=False)
+                return
+            session.commit()
+        if self._panel == "trips":
+            self._build_trips()
+            self._fill_trips()
+        self.reload()
+        message = (
+            f"{name}: {start} .. {end}"
+            if start
+            else f"{name}: dates back to whatever its transactions say."
+        )
+        self.notify(message, markup=False)
 
     def _do_trip_bucket(self, arg: str) -> None:
         """``trip bucket <categories> = <bucket>`` -- category (or comma-separated
@@ -1112,6 +1191,12 @@ class BudgetApp(App):
             scope.append("tag")
         if self.trip_filter is not None:
             scope.append("trip")
+        if self.category_ids_filter is not None:
+            # Set only by a trips-panel bucket drill-down (see _drill_into_trip_row) --
+            # "bucket" rather than "category" so it reads as the distinct thing it is,
+            # the same reason the date-filter branch below spells out a real range
+            # rather than reusing the word "date".
+            scope.append("bucket")
         if self.date_filter is not None:
             # Spelled out rather than labelled "date": the drill-down from a statistics
             # row is the only thing that sets it, and the user needs to see which window
@@ -1196,6 +1281,9 @@ class BudgetApp(App):
             return
         if event.data_table.id == "chart":
             self._drill_into_bar(event.cursor_row)
+            return
+        if event.data_table.id == "trip_table":
+            self._drill_into_trip_row(event.cursor_row)
             return
         if event.data_table.id == "setup":
             if self._setup is not None and self._setup.question is not None:
@@ -1679,6 +1767,9 @@ class BudgetApp(App):
                 "  as a color bar (trip buckets lists the buckets themselves)\n"
                 "  space folds/unfolds a trip into its buckets; f folds/unfolds every\n"
                 "  trip at once\n"
+                "  enter, or the right arrow, on a trip row lists that trip's\n"
+                "  transactions; on an unfolded bucket row, just that bucket's; the\n"
+                "  left arrow goes back to the trips panel\n"
                 "trip bucket <categories> = <bucket> — map category spending into a\n"
                 "  travel bucket; comma-separate several categories at once, e.g.\n"
                 "  trip bucket Car Rental, Taxi = car — a blank bucket unmaps it\n"
@@ -1860,9 +1951,10 @@ class BudgetApp(App):
     def _set_panel(self, panel: str) -> None:
         """Show one of the main-view panels; escape always returns to transactions."""
         # Leaving the drilled-down view for any other panel invalidates "back to
-        # stats"/"back to chart". _drill_into_category()/_drill_into_bar() and
-        # _go_back_from_drill() all set the flag to its real value themselves, after
-        # calling this, so this cannot undo any of them.
+        # stats"/"back to chart"/"back to trips". _drill_into_category()/
+        # _drill_into_bar()/_drill_into_trip_row() and _go_back_from_drill() all set
+        # the flag to its real value themselves, after calling this, so this cannot
+        # undo any of them.
         self._set_drilled_from(None)
         self._panel = panel
         for name in self.PANELS:
@@ -2583,9 +2675,14 @@ class BudgetApp(App):
         stat = self._stats_rows[row]
         # Remember what the drill-down is about to overwrite, and where it came from, so
         # a left arrow can undo exactly this rather than blanking filters the user set
-        # themselves, and can put the cursor back where it was.
+        # themselves, and can put the cursor back where it was. trip_filter and
+        # category_ids_filter are untouched by this drill-down, but are still snapshot
+        # here so _go_back_from_drill can restore all four the same way regardless of
+        # which drill-down produced this view.
         self._pre_drill_category_filter = self.category_filter
         self._pre_drill_date_filter = self.date_filter
+        self._pre_drill_trip_filter = self.trip_filter
+        self._pre_drill_category_ids_filter = self.category_ids_filter
         self._drill_source_row = row
         self.category_filter = stat.category_id
         self.date_filter = (self._report.window.start, self._report.window.end)
@@ -2616,6 +2713,8 @@ class BudgetApp(App):
         bar = self._chart.bars[row]
         self._pre_drill_category_filter = self.category_filter
         self._pre_drill_date_filter = self.date_filter
+        self._pre_drill_trip_filter = self.trip_filter
+        self._pre_drill_category_ids_filter = self.category_ids_filter
         self._drill_source_row = row
         self.date_filter = charts.bucket_date_range(bar.key, self._bucket, self.window)
         # Panel first: reload() only rebuilds the chart while the chart panel is up, and
@@ -2624,26 +2723,67 @@ class BudgetApp(App):
         self._set_drilled_from("chart")
         self.reload()
 
+    def _drill_into_trip_row(self, row: int) -> None:
+        """Enter, or the right arrow, on a trip row lists that trip's transactions; on
+        one of its unfolded bucket rows, that trip's transactions in that bucket alone.
+
+        A bucket is several unrelated categories at once (trips.resolve_buckets), which
+        is exactly what queries.Filters.category_ids is for -- not a subtree, an
+        explicit set. misc's set always includes None, or every uncategorized
+        transaction on the trip would silently vanish from its own drill-down (see
+        tui.trips.bucket_category_ids).
+        """
+        if not 0 <= row < len(self._trip_rows):
+            return
+        panel_row = self._trip_rows[row]
+        # Same snapshot-everything discipline as _drill_into_category()/
+        # _drill_into_bar(): category_filter/date_filter are untouched by this
+        # drill-down, but are still recorded so _go_back_from_drill can restore all
+        # four uniformly.
+        self._pre_drill_category_filter = self.category_filter
+        self._pre_drill_date_filter = self.date_filter
+        self._pre_drill_trip_filter = self.trip_filter
+        self._pre_drill_category_ids_filter = self.category_ids_filter
+        self._drill_source_row = row
+        self.trip_filter = panel_row.trip.id
+        if panel_row.bucket_index is None:
+            self.category_ids_filter = None
+        else:
+            bucket = trips.BUCKETS[panel_row.bucket_index]
+            with self.session_factory() as session:
+                mapping = trips.resolve_buckets(session)
+            self.category_ids_filter = trips_panel.bucket_category_ids(mapping, bucket)
+        # Panel first: reload() only rebuilds the trips panel while it is up, and
+        # rebuilding it under the new filters would rewrite the rows we just read.
+        self._set_panel("txns")
+        self._set_drilled_from("trips")
+        self.reload()
+
     def _go_back_from_drill(self) -> None:
         """Left arrow, undoing exactly the drill-down that produced this view.
 
-        Mirrors _drill_into_category()/_drill_into_bar(): restores the filters either one
-        overwrote (which may be None, or may be a filter the user had set before drilling
-        in), rebuilds whichever panel the drill-down came from, and returns its cursor to
-        the row that was drilled from.
+        Mirrors _drill_into_category()/_drill_into_bar()/_drill_into_trip_row():
+        restores the four filters any of them might have overwritten (each may be
+        None, or may be a filter the user had set before drilling in -- see their own
+        snapshot comments), rebuilds whichever panel the drill-down came from, and
+        returns its cursor to the row that was drilled from.
         """
         origin = self._drill_origin
         row = self._drill_source_row
         self.category_filter = self._pre_drill_category_filter
         self.date_filter = self._pre_drill_date_filter
+        self.trip_filter = self._pre_drill_trip_filter
+        self.category_ids_filter = self._pre_drill_category_ids_filter
         self._pre_drill_category_filter = None
         self._pre_drill_date_filter = None
+        self._pre_drill_trip_filter = None
+        self._pre_drill_category_ids_filter = None
         self._drill_source_row = None
         self._set_drilled_from(None)
         # reload() while the panel is still "txns" resyncs the transactions/totals to the
-        # restored filters without rebuilding the report or chart (see their own guards),
-        # so whichever one is being returned to is rebuilt explicitly below, the same way
-        # _show_stats()/_show_chart() does.
+        # restored filters without rebuilding the report, chart, or trips panel (see
+        # their own guards), so whichever one is being returned to is rebuilt
+        # explicitly below, the same way _show_stats()/_show_chart()/_show_trips() does.
         self.reload()
         if origin == "chart":
             self._build_chart()
@@ -2653,6 +2793,19 @@ class BudgetApp(App):
                 table = self.query_one("#chart", DataTable)
                 if 0 <= row < table.row_count:
                     table.move_cursor(row=row)
+            return
+        if origin == "trips":
+            self._build_trips()
+            self._fill_trips()
+            self._set_panel("trips")
+            table = self.query_one("#trip_table", trips_panel.TripTable)
+            # Coming back from a drill-down is not a fresh open of the panel -- the
+            # cursor was already visible on the row the user drilled from (they had to
+            # touch the table to get there), so it stays visible rather than hiding
+            # again the way _show_trips() makes a genuinely new open start clean.
+            table.show_cursor = True
+            if row is not None and 0 <= row < table.row_count:
+                table.move_cursor(row=row)
             return
         self._build_report()
         self._fill_stats()
@@ -2727,10 +2880,15 @@ class BudgetApp(App):
         self._prefill_command(f"{verb} {vendor.name} = ")
 
     def action_drill_down(self) -> None:
-        """The right arrow's twin of enter on a statistics row or a chart bar."""
+        """The right arrow's twin of enter on a statistics row, a chart bar, or a
+        trips-panel row."""
         if self._panel == "chart":
             table = self.query_one("#chart", DataTable)
             self._drill_into_bar(table.cursor_row)
+            return
+        if self._panel == "trips":
+            table = self.query_one("#trip_table", DataTable)
+            self._drill_into_trip_row(table.cursor_row)
             return
         table = self.query_one("#stats_table", DataTable)
         self._drill_into_category(table.cursor_row)
@@ -2862,6 +3020,7 @@ class BudgetApp(App):
         self.date_filter = None
         self.tag_filter = None
         self.trip_filter = None
+        self.category_ids_filter = None
         self.reload()
         self.notify("Filters cleared.")
 

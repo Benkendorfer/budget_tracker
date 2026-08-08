@@ -326,6 +326,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Unmap the categories instead of assigning them (falls back to misc).",
     )
 
+    trips_dates = trips_subparsers.add_parser(
+        "dates",
+        help=(
+            "Set a trip's start and end by hand, overriding the dates derived from "
+            "its transactions, or --clear to go back to deriving them."
+        ),
+    )
+    trips_dates.add_argument("trip", help="The trip's name.")
+    trips_dates.add_argument("start", nargs="?", help="Start date, YYYY-MM-DD.")
+    trips_dates.add_argument("end", nargs="?", help="End date, YYYY-MM-DD.")
+    trips_dates.add_argument(
+        "--clear",
+        action="store_true",
+        help="Derive the dates from the trip's transactions again.",
+    )
+
     account_parser = subparsers.add_parser(
         "account", help="List, rename, or merge accounts."
     )

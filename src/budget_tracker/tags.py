@@ -20,6 +20,7 @@ function here edits transactions per-row (a list of ids), unlike :mod:`.vendors`
 
 from __future__ import annotations
 
+from datetime import date
 from typing import Dict, List, Optional, Sequence
 
 from sqlalchemy import delete, insert, select
@@ -159,6 +160,33 @@ def tags_for(session: Session, txn_ids: Sequence[int]) -> Dict[int, List[Tag]]:
     for txn_id, tag in rows:
         result[txn_id].append(tag)
     return result
+
+
+def set_trip_dates(
+    session: Session,
+    name: str,
+    start: Optional[date],
+    end: Optional[date],
+) -> bool:
+    """Override a trip's dates. ``None`` for either goes back to deriving that end.
+
+    Returns ``False`` if no trip called ``name`` exists. The two ends are independent:
+    passing a start and ``None`` for the end fixes the start and leaves the end derived
+    from the transactions, which is the common case (a flight booked months ahead drags
+    a start back; the end was right all along).
+
+    A start after the end is refused rather than stored -- it would invert the panel's
+    sort and read as a trip that ended before it began.
+    """
+    trip = resolve(session, name, TRIP)
+    if trip is None:
+        return False
+    if start is not None and end is not None and start > end:
+        raise ValueError(f"A trip cannot end before it starts: {start} .. {end}.")
+    trip.start_date = start
+    trip.end_date = end
+    session.flush()
+    return True
 
 
 def rename_tag(session: Session, name: str, new_name: str, kind: str = TAG) -> bool:
