@@ -14,6 +14,7 @@ from budget_tracker import queries, transfers
 from budget_tracker.db import get_engine, get_sessionmaker, init_db
 from budget_tracker.importer import import_csv
 from budget_tracker.models import Account, Currency, Transaction
+from budget_tracker.tui import transactions
 from budget_tracker.tui import BudgetApp, _fmt_amount
 
 from conftest import _rows_of, _setup
@@ -311,7 +312,7 @@ def test_txns_table_columns_fit_the_real_terminal(tmp_path, monkeypatch):
             return widths, table.size.width
 
     widths, panel_width = asyncio.run(run())
-    assert widths == [2, 10, 30, 20, 16, 15, 18, 22]
+    assert widths == [2, 10, 30, 20, 16, 15, 18, transactions.TAGS_COLUMN_WIDTH]
     # Two cells of padding per column, plus the panel's own round border.
     assert sum(widths) + 2 * len(widths) + 2 <= panel_width
 

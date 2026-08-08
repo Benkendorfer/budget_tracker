@@ -22,6 +22,10 @@ SELECTED_MARK = "✓"
 # tag's "#" prefix so a trip reads as a place, not a label.
 TRIP_MARK = "✈"
 
+# Shared with app.py's add_column so the declared width and the width the cell
+# truncates to cannot drift apart.
+TAGS_COLUMN_WIDTH = 30
+
 _NO_SELECTION: FrozenSet[int] = frozenset()
 
 
@@ -57,5 +61,5 @@ def fill_txns(
             _txn_cell(txn.category, 16, txn.is_transfer),
             _amount_cell(txn.amount_minor, txn.is_transfer, currencies.get(txn.currency)),
             _txn_cell(txn.account, 18, txn.is_transfer),
-            _tags_cell(txn.trip or "", txn.tags, 22, txn.is_transfer),
+            _tags_cell(txn.trip or "", txn.tags, TAGS_COLUMN_WIDTH, txn.is_transfer),
         )

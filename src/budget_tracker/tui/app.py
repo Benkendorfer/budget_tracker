@@ -370,10 +370,12 @@ class BudgetApp(App):
         table.add_column("Amount", width=15)
         table.add_column("Account", width=18)
         # The trip (if any) then ordinary tags, from queries.TxnRow.trip/tags -- see
-        # transactions._tags_cell().
-        table.add_column("Tags", width=22)
-        # 2 + 10 + 30 + 20 + 16 + 15 + 18 + 22 = 133, plus 2 columns of padding each
-        # (16) = 149. The main panel is ~175 wide at the terminal size the user
+        # transactions._tags_cell(). 30 rather than 22 because a single trip and a
+        # single tag ("✈Japan 2026 #reimbursable") is already 25 characters, and that
+        # is the ordinary case rather than a worst case.
+        table.add_column("Tags", width=transactions.TAGS_COLUMN_WIDTH)
+        # 2 + 10 + 30 + 20 + 16 + 15 + 18 + 30 = 141, plus 2 columns of padding each
+        # (16) = 157. The main panel is ~175 wide at the terminal size the user
         # actually runs (213 columns), not the 130-wide test default, so this fits
         # with room to spare -- see the 2026-08-08 spec correction that replaced the
         # earlier 92-column budget.
@@ -1303,6 +1305,13 @@ class BudgetApp(App):
                 "x, or clicking a row — select/deselect a transaction for bulk edits\n"
                 "sel all — select every transaction currently listed\n"
                 "sel none — clear the selection\n"
+                "sel category = <name> — categorize everything selected (blank undoes)\n"
+                "sel vendor = <name> — point everything selected at that vendor\n"
+                "sel tag = <name> / sel untag = <name> — add or remove a tag\n"
+                "sel trip = <name> — put everything selected on a trip, replacing any\n"
+                "  other trip; sel untrip takes them off it\n"
+                "  the selection survives an edit, so you can set a category and then\n"
+                "  a tag on the same rows without reselecting\n"
                 "  ctrl+n / ctrl+t prefill 'sel vendor = ' / 'sel category = ' once\n"
                 "  anything is selected, in place of their usual per-vendor behavior\n"
                 "transfers — pair up movements between your own accounts\n"
@@ -1745,30 +1754,108 @@ class BudgetApp(App):
     )
 
     def _do_sel(self, arg: str) -> None:
-        """Act on the multi-select: ``sel all`` / ``sel none`` this wave.
+        """Act on the multi-select — the one place transactions are edited per row.
 
-        The rest of the grammar (``sel category = ...``, ``sel vendor = ...``,
-        ``sel tag = ...``, ``sel untag = ...``, ``sel trip = ...``, ``sel untrip``)
-        lands in a later wave, once tags exist. Parsed here in the shape it will need
-        — a bare subject, or ``<subject> = <value>`` — so adding those is a new branch
-        below, not a rewrite of this one. An unrecognized subcommand notifies rather
-        than crashing.
+        Every other write in this app keys off a vendor and hits all of that vendor's
+        transactions; these key off the rows the user actually picked. Parsed as a bare
+        subject or ``<subject> = <value>``, so an empty right-hand side undoes, the way
+        a bare ``filter`` and ``categorize <vendor> =`` already do.
         """
         arg = arg.strip()
         if not arg:
             self.notify(self.SEL_USAGE, severity="warning")
             return
-        subject, _, value = (part.strip() for part in arg.partition("="))
+        subject, separator, value = (part.strip() for part in arg.partition("="))
         subject = subject.lower()
-        if subject == "all" and not value:
+        if subject == "all" and not separator:
             self._sel_all()
             return
-        if subject == "none" and not value:
+        if subject == "none" and not separator:
             self._sel_none()
+            return
+        if subject == "untrip" and not separator:
+            self._sel_write(tags_module.clear_trip, "taken off their trip")
+            return
+        if subject in self.SEL_WRITE_SUBJECTS:
+            if not separator:
+                self.notify(self.SEL_USAGE, severity="warning")
+                return
+            self._sel_apply(subject, value)
             return
         self.notify(
             f"Unknown 'sel' command: {arg!r}\n{self.SEL_USAGE}",
             severity="warning",
+            markup=False,
+        )
+
+    # The `sel <subject> = <value>` verbs, and whether the value is allowed to be blank.
+    # Only `category` is: a blank right-hand side undoes it, matching
+    # `categorize <vendor> =`. Blanking a vendor or a tag has no obvious meaning, so
+    # those are a usage error rather than a silent no-op.
+    SEL_WRITE_SUBJECTS = {
+        "category": True,
+        "vendor": False,
+        "tag": False,
+        "untag": False,
+        "trip": False,
+    }
+
+    def _sel_apply(self, subject: str, value: str) -> None:
+        """Run one ``sel <subject> = <value>`` verb over the selection."""
+        if not value and not self.SEL_WRITE_SUBJECTS[subject]:
+            self.notify(self.SEL_USAGE, severity="warning")
+            return
+
+        if subject == "category":
+            if value:
+                self._sel_write(
+                    lambda session, ids: categories.set_category_for(session, ids, value),
+                    f"categorized {value!r}",
+                )
+            else:
+                # Mirrors `categorize <vendor> =`: a blank right-hand side undoes.
+                self._sel_write(categories.clear_category_for, "cleared of their category")
+        elif subject == "vendor":
+            self._sel_write(
+                lambda session, ids: vendors.set_vendor(session, ids, value),
+                f"pointed at vendor {value!r}",
+            )
+        elif subject == "tag":
+            self._sel_write(
+                lambda session, ids: tags_module.add_tag(session, ids, value),
+                f"tagged {value!r}",
+            )
+        elif subject == "untag":
+            self._sel_write(
+                lambda session, ids: tags_module.remove_tag(session, ids, value),
+                f"untagged {value!r}",
+            )
+        elif subject == "trip":
+            self._sel_write(
+                lambda session, ids: tags_module.set_trip(session, ids, value),
+                f"put on trip {value!r}",
+            )
+
+    def _sel_write(self, write, description: str) -> None:
+        """Apply ``write(session, ids)`` to the selection, then reload and report.
+
+        The selection deliberately survives: setting a category and then a tag on the
+        same rows is the common case, and having to reselect between the two would make
+        the feature tedious enough not to use. The core modules do not commit -- callers
+        own the transaction -- so this does, the way :meth:`_do_categorize` does.
+        """
+        if not self._selected_ids:
+            self.notify("Nothing selected.", severity="warning")
+            return
+        ids = sorted(self._selected_ids)
+        with self.session_factory() as session:
+            changed = write(session, ids)
+            session.commit()
+        self.reload()
+        # markup=False: a category, vendor or tag name may contain square brackets,
+        # which Rich would otherwise read as markup.
+        self.notify(
+            f"{changed} transaction{'s' if changed != 1 else ''} {description}.",
             markup=False,
         )
 
