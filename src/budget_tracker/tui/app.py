@@ -36,6 +36,7 @@ from .. import (
     queries,
     rates,
     stats,
+    tags as tags_module,
     transfers,
     vendors,
 )
@@ -368,8 +369,8 @@ class BudgetApp(App):
         # test_txns_amount_column_fits_a_symbol_and_a_six_figure_amount.
         table.add_column("Amount", width=15)
         table.add_column("Account", width=18)
-        # Always blank for now -- tags don't exist yet. A later wave fills this from
-        # queries.TxnRow.tags/trip; the column exists early so that wave is additive.
+        # The trip (if any) then ordinary tags, from queries.TxnRow.trip/tags -- see
+        # transactions._tags_cell().
         table.add_column("Tags", width=22)
         # 2 + 10 + 30 + 20 + 16 + 15 + 18 + 22 = 133, plus 2 columns of padding each
         # (16) = 149. The main panel is ~175 wide at the terminal size the user

@@ -7,17 +7,37 @@ totals-driven status line, the drill-down that lands here) is app state, and sta
 
 from __future__ import annotations
 
-from typing import AbstractSet, Dict, FrozenSet, List
+from typing import AbstractSet, Dict, FrozenSet, List, Tuple
 
+from rich.text import Text
 from textual.widgets import DataTable
 
 from .. import queries
-from .formatting import TRANSFER_MARK, _amount_cell, _txn_cell
+from .formatting import TRANSFER_MARK, TRANSFER_STYLE, _amount_cell, _truncate, _txn_cell
 
 # The cell shown in the leading select column -- see BudgetApp._selected_ids.
 SELECTED_MARK = "✓"
 
+# The trip marker in the Tags column, e.g. "✈Japan 2026" -- distinct from an ordinary
+# tag's "#" prefix so a trip reads as a place, not a label.
+TRIP_MARK = "✈"
+
 _NO_SELECTION: FrozenSet[int] = frozenset()
+
+
+def _tags_cell(trip: str, tags: Tuple[str, ...], width: int, is_transfer: bool) -> Text:
+    """The Tags column: the trip first (``✈Japan 2026``), then ordinary tags sorted
+    by name and space-separated (``#reimbursable``), dim-styled, truncated -- and
+    following the same dim-on-transfer idiom every other cell in the row gets, so a
+    tagged transfer still reads as a transfer rather than losing that at a glance.
+    """
+    parts = []
+    if trip:
+        parts.append(f"{TRIP_MARK}{trip}")
+    parts.extend(f"#{tag}" for tag in sorted(tags))
+    text = " ".join(parts)
+    style = TRANSFER_STYLE if is_transfer else "dim"
+    return Text(_truncate(text, width), style=style)
 
 
 def fill_txns(
@@ -37,8 +57,5 @@ def fill_txns(
             _txn_cell(txn.category, 16, txn.is_transfer),
             _amount_cell(txn.amount_minor, txn.is_transfer, currencies.get(txn.currency)),
             _txn_cell(txn.account, 18, txn.is_transfer),
-            # Always blank for now -- tags don't exist yet (queries.TxnRow has no
-            # tags/trip field this wave). A later wave fills this from that data; the
-            # column exists early so that wave is additive, not a reshape.
-            "",
+            _tags_cell(txn.trip or "", txn.tags, 22, txn.is_transfer),
         )
