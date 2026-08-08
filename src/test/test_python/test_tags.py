@@ -380,6 +380,55 @@ def test_get_tags_counts_and_sums_over_the_transactions_carrying_it(tmp_path):
         ]
 
 
+def test_trips_sort_by_name_not_by_transaction_count(tmp_path):
+    """A trip list is a handful of proper nouns the user already knows the name of, so
+    it is scanned alphabetically; ordinary tags stay busiest-first."""
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        currency, accounts = _seed(session)
+        txns = [
+            _txn(session, currency, accounts["Checking"], date(2025, 1, n + 1), -100, str(n))
+            for n in range(3)
+        ]
+        session.commit()
+        ids = [t.id for t in txns]
+
+    with session_factory() as session:
+        # Zurich gets the most transactions, Berlin the fewest -- so count order and
+        # name order disagree, and the assertion can tell them apart.
+        tags.set_trip(session, ids, "Zurich 2026")
+        tags.set_trip(session, ids[:2], "Oregon 2026")
+        tags.set_trip(session, ids[:1], "Berlin 2026")
+        session.commit()
+
+    with session_factory() as session:
+        assert [r.name for r in queries.get_tags(session, tags.TRIP)] == [
+            "Berlin 2026", "Oregon 2026", "Zurich 2026",
+        ]
+
+
+def test_a_mixed_listing_groups_tags_before_trips(tmp_path):
+    """Two kinds sorted by two different rules have to be grouped, not interleaved."""
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        currency, accounts = _seed(session)
+        txn = _txn(session, currency, accounts["Checking"], date(2025, 1, 1), -100, "A")
+        session.commit()
+        ids = [txn.id]
+
+    with session_factory() as session:
+        tags.set_trip(session, ids, "Alps 2026")
+        tags.add_tag(session, ids, "zzz-tag")
+        session.commit()
+
+    with session_factory() as session:
+        rows = queries.get_tags(session)
+        # Alphabetically 'Alps 2026' would come first; grouping by kind wins.
+        assert [(r.kind, r.name) for r in rows] == [
+            (tags.TAG, "zzz-tag"), (tags.TRIP, "Alps 2026"),
+        ]
+
+
 def test_get_tags_shows_a_tag_with_no_transactions(tmp_path):
     """Unlike get_categories, an empty tag stays visible -- a freshly created trip must
     be selectable to put something on it."""

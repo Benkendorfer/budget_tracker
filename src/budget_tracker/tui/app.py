@@ -40,6 +40,7 @@ from .. import (
     stats,
     tags as tags_module,
     transfers,
+    trips,
     vendors,
 )
 from ..db import DuplicateCategoryNamesError, get_engine, get_sessionmaker, init_db
@@ -60,6 +61,7 @@ from . import pie as pie_panel
 from . import rules as rules_panel
 from . import stats as stats_panel
 from . import transactions
+from . import trips as trips_panel
 from .formatting import CHART_WIDTH, _fmt_amount, _range_label, _truncate
 from .imports import _Setup
 
@@ -98,13 +100,18 @@ class BudgetApp(App):
     #stats { height: 1fr; }
     #stats_table, #chart { border: round $accent; height: 1fr; }
     #pie { border: round $accent; height: 1fr; padding: 1; }
+    #trips_view { height: 1fr; }
+    #trip_table { border: round $accent; height: 1fr; }
+    #trips_legend { height: auto; padding: 0 1; color: $text-muted; }
     #prompt { height: auto; padding: 1 1 0 1; color: $accent; }
     #status { height: 1; padding: 0 1; color: $text-muted; background: $panel; }
     #command { border: tall $accent; }
     .heading { padding: 0 1; text-style: bold; color: $accent; }
     """
 
-    PANELS = ("txns", "rules", "imports", "setup", "periods", "stats", "chart", "pie")
+    PANELS = (
+        "txns", "rules", "imports", "setup", "periods", "stats", "chart", "pie", "trips",
+    )
 
     # The sidebar's five collapsible sections, in the order they are stacked. Exactly
     # one is expanded (its ListView shown) at a time; the rest collapse to their
@@ -120,7 +127,13 @@ class BudgetApp(App):
         "trips": "Trips",
     }
     # Panels whose widget is not itself focusable name the child that takes focus.
-    PANEL_FOCUS = {"stats": "#stats_table"}
+    PANEL_FOCUS = {"stats": "#stats_table", "trips": "#trip_table"}
+    # Panels whose *container* id cannot just be "#<panel name>": "trips" would
+    # collide with the sidebar's own #trips ListView (see SECTIONS/compose()), so its
+    # container is #trips_view instead. Every other panel's container id is still just
+    # its own name -- see _set_panel()'s display-toggle loop, the one place this is
+    # read.
+    PANEL_CONTAINER = {"trips": "trips_view"}
 
     # The vendor sidebar mounts one ListItem per row, and a real history runs to
     # hundreds of distinct merchants. _fill_list's cache guard already skips rebuilding
@@ -273,6 +286,19 @@ class BudgetApp(App):
         # _SHARE_BUCKETS. Monthly by default; sticky across a new period the same way
         # the chart's measure is, not re-derived from the window's length.
         self._pie_bucket = "month"
+        # The trips panel's own data (dates, cost, bucket breakdown) -- not scoped by
+        # the app's other filters, since queries.get_trips takes none: a trip is
+        # already its own scope. See _build_trips().
+        self._trip_data: List[queries.TripRow] = []
+        # Parallel to the rendered rows of #trip_table, bucket sub-rows included -- see
+        # trips_panel.TripPanelRow and _fill_trips().
+        self._trip_rows: List[trips_panel.TripPanelRow] = []
+        # Which trips are currently unfolded, and which trip ids are foldable at all
+        # (every one of them -- see trips_panel's own module docstring for why this is
+        # a deliberately separate Set from the statistics panel's _collapsed/
+        # _foldable_ids rather than a shared one).
+        self._trips_expanded: Set[int] = set()
+        self._trips_foldable_ids: Set[int] = set()
         self._range_pending = False  # awaiting a typed date range for the picker
         # Which panel the period picker is choosing for: "stats", "chart", or "pie". All
         # three open the same picker, and it has to know where the answer goes.
@@ -330,12 +356,15 @@ class BudgetApp(App):
                     yield DataTable(id="stats_table")
                 yield DataTable(id="chart")
                 yield Static("", id="pie")
+                with Vertical(id="trips_view"):
+                    yield DataTable(id="trip_table")
+                    yield Static("", id="trips_legend")
                 yield Static("", id="status")
         yield Input(
             placeholder=(
                 "command: import | unimport | filter | categorize | category | sel | "
-                "section | format | stats | chart | pie | rates | rules | all | refresh | "
-                "help | quit"
+                "section | format | stats | chart | pie | trips | rates | rules | all | "
+                "refresh | help | quit"
             ),
             id="command",
         )
@@ -364,6 +393,10 @@ class BudgetApp(App):
         if action == "drill_up":
             return self._drill_origin is not None
         if action in ("toggle_stats_fold", "toggle_all_stats_folds"):
+            # Same keys fold the trips panel's per-trip buckets -- see
+            # action_toggle_stats_fold()/action_toggle_all_stats_folds().
+            if self._panel == "trips":
+                return self.focused is not None and self.focused.id == "trip_table"
             return (
                 self._panel == "stats"
                 and self.focused is not None
@@ -493,6 +526,13 @@ class BudgetApp(App):
         # Columns are added in _fill_chart, not here: two of the headers name the measure
         # being charted, so they change when 'm' does.
 
+        trip_table = self.query_one("#trip_table", DataTable)
+        trip_table.cursor_type = "row"
+        trip_table.zebra_stripes = True
+        # Columns are added in trips_panel.fill_trips, not here: the Breakdown column's
+        # width is adaptive (see trips_panel.bar_width), so it is only known once the
+        # panel's actual width is.
+
         self.query_one("#stats", Vertical).display = False
         chart.display = False
         pie = self.query_one("#pie", Static)
@@ -501,6 +541,7 @@ class BudgetApp(App):
         # action_cycle_bucket instead of being typed into the command bar (see
         # _set_panel()).
         pie.can_focus = True
+        self.query_one("#trips_view", Vertical).display = False
         self.query_one("#prompt", Static).display = False
 
         # Accounts starts expanded; every other section collapses to its heading. See
@@ -586,6 +627,12 @@ class BudgetApp(App):
             self._build_report()
             self._build_pie()
             self._fill_pie()
+        # The trips panel is not scoped by the app's other filters (queries.get_trips
+        # takes none -- a trip is already its own scope), so this only needs to notice
+        # the database changed, not any filter above.
+        if self._panel == "trips":
+            self._build_trips()
+            self._fill_trips()
         # A collapsed heading's summary names whichever filter is active on it, so it
         # has to be redrawn whenever a filter (or the sidebar's own contents) changes --
         # not just when a section expands or collapses.
@@ -874,6 +921,124 @@ class BudgetApp(App):
         """One line, the same shape as _stats_status()/_chart_status()."""
         return pie_panel.pie_status(self._report, self._pie, self._pie_bucket)
 
+    # ----------------------------------------------------------------- trips
+    def _build_trips(self) -> None:
+        """Fetch every trip's dates, cost, and bucket breakdown -- no window, no
+        filters: queries.get_trips takes none (a trip is already its own scope)."""
+        with self.session_factory() as session:
+            self._trip_data = queries.get_trips(session)
+
+    def _fill_trips(self) -> None:
+        """Redraw the table (columns included -- the Breakdown column's width is
+        adaptive, see trips_panel.bar_width) and the shared legend beneath it."""
+        table = self.query_one("#trip_table", DataTable)
+        width = trips_panel.bar_width(self.query_one("#main").size.width)
+        self._trip_rows, self._trips_foldable_ids = trips_panel.fill_trips(
+            table, self._trip_data, self._trips_expanded, width
+        )
+        self.query_one("#trips_legend", Static).update(trips_panel.legend())
+
+    def _toggle_trip_fold(self, row: int) -> None:
+        """Space on a trip row: unfold/fold its trips.BUCKETS rows. See check_action()."""
+        if not trips_panel.toggle_fold(
+            row, self._trip_rows, self._trips_foldable_ids, self._trips_expanded
+        ):
+            return
+        self._fill_trips()
+        table = self.query_one("#trip_table", DataTable)
+        if 0 <= row < table.row_count:
+            table.move_cursor(row=row)
+
+    def _toggle_trip_fold_all(self) -> None:
+        """``f`` on the trips table: unfold/fold every trip. See check_action()."""
+        if not self._trips_foldable_ids:
+            return
+        table = self.query_one("#trip_table", DataTable)
+        row = table.cursor_row
+        trips_panel.toggle_fold_all(self._trips_foldable_ids, self._trips_expanded)
+        self._fill_trips()
+        if table.row_count:
+            table.move_cursor(row=min(row, table.row_count - 1))
+
+    def _show_trips(self) -> None:
+        """``trips``: seed the bucket map if it is still empty, then open the panel.
+
+        Seeding is idempotent (trips.seed_default_buckets checks the table itself, not
+        the individual names) so calling it on every open costs one cheap query once
+        the user has actually edited the map, and makes the map useful the very first
+        time without a separate setup step.
+        """
+        with self.session_factory() as session:
+            trips.seed_default_buckets(session)
+            session.commit()
+        self._build_trips()
+        self._fill_trips()
+        self._set_panel("trips")
+
+    TRIP_USAGE = (
+        "Usage: trip bucket <category>[, <category>...] = <bucket>   "
+        "(blank bucket unmaps it) | trip buckets"
+    )
+
+    def _do_trip(self, arg: str) -> None:
+        """``trip bucket ... = ...`` sets the map; ``trip buckets`` shows it."""
+        arg = arg.strip()
+        head, _, rest = arg.partition(" ")
+        if head.lower() == "buckets":
+            self._notify_trip_buckets()
+            return
+        if head.lower() == "bucket":
+            self._do_trip_bucket(rest.strip())
+            return
+        self.notify(self.TRIP_USAGE, severity="warning")
+
+    def _do_trip_bucket(self, arg: str) -> None:
+        """``trip bucket <categories> = <bucket>`` -- category (or comma-separated
+        list) on the left, bucket on the right, matching every other ``=`` command in
+        this app. A blank right-hand side unmaps, the way ``categorize <vendor> =``
+        already does.
+        """
+        if "=" not in arg:
+            self.notify(self.TRIP_USAGE, severity="warning")
+            return
+        left, value = (part.strip() for part in arg.split("=", 1))
+        category_names = [name.strip() for name in left.split(",") if name.strip()]
+        if not category_names:
+            self.notify(self.TRIP_USAGE, severity="warning")
+            return
+        with self.session_factory() as session:
+            try:
+                if value:
+                    changed = trips.set_bucket(session, category_names, value)
+                    message = (
+                        f"{', '.join(category_names)} → {value} "
+                        f"({changed} categor{'y' if changed == 1 else 'ies'})"
+                    )
+                else:
+                    changed = trips.clear_bucket(session, category_names)
+                    message = (
+                        f"{', '.join(category_names)}: unmapped "
+                        f"({changed} categor{'y' if changed == 1 else 'ies'})"
+                    )
+            except ValueError as error:
+                self.notify(str(error), severity="error", markup=False)
+                return
+            session.commit()
+        if self._panel == "trips":
+            self._build_trips()
+            self._fill_trips()
+            self._refresh_status()
+        self.notify(message, markup=False)
+
+    def _notify_trip_buckets(self) -> None:
+        with self.session_factory() as session:
+            mapping = trips.list_buckets(session)
+        lines = [
+            f"{bucket}: {', '.join(mapping[bucket]) if mapping[bucket] else '(none)'}"
+            for bucket in trips.BUCKETS
+        ]
+        self.notify("\n".join(lines), title="Trip buckets", markup=False, timeout=8)
+
     def _fill_periods(self) -> None:
         periods_panel.fill_periods(self.query_one("#periods", DataTable))
 
@@ -891,6 +1056,9 @@ class BudgetApp(App):
             return
         if self._panel == "pie" and self._report is not None:
             status.update(self._pie_status())
+            return
+        if self._panel == "trips":
+            status.update(trips_panel.trips_status(self._trip_data))
             return
         if self._panel == "periods":
             status.update(
@@ -1416,6 +1584,14 @@ class BudgetApp(App):
             self._do_chart(arg)
         elif name == "pie":
             self._do_pie(arg)
+        elif name == "trips":
+            # Bare "trips" opens the panel; there is no windowed variant like
+            # stats/chart/pie -- a trip is already its own scope. Not "trip" (singular):
+            # that name is reserved for the bucket-map commands below, and "sel trip ="
+            # already exists for putting the selection on one.
+            self._show_trips()
+        elif name == "trip":
+            self._do_trip(arg)
         elif name == "rates":
             self._do_rates(arg)
         elif name == "help":
@@ -1499,6 +1675,14 @@ class BudgetApp(App):
                 "  only categories with real net spend get a segment — a category\n"
                 "  that is all refund, or a window with no spending, draws none;\n"
                 "  small categories fold into Other\n"
+                "trips — see each trip's dates, cost, and a travel-bucket breakdown\n"
+                "  as a color bar (trip buckets lists the buckets themselves)\n"
+                "  space folds/unfolds a trip into its buckets; f folds/unfolds every\n"
+                "  trip at once\n"
+                "trip bucket <categories> = <bucket> — map category spending into a\n"
+                "  travel bucket; comma-separate several categories at once, e.g.\n"
+                "  trip bucket Car Rental, Taxi = car — a blank bucket unmaps it\n"
+                "trip buckets — show the bucket map, grouped by bucket\n"
                 "rates — list cached exchange rates (pair, source, span, count)\n"
                 "rates fetch — cache ECB reference rates for every foreign currency\n"
                 "  on file, over its whole date range; runs in the background so the\n"
@@ -1682,7 +1866,8 @@ class BudgetApp(App):
         self._set_drilled_from(None)
         self._panel = panel
         for name in self.PANELS:
-            self.query_one(f"#{name}").display = name == panel
+            container_id = self.PANEL_CONTAINER.get(name, name)
+            self.query_one(f"#{container_id}").display = name == panel
         # The prompt belongs to whichever panel last raised a question.
         self.query_one("#prompt", Static).display = panel == self._prompt_panel
         if panel == "txns":
@@ -2555,12 +2740,24 @@ class BudgetApp(App):
         self._go_back_from_drill()
 
     def action_toggle_stats_fold(self) -> None:
-        """Space on a statistics row: fold/unfold its subtree. See check_action()."""
+        """Space on a statistics row: fold/unfold its subtree.
+
+        Same key, on the trips panel, folds/unfolds a trip's buckets instead --
+        see check_action() for the gate and _toggle_trip_fold() for what it does.
+        """
+        if self._panel == "trips":
+            table = self.query_one("#trip_table", DataTable)
+            self._toggle_trip_fold(table.cursor_row)
+            return
         table = self.query_one("#stats_table", DataTable)
         self._toggle_fold(table.cursor_row)
 
     def action_toggle_all_stats_folds(self) -> None:
-        """``f`` on the statistics table: fold/unfold every group. See check_action()."""
+        """``f``: fold/unfold every group in the statistics table, or every trip in
+        the trips panel. See check_action()."""
+        if self._panel == "trips":
+            self._toggle_trip_fold_all()
+            return
         self._toggle_fold_all()
 
     def action_toggle_selected(self) -> None:

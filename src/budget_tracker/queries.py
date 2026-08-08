@@ -18,7 +18,7 @@ from typing import Dict, List, Optional, Set, Tuple
 from sqlalchemy import case, func, or_, select, true
 from sqlalchemy.orm import Session, selectinload
 
-from . import rates
+from . import rates, trips
 from .models import (
     Account,
     Category,
@@ -354,8 +354,18 @@ class TagRow:
 def get_tags(session: Session, kind: Optional[str] = None) -> List[TagRow]:
     """The sidebar's tag list, each row counted over the transactions carrying it.
 
-    Sorted ``(-count, name.lower())``, matching :func:`get_vendors`. Unlike
-    :func:`get_categories`, a tag with no transactions still appears -- a freshly
+    **The two kinds sort differently, on purpose.** Ordinary tags sort by
+    ``(-count, name)`` like :func:`get_vendors`, because that list is an index the user
+    scans by weight: the tag they reach for most should not drift down it as other tags
+    are created. Trips sort by name, because a trip list is a small set of proper nouns
+    that the user comes to already knowing which one they want, and hunting for
+    ``Oregon 2026`` in transaction-count order means reading the whole list every time.
+
+    In a mixed listing (``kind=None``) that would be two incompatible orders in one
+    list, so the kinds are grouped -- tags first, then trips -- rather than interleaved
+    under whichever rule happened to win.
+
+    Unlike :func:`get_categories`, a tag with no transactions still appears -- a freshly
     created trip with nothing on it yet must be visible in the sidebar or the user has
     no way to add anything to it.
     """
@@ -382,7 +392,12 @@ def get_tags(session: Session, kind: Optional[str] = None) -> List[TagRow]:
         )
         for tag in session.scalars(query)
     ]
-    rows.sort(key=lambda r: (-r.count, r.name.lower()))
+    def order(row: TagRow) -> Tuple[int, int, str]:
+        if row.kind == TRIP:
+            return (1, 0, row.name.lower())
+        return (0, -row.count, row.name.lower())
+
+    rows.sort(key=order)
     return rows
 
 
@@ -1187,6 +1202,146 @@ def get_category_bucket_totals(
     ]
     results.sort(key=lambda r: r.bucket_key)
     return results
+
+
+@dataclass(frozen=True)
+class TripRow:
+    """A trip's dates, cost, and per-travel-bucket breakdown, for the trips panel."""
+
+    id: int
+    name: str
+    start: Optional[date]  # earliest posted_date on the trip; None if it has none
+    end: Optional[date]  # latest; both None for a trip with no transactions
+    count: int  # every transaction on the trip, transfers included
+    total_minor: int  # cost, in home_currency -- see get_trips
+    buckets: Tuple[int, ...]  # one entry per trips.BUCKETS, same order, same units
+
+
+def get_trips(session: Session, home_currency: str = HOME_CURRENCY) -> List[TripRow]:
+    """Every trip with its dates, cost, and per-bucket breakdown.
+
+    Cost is the negated net of the trip's non-transfer transactions, converted to
+    ``home_currency`` at each day's own rate (the same path ``get_totals`` uses --
+    ``_currencies_present``'s single-currency fast path, else ``rates.convert`` per
+    (currency, day) group), so a refunded booking reduces the trip rather than
+    inflating it. Reported as a positive number when spending outweighs refunds.
+
+    ``buckets`` carries the same signed convention per travel bucket (see
+    ``trips.BUCKETS``, ``trips.resolve_buckets`` for how a category maps to one): a
+    bucket where refunds outweigh spending is negative here. Clamping that to 0 is the
+    bar's job, not this query's -- the unfolded number next to the bar must stay honest
+    even when the bar itself cannot show a negative segment.
+
+    A transaction with no category, or one no ancestor of which is mapped, falls into
+    ``trips.MISC``, same as ``trips.resolve_buckets``. Trips with no transactions still
+    appear (dates ``None``, cost 0) -- same reasoning as ``get_tags``: a trip you cannot
+    see is one you cannot fill. Sorted by ``start`` descending, dateless trips last.
+    """
+    trip_tags = list(session.scalars(select(Tag).where(Tag.kind == TRIP)))
+    if not trip_tags:
+        return []
+    trip_ids = [tag.id for tag in trip_tags]
+
+    date_rows = session.execute(
+        select(
+            TransactionTag.tag_id,
+            func.min(Transaction.posted_date),
+            func.max(Transaction.posted_date),
+            func.count(),
+        )
+        .select_from(TransactionTag)
+        .join(Transaction, Transaction.id == TransactionTag.transaction_id)
+        .where(TransactionTag.tag_id.in_(trip_ids))
+        .group_by(TransactionTag.tag_id)
+    ).all()
+    dates: Dict[int, Tuple[Optional[date], Optional[date], int]] = {
+        r[0]: (r[1], r[2], r[3]) for r in date_rows
+    }
+
+    cat_to_bucket = trips.resolve_buckets(session)
+
+    base = (
+        select(
+            TransactionTag.tag_id.label("trip_id"),
+            Transaction.category_id.label("category_id"),
+            Transaction.value_minor.label("value_minor"),
+            Transaction.currency_id.label("currency_id"),
+            Transaction.posted_date.label("posted_date"),
+            Transaction.transfer_group_id.label("transfer_group_id"),
+        )
+        .select_from(TransactionTag)
+        .join(Transaction, Transaction.id == TransactionTag.transaction_id)
+        .where(TransactionTag.tag_id.in_(trip_ids))
+    ).subquery()
+    real = base.c.transfer_group_id.is_(None)
+
+    # trip_id -> {bucket -> net_minor}; net, not yet negated into cost. This module's
+    # own BUCKETS (day/week/month/year, above) is a different vocabulary entirely --
+    # trips.BUCKETS is spelled out here rather than imported bare to keep the two apart.
+    nets: Dict[int, Dict[str, int]] = {
+        trip_id: {bucket: 0 for bucket in trips.BUCKETS} for trip_id in trip_ids
+    }
+
+    def _bucket_for(category_id: Optional[int]) -> str:
+        if category_id is None:
+            return trips.MISC
+        return cat_to_bucket.get(category_id, trips.MISC)
+
+    if _currencies_present(session, base, real) <= {home_currency}:
+        rows = session.execute(
+            select(
+                base.c.trip_id, base.c.category_id,
+                func.coalesce(func.sum(base.c.value_minor), 0),
+            )
+            .where(real)
+            .group_by(base.c.trip_id, base.c.category_id)
+        ).all()
+        for trip_id, category_id, net in rows:
+            nets[trip_id][_bucket_for(category_id)] += net
+    else:
+        # Slow path, mirroring get_totals: grouped by (trip, category, currency, day),
+        # each group converted at that day's own rate and summed in Python.
+        money_groups = session.execute(
+            select(
+                base.c.trip_id, base.c.category_id, Currency.value, base.c.posted_date,
+                func.coalesce(func.sum(case((base.c.value_minor < 0, base.c.value_minor), else_=0)), 0),
+                func.coalesce(func.sum(case((base.c.value_minor > 0, base.c.value_minor), else_=0)), 0),
+            )
+            .select_from(base)
+            .join(Currency, Currency.id == base.c.currency_id)
+            .where(real)
+            .group_by(base.c.trip_id, base.c.category_id, Currency.value, base.c.posted_date)
+        ).all()
+        # See get_totals for why this is checked once ahead of the loop rather than
+        # left to rates.convert to raise.
+        home_currency_known = rates.currency_known(session, home_currency)
+        for trip_id, category_id, currency, day, outflow_sum, inflow_sum in money_groups:
+            converted_outflow = converted_inflow = None
+            if home_currency_known:
+                converted_outflow = rates.convert(session, outflow_sum, currency, home_currency, day)
+                converted_inflow = rates.convert(session, inflow_sum, currency, home_currency, day)
+            if converted_outflow is None or converted_inflow is None:
+                continue  # missing rate (or an unknown home_currency): left out, not zeroed
+            nets[trip_id][_bucket_for(category_id)] += converted_outflow + converted_inflow
+
+    rows = []
+    for tag in trip_tags:
+        start, end, count = dates.get(tag.id, (None, None, 0))
+        bucket_costs = tuple(-nets[tag.id][bucket] for bucket in trips.BUCKETS)
+        rows.append(
+            TripRow(
+                id=tag.id, name=tag.name, start=start, end=end, count=count,
+                total_minor=sum(bucket_costs), buckets=bucket_costs,
+            )
+        )
+
+    def _sort_key(row: TripRow) -> Tuple[int, int, str]:
+        if row.start is None:
+            return (1, 0, row.name.lower())
+        return (0, -row.start.toordinal(), row.name.lower())
+
+    rows.sort(key=_sort_key)
+    return rows
 
 
 def get_imports(session: Session) -> List[ImportRow]:

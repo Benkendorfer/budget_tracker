@@ -105,6 +105,9 @@ vendor not listed. Type commands into the bar at the bottom:
 | `chart <window> [day\|week\|month] [net\|spending\|income]` | Skip the picker, and set the bar width and what the bars measure: `chart 1y month spending` |
 | `pie` | Pick a time window, then see each category's share of spending over time (see below) |
 | `pie <window>` | Skip the picker: `pie 6m`, `pie 1 year`, `pie 2025-01-01..2025-06-30` |
+| `trips` | See each trip's dates, cost, and travel-bucket breakdown as a color bar (see below) |
+| `trip bucket <categories> = <bucket>` | Map one or more categories to a travel bucket; a blank bucket unmaps it (see below) |
+| `trip buckets` | Show the bucket map, grouped by bucket |
 | `transfers` | Pair up movements between your own accounts (`transfers reset` undoes it) |
 | `transfers same-account` | Also pair legs within the same account (see below); off by default |
 | `rates` | List cached exchange rates: pair, source, date span, count (see below) |
@@ -120,10 +123,12 @@ transactions from the rules panel, and `ctrl+c` quits. On a statistics row **or 
 bar**, the right arrow drills into its transactions (same as `enter`); the left arrow
 goes back to the breakdown or chart it came from, once you have drilled into one;
 `space` folds or unfolds a category's subtree; and `f` folds or unfolds every group at
-once — see "Statistics" below. On the chart, `b` cycles the bar width between day, week,
-and month, and `m` cycles what the bars measure between net, spending, and income — see
-"Charts". On the pie panel, `b` cycles the bucket between week, month, and year (no
-daily — see "Pie chart"). The footer shows the arrows only while they do something.
+once — see "Statistics" below (the same two keys fold and unfold a trip's bucket
+breakdown on the trips panel — see "Trips"). On the chart, `b` cycles the bar width
+between day, week, and month, and `m` cycles what the bars measure between net, spending,
+and income — see "Charts". On the pie panel, `b` cycles the bucket between week, month,
+and year (no daily — see "Pie chart"). The footer shows the arrows only while they do
+something.
 
 `ctrl+n` prefills a `rename` command for whichever vendor you are pointing at, and
 `ctrl+t` prefills a `categorize` command for the same vendor. With the transaction table
@@ -502,6 +507,50 @@ One thing to know about the counts and totals shown next to a tag in the sidebar
 do not exclude transfers, so they will not always match the totals line, which converts
 to your home currency and leaves transfers out. Use the totals line, `stats`, or
 `budget list --tag` for a figure you intend to rely on.
+
+### Trips
+
+`trips` opens a panel listing every trip: its date span, total cost in your home
+currency (transfers excluded, refunds netted off), and a proportional color bar showing
+how that cost breaks down across a fixed set of travel buckets — **airfare, rail, car,
+hotel, food, tourism, shopping**, and a catch-all **misc**. The bar is 100 cells wide
+when the panel has room for one, 50 otherwise, so it stays proportional even in a
+narrower terminal. Dates read `2026-03-02..03-14` — the end's year dropped when it
+matches the start's, since a trip is usually inside one month — and just `2026-03-02`
+for a single-day trip; a trip with no transactions yet shows a blank date and a zero bar,
+so there is somewhere to put its first transaction.
+
+`space` unfolds a trip's row into one row per bucket, each with its own cost and share of
+the bar; `f` folds or unfolds every trip at once — the same keys that fold the statistics
+breakdown (see "Statistics"). A bucket whose refunds outweigh its spending shows its real,
+negative cost even though a negative segment has no length to draw in the bar: the two are
+allowed to disagree in that one case rather than the bar quietly claiming a positive
+length it did not earn.
+
+Which category counts toward which bucket is a map, not a fixed rule — opening the panel
+seeds it with a guess from common category names (`Airfare`, `Hotel`, `Food`, and so on)
+the first time, and you correct the rest:
+
+```text
+trip bucket Car Rental = car
+trip bucket Car Rental, Taxi = car        several at once, without disturbing what
+                                           is already mapped to car
+trip bucket Taxi =                        blank unmaps it, back to misc
+trip buckets                              show the map, grouped by bucket
+```
+
+Category on the left, bucket on the right, like every other `=` command in this app. A
+category with no mapping of its own inherits its nearest mapped ancestor's bucket (mapping
+`Food` covers `Food > Dining` without a row of its own), or falls back to `misc` if nothing
+above it is mapped either.
+
+From the command line:
+
+```bash
+budget trips                              # the same table, breakdown as percentages
+budget trips buckets                      # the map, grouped by bucket
+budget trips bucket "Car Rental" car      # category first, then the bucket
+```
 
 ### Statistics
 

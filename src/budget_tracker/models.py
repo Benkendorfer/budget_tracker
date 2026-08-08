@@ -276,3 +276,19 @@ class TransactionTag(Base):
     tag_id: Mapped[int] = mapped_column(
         ForeignKey("tag.id", ondelete="CASCADE"), primary_key=True
     )
+
+
+class TripBucket(Base):
+    """Which travel bucket a category's spending counts toward.
+
+    Keyed on the category rather than on a name so a rename cannot orphan it, and
+    inherited down the tree: mapping ``Food`` covers ``Food > Dining`` and
+    ``Food > Groceries`` without a row each.
+    """
+
+    __tablename__ = "trip_bucket"
+
+    category_id: Mapped[int] = mapped_column(
+        ForeignKey("category.id", ondelete="CASCADE"), primary_key=True
+    )
+    bucket: Mapped[str] = mapped_column(String)

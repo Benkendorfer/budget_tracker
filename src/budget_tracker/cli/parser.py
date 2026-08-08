@@ -25,6 +25,7 @@ from .list_cmd import _cmd_list
 from .rates import _cmd_rates
 from .tags import _cmd_tags
 from .transfers import _cmd_transfers
+from .trips import _cmd_trips
 from .vendors import _cmd_rename, _cmd_rule
 
 
@@ -287,6 +288,42 @@ def build_parser() -> argparse.ArgumentParser:
         "--yes",
         action="store_true",
         help="Actually delete. Without it, only preview what would be unlinked.",
+    )
+
+    trips_parser = subparsers.add_parser(
+        "trips", help="List trips, or manage the travel-bucket map."
+    )
+    trips_parser.set_defaults(func=_cmd_trips, trips_command="list")
+    trips_subparsers = trips_parser.add_subparsers(dest="trips_command")
+
+    trips_subparsers.add_parser(
+        "list", help="Show every trip: dates, cost, and bucket breakdown (default)."
+    )
+
+    trips_subparsers.add_parser(
+        "buckets", help="Show the category -> travel-bucket map, grouped by bucket."
+    )
+
+    trips_bucket = trips_subparsers.add_parser(
+        "bucket",
+        help=(
+            "Assign one or more categories to a travel bucket (category first, "
+            "bucket last), or unmap them with --clear."
+        ),
+    )
+    trips_bucket.add_argument(
+        "categories",
+        nargs="+",
+        help=(
+            "One or more categories (bare name or 'Food > Dining' path). Without "
+            "--clear, the last value is the bucket to assign them to, not a "
+            "category."
+        ),
+    )
+    trips_bucket.add_argument(
+        "--clear",
+        action="store_true",
+        help="Unmap the categories instead of assigning them (falls back to misc).",
     )
 
     account_parser = subparsers.add_parser(
