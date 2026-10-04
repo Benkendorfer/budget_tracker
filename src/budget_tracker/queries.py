@@ -569,7 +569,12 @@ def get_category_rules(session: Session) -> List[CategoryRuleRow]:
     )
     counts = {rule.id: 0 for rule in rules}
     owner = {}
-    for vendor in session.scalars(select(Vendor)):
+    # Same lazy-load-per-vendor cost as categories.apply_category_rules -- matches()
+    # reads vendor.display_name, which reaches through vendor_name -- so it is
+    # eager-loaded here too (148 extra SELECTs on a real database otherwise).
+    for vendor in session.scalars(
+        select(Vendor).options(selectinload(Vendor.vendor_name))
+    ):
         match = next((r for r in rules if matches(r.pattern, vendor)), None)
         if match is not None:
             owner[vendor.id] = match.id

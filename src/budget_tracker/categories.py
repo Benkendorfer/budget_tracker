@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Sequence
 
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from .models import Category, CategoryRule, Transaction, Vendor, VendorName
 from .transfers import MANUAL_TRANSFER_SOURCE, TRANSFER_SOURCE
@@ -549,12 +549,16 @@ def apply_category_rules(session: Session) -> int:
     """
     rules = list_rules(session)
     # Patterns are matched per vendor, not per transaction: vendors are far fewer, and
-    # every transaction of one vendor gets the same answer anyway.
+    # every transaction of one vendor gets the same answer anyway. matches() reads
+    # vendor.display_name, which reaches through vendor_name -- eager-loaded here so
+    # that is one extra SELECT, not one per vendor (~1,400 of them on a real database).
     target_by_vendor = {
         vendor.id: next(
             (r.category_id for r in rules if matches(r.pattern, vendor)), None
         )
-        for vendor in session.scalars(select(Vendor))
+        for vendor in session.scalars(
+            select(Vendor).options(selectinload(Vendor.vendor_name))
+        )
     }
 
     changed = 0

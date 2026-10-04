@@ -230,7 +230,9 @@ def test_vendor_sidebar_over_the_cap_truncates_and_notes_the_rest(tmp_path, monk
 def test_vendor_sidebar_more_row_fits_the_sidebar_width(tmp_path, monkeypatch):
     """The summary row must not run past the sidebar's own item width, or Textual
     hard-clips it mid-word with no ellipsis -- see formatting._truncate."""
-    _setup_many_vendors(tmp_path, monkeypatch, BudgetApp.VENDOR_SIDEBAR_CAP + 8000)
+    # A four-digit count is the widest label this has to fit; 1000 is as wide as 8000
+    # and imports an eighth of the rows (this test was the suite's slowest by far).
+    _setup_many_vendors(tmp_path, monkeypatch, BudgetApp.VENDOR_SIDEBAR_CAP + 1000)
 
     async def run():
         app = BudgetApp()
@@ -247,7 +249,7 @@ def test_vendor_sidebar_more_row_fits_the_sidebar_width(tmp_path, monkeypatch):
             return label, width
 
     label, width = asyncio.run(run())
-    assert "8000 more" in label
+    assert "1000 more" in label
     assert len(label) <= width
 
 

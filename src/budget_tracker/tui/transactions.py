@@ -7,13 +7,15 @@ totals-driven status line, the drill-down that lands here) is app state, and sta
 
 from __future__ import annotations
 
-from typing import AbstractSet, Dict, FrozenSet, List, Tuple
+from typing import AbstractSet, Dict, FrozenSet, Iterable, List, Tuple
 
 from rich.text import Text
 from textual import events
 from textual.coordinate import Coordinate
+from textual.geometry import Size
 from textual.message import Message
 from textual.widgets import DataTable
+from textual.widgets.data_table import RowKey
 
 from .. import queries
 from .formatting import TRANSFER_MARK, TRANSFER_STYLE, _amount_cell, _truncate, _txn_cell
@@ -66,6 +68,42 @@ class TxnTable(DataTable):
             self.cursor_coordinate = Coordinate(row, SELECT_COLUMN)
             self.post_message(self.SelectClicked(self, row))
             event.prevent_default()
+
+    def _update_dimensions(self, new_rows: Iterable[RowKey]) -> None:
+        """Skip Textual's ``measure()`` sweep over every cell on every refresh.
+
+        ``DataTable._update_dimensions`` measures each cell to grow a column's
+        ``content_width``, but ``Column.get_render_width`` only reads that for
+        columns marked ``auto_width`` -- every column this table has (see
+        app.py's ``on_mount``) is given an explicit ``width=`` instead, so
+        measuring is pure overhead. On a few thousand rows it is the single
+        largest cost in a refresh (profiled at ~300 ms of ~500 ms), yet changes
+        nothing the table renders, since the measured width it would compute is
+        never read.
+
+        Falls back to Textual's own implementation the moment that assumption
+        stops holding -- an auto-width column, or a row whose height is meant to
+        be auto-detected rather than fixed at 1 -- so correctness never
+        silently depends on this table's current column setup; only the
+        performance win does.
+        """
+        if any(column.auto_width for column in self.columns.values()) or any(
+            self.rows[row_key].auto_height
+            for row_key in new_rows
+            if row_key in self._row_locations
+        ):
+            super()._update_dimensions(new_rows)
+            return
+
+        data_cells_width = sum(
+            column.get_render_width(self) for column in self.columns.values()
+        )
+        total_width = data_cells_width + self._row_label_column_width
+        header_height = self.header_height if self.show_header else 0
+        self.virtual_size = Size(
+            total_width,
+            self._total_row_height + header_height,
+        )
 
 # The trip marker in the Tags column, e.g. "✈Japan 2026" -- distinct from an ordinary
 # tag's "#" prefix so a trip reads as a place, not a label.

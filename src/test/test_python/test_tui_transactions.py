@@ -333,3 +333,62 @@ def test_selected_rows_show_a_checkmark_in_the_leading_column(tmp_path, monkeypa
     rows = asyncio.run(run())
     assert rows[0][0] == "✓"
     assert all(row[0] == "" for row in rows[1:])
+
+
+# ------------------------------------------------------- refresh performance
+
+
+def test_txns_refill_skips_per_cell_measurement(tmp_path, monkeypatch):
+    """``TxnTable._update_dimensions`` (see transactions.py) must bypass
+    Textual's per-cell ``measure()`` sweep, since every #txns column is given
+    an explicit ``width=`` (see app.py's ``on_mount``) rather than being
+    auto-sized -- so the width ``measure()`` computes is never read. That sweep
+    profiled as the single largest cost of a refresh on a real database (~300
+    ms of ~500 ms on a 2,000-row page), one call per cell on every refill.
+    """
+    _setup(tmp_path, monkeypatch)
+    import textual.widgets._data_table as data_table_module
+
+    calls = []
+    original_measure = data_table_module.measure
+
+    def counting_measure(*args, **kwargs):
+        calls.append(1)
+        return original_measure(*args, **kwargs)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            monkeypatch.setattr(data_table_module, "measure", counting_measure)
+            table = app.query_one("#txns", DataTable)
+            calls.clear()
+            transactions.fill_txns(table, app._txns, app._currencies)
+            await pilot.pause()
+            return len(calls)
+
+    assert asyncio.run(run()) == 0
+
+
+def test_txns_table_virtual_size_matches_textual_measurement(tmp_path, monkeypatch):
+    """The fast path above must still compute the same scrollable size Textual's
+    own measuring implementation would -- otherwise every visible cell looks
+    right while scrolling silently breaks. Forces the real, measuring
+    ``DataTable._update_dimensions`` on the very same table and rows, and
+    checks the two agree.
+    """
+    _setup(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.query_one("#txns", DataTable)
+            fast_size = table.virtual_size
+
+            DataTable._update_dimensions(table, list(table.rows.keys()))
+            slow_size = table.virtual_size
+            return fast_size, slow_size
+
+    fast_size, slow_size = asyncio.run(run())
+    assert fast_size == slow_size

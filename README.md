@@ -1196,11 +1196,16 @@ PYTHONPATH=src .venv/bin/python -m budget_tracker.migrations new "add monthly bu
 ### Running the tests
 
 ```bash
-pytest
+pytest                # serial
+pytest -n auto        # full suite in parallel (pytest-xdist, in the dev extras)
 ```
 
-The suite covers CSV importing, vendor overrides, categorisation, and the TUI's shortcuts
+The suite covers CSV importing, vendor overrides, categorization, and the TUI's shortcuts
 and panels. It builds a temporary database per test, so it never touches `data/budget.db`.
+
+Use `-n auto` for a full run: it takes about 25 s instead of about 2.5 minutes. It is
+not on by default because starting the workers adds about 2 s, which makes a run of
+a single test file slower.
 
 ## Technical details
 

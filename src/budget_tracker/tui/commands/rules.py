@@ -135,7 +135,8 @@ class RuleCommands:
         )
 
     def _show_rules(self) -> None:
-        self.reload()
+        self._build_rules()
+        self._fill_rules()
         self._set_panel("rules")
         if not self._rules and not self._category_rules:
             self.notify(
@@ -143,6 +144,16 @@ class RuleCommands:
                 "  rule <pattern> = <display name>\n"
                 "  rule categorize <pattern> = <category>"
             )
+
+    def _build_rules(self) -> None:
+        """Fetch both kinds of rule. Matches every rule against every vendor (see
+        queries.get_rules/get_category_rules), so -- like _build_trips, _build_report --
+        this runs only when the rules panel is being opened or is already on screen
+        (see reload()'s guard), not on every reload regardless of what is showing.
+        """
+        with self.session_factory() as session:
+            self._rules = queries.get_rules(session)
+            self._category_rules = queries.get_category_rules(session)
 
     def _fill_rules(self) -> None:
         rules_panel.fill_rules(

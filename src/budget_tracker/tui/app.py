@@ -606,8 +606,6 @@ class BudgetApp(
             self._tags = queries.get_tags(session, kind=tags_module.TAG)
             self._trips = queries.get_tags(session, kind=tags_module.TRIP)
             self._currencies = {c.code: c for c in queries.get_currencies(session)}
-            self._rules = queries.get_rules(session)
-            self._category_rules = queries.get_category_rules(session)
             txns = queries.get_transactions(
                 session,
                 filters=self._active_filters(),
@@ -633,7 +631,6 @@ class BudgetApp(
         self._fill_list("#tags", [f"{t.name} ({t.count})" for t in self._tags])
         self._fill_list("#trips", [f"{t.name} ({t.count})" for t in self._trips])
         self._fill_txns(txns)
-        self._fill_rules()
         self._totals = totals
         # Statistics are scoped by exactly the filters above, so an open panel has to be
         # recomputed whenever they change.
@@ -658,6 +655,14 @@ class BudgetApp(
         if self._panel == "trips":
             self._build_trips()
             self._fill_trips()
+        # The rules panel's data comes from get_rules/get_category_rules, which match
+        # every rule against every vendor -- not cheap, and not needed at all when the
+        # panel is hidden, so (like stats/chart/pie/trips above) it is only rebuilt
+        # while actually on screen. _show_rules builds it once more, itself, when the
+        # panel first opens.
+        if self._panel == "rules":
+            self._build_rules()
+            self._fill_rules()
         # A collapsed heading's summary names whichever filter is active on it, so it
         # has to be redrawn whenever a filter (or the sidebar's own contents) changes --
         # not just when a section expands or collapses.
