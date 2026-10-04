@@ -27,7 +27,7 @@ from .. import rates as rates_module
 from .. import sync as sync_module
 from ..db import get_engine, get_sessionmaker, init_db
 from ..formats import AccountCurrencyMismatch
-from ..models import SyncAccount, SyncConnection
+from ..models import SYNC_ERROR, SYNC_OK, SyncAccount, SyncConnection
 from ..simplefin import RemoteAccount
 
 # Every exception a connection/mapping/sync call can raise that is this module's job
@@ -464,10 +464,15 @@ def _sync_status(args: argparse.Namespace) -> int:
                 if account.last_synced_at
                 else "never"
             )
-            print(
+            line = (
                 f"  {account.local_name:<24} remote: {account.remote_name:<24} "
                 f"synced through: {synced:<10} last synced: {last_synced}"
             )
+            if account.last_status == SYNC_ERROR:
+                line += f"  ERROR: {account.last_error}"
+            elif account.last_status == SYNC_OK:
+                line += "  ok"
+            print(line)
     return 0
 
 

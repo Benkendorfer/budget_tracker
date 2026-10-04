@@ -315,7 +315,9 @@ def _merge_account_sets(results: Sequence[AccountSet]) -> AccountSet:
     txns_by_id: Dict[str, Dict[str, RemoteTransaction]] = {}
     errors: List[RemoteError] = []
     for account_set in results:
-        errors.extend(account_set.errors)
+        # A split request repeats a connection-level error once per window; report it
+        # once. RemoteError is frozen, so equal entries compare (and hash) equal.
+        errors.extend(e for e in account_set.errors if e not in errors)
         for account in account_set.accounts:
             if account.id not in latest:
                 order.append(account.id)

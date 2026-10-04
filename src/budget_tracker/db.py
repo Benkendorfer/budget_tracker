@@ -72,6 +72,8 @@ _ADDED_COLUMNS = {
     # not validate a REFERENCES target at ALTER TABLE time, only at DML time, so adding
     # the column first and creating the table after is safe (see test_sync.py).
     "import": {"sync_connection_id": "INTEGER REFERENCES sync_connection(id)"},
+    # NULL until the next sync records a status, which reads as "not yet known".
+    "sync_account": {"last_status": "VARCHAR", "last_error": "VARCHAR"},
 }
 
 

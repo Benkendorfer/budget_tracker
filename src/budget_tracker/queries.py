@@ -26,6 +26,7 @@ from .models import (
     Currency,
     ExchangeRate,
     Import,
+    SyncAccount,
     Tag,
     Transaction,
     TransactionTag,
@@ -192,6 +193,10 @@ class AccountRow:
     name: str
     currency: str
     count: int
+    # From the account's sync mapping: models.SYNC_OK / SYNC_ERROR, or None when the
+    # account is not synced or has not been synced since statuses were recorded.
+    sync_status: Optional[str] = None
+    sync_error: Optional[str] = None
 
 
 @dataclass
@@ -318,13 +323,23 @@ def get_accounts(session: Session) -> List[AccountRow]:
             Account.name,
             Currency.value,
             func.count(Transaction.id),
+            SyncAccount.last_status,
+            SyncAccount.last_error,
         )
         .join(Currency, Currency.id == Account.currency_id)
         .join(Transaction, Transaction.account_id == Account.id, isouter=True)
+        # At most one mapping per account (SyncAccount's unique constraint), so this
+        # join cannot multiply the transaction count.
+        .join(SyncAccount, SyncAccount.account_id == Account.id, isouter=True)
         .group_by(Account.id)
         .order_by(Account.name)
     ).all()
-    return [AccountRow(id=r[0], name=r[1], currency=r[2], count=r[3]) for r in rows]
+    return [
+        AccountRow(
+            id=r[0], name=r[1], currency=r[2], count=r[3], sync_status=r[4], sync_error=r[5]
+        )
+        for r in rows
+    ]
 
 
 def get_vendors(session: Session) -> List[VendorRow]:

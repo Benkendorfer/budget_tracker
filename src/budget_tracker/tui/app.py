@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 from datetime import date
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple, Union
 
 from rich.text import Text
 from sqlalchemy.orm import Session
@@ -36,6 +36,7 @@ from .. import (
     charts,
     formats,
     importer,
+    models,
     queries,
     rates,
     stats,
@@ -117,6 +118,11 @@ class BudgetApp(App):
     #status { height: 1; padding: 0 1; color: $text-muted; background: $panel; }
     #command { border: tall $accent; }
     .heading { padding: 0 1; text-style: bold; color: $accent; }
+    /* Accounts sidebar rows, colored by last sync status (see queries.AccountRow and
+    reload()'s build of the #accounts list) -- $success/$error rather than a
+    hard-coded color, so both read correctly in light and dark themes. */
+    #accounts ListItem.sync-ok Label { color: $success; }
+    #accounts ListItem.sync-error Label { color: $error; }
     """
 
     PANELS = (
@@ -239,9 +245,10 @@ class BudgetApp(App):
         # in its own decimal places and symbol rather than always assuming two decimal
         # places — see _fmt_amount_for().
         self._currencies: Dict[str, queries.CurrencyRow] = {}
-        # Last labels rendered into each sidebar list, so _fill_list can skip a rebuild
-        # that would produce exactly what is already on screen.
-        self._list_labels: Dict[str, List[str]] = {}
+        # Last labels (or, for #accounts, (label, css_class, tooltip) triples) rendered
+        # into each sidebar list, so _fill_list can skip a rebuild that would produce
+        # exactly what is already on screen.
+        self._list_labels: Dict[str, List[Union[str, Tuple[str, str, Optional[str]]]]] = {}
         # Parallel to the rows in #txns, so a cursor index maps back to a transaction.
         self._txns: List[queries.TxnRow] = []
         # Multi-select on the transactions table: transaction *ids*, not row indices,
@@ -631,7 +638,7 @@ class BudgetApp(App):
                 session,
                 filters=self._active_filters(),
             )
-        self._fill_list("#accounts", [f"{a.name} ({a.count})" for a in self._accounts])
+        self._fill_list("#accounts", self._account_items())
         self._fill_list("#vendors", self._vendor_labels())
         self._fill_list(
             "#categories",
@@ -678,7 +685,9 @@ class BudgetApp(App):
         self._update_section_headings()
         self._refresh_status()
 
-    def _fill_list(self, selector: str, labels: List[str]) -> None:
+    def _fill_list(
+        self, selector: str, items: List[Union[str, Tuple[str, str, Optional[str]]]]
+    ) -> None:
         """Render a sidebar list, but only when its contents have actually changed.
 
         reload() runs on every filter change and every statistics drill-down, and none of
@@ -689,17 +698,33 @@ class BudgetApp(App):
         behind it. Comparing the labels first is cheap, correct whatever the caller
         wanted, and keeps the list's scroll position across a drill.
 
+        ``items`` is ordinarily a plain label per row. The accounts list is the one
+        exception: it passes ``(label, css_class, tooltip)`` triples instead, so a sync
+        status that changes without the label changing (same name, same count) still
+        rebuilds -- the memo compares ``items`` as given, and the triple folds the
+        status and its tooltip into the comparison along with the text.
+
         extend() mounts the items in one pass; appending in a loop mounts them one at a
         time and is several times slower on a list this long.
         """
-        if self._list_labels.get(selector) == labels:
+        if self._list_labels.get(selector) == items:
             return
-        self._list_labels[selector] = list(labels)
+        self._list_labels[selector] = list(items)
         list_view = self.query_one(selector, ListView)
         list_view.clear()
-        list_view.extend(
-            [ListItem(Label("— All —"))] + [ListItem(Label(label)) for label in labels]
-        )
+        rows = [ListItem(Label("— All —"))]
+        for item in items:
+            if isinstance(item, tuple):
+                label, css_class, tooltip = item
+                list_item = ListItem(Label(label))
+                if css_class:
+                    list_item.add_class(css_class)
+                if tooltip:
+                    list_item.tooltip = tooltip
+            else:
+                list_item = ListItem(Label(item))
+            rows.append(list_item)
+        list_view.extend(rows)
 
     def _expand_section(self, name: str) -> None:
         """Expand ``name``'s sidebar section, collapsing every other one.
@@ -762,6 +787,29 @@ class BudgetApp(App):
                 filter_label = self._section_filter_label(section)
                 text = f"▶ {title} — {filter_label}" if filter_label else f"▶ {title}"
             self.query_one(f"#head_{section}", Static).update(Text(_truncate(text, 34)))
+
+    def _account_items(self) -> List[Tuple[str, str, Optional[str]]]:
+        """Rows for the accounts sidebar, colored by each account's last sync status.
+
+        green (``.sync-ok``) on success, red (``.sync-error``) on failure, no class
+        (the default theme color) when it is not synced or has no status yet -- see
+        queries.AccountRow.sync_status and models.SYNC_OK/SYNC_ERROR. A failing
+        account also carries its ``sync_error`` as a tooltip, since "this one is red"
+        is not itself an explanation.
+        """
+        items = []
+        for account in self._accounts:
+            if account.sync_status == models.SYNC_OK:
+                css_class = "sync-ok"
+                tooltip = None
+            elif account.sync_status == models.SYNC_ERROR:
+                css_class = "sync-error"
+                tooltip = account.sync_error
+            else:
+                css_class = ""
+                tooltip = None
+            items.append((f"{account.name} ({account.count})", css_class, tooltip))
+        return items
 
     def _vendor_shown_count(self) -> int:
         """How many real vendor rows the sidebar has mounted -- see VENDOR_SIDEBAR_CAP."""
@@ -3018,9 +3066,15 @@ class BudgetApp(App):
                 timeout=20,
             )
 
-        if not dry_run and import_ids:
+        if not dry_run:
+            # A real sync always needs a reload even when nothing was inserted: it still
+            # wrote each account's sync_status/sync_error (see models.SyncAccount), and
+            # the accounts sidebar's colors come from exactly that -- see
+            # queries.get_accounts. import_ids only gates the rate fetch below, which
+            # has nothing to do once there is no new import.
             self.reload()
-            self._fetch_rates_after_import(import_ids)
+            if import_ids:
+                self._fetch_rates_after_import(import_ids)
 
     # ------------------------------------------------------------- drill-down
     def _drill_into_category(self, row: int) -> None:

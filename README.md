@@ -1138,6 +1138,13 @@ budget sync              # pull new transactions from every connection
 budget sync disconnect   # remove a connection and its keychain entry (keeps transactions)
 ```
 
+**The Accounts sidebar shows how each account's last sync went:** green if it synced
+cleanly, red if it did not (hover for the reason; `budget sync status` lists it too), and
+the usual color for accounts that are not synced at all. A provider error about an
+account's bank connection — "Auth required" when a login has expired — turns that account
+red even when stale data still came back with it. A preview (`--dry-run`) never changes
+the colors.
+
 Undo a sync the same way you would a CSV import — `budget imports` shows it (its source
 file reads `sync:<name> <date>`) and `budget unimport <id>` removes it.
 

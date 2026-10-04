@@ -18,14 +18,30 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional, Sequence
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from . import importer
-from .models import Account, Currency, Import, SyncAccount, SyncConnection, Transaction
-from .simplefin import AccountSet, AuthFailed, RemoteAccount, RemoteTransaction
+from .models import (
+    SYNC_ERROR,
+    SYNC_OK,
+    Account,
+    Currency,
+    Import,
+    SyncAccount,
+    SyncConnection,
+    Transaction,
+)
+from .simplefin import (
+    AccountSet,
+    AuthFailed,
+    RemoteAccount,
+    RemoteError,
+    RemoteTransaction,
+    SimpleFINError,
+)
 
 # Re-fetch this far back before the high-water mark (whether that is a previous sync's
 # ``synced_through`` or, on a first sync, the CSV cutoff) so a provider that is still
@@ -120,6 +136,8 @@ class ConnectionAccountStatus:
     remote_name: str
     synced_through: Optional[date]
     last_synced_at: Optional[datetime]
+    last_status: Optional[str] = None  # SYNC_OK / SYNC_ERROR / None (never synced)
+    last_error: Optional[str] = None
 
 
 @dataclass
@@ -141,6 +159,39 @@ def _require_connection(session: Session, name: str) -> SyncConnection:
 def _is_url_currency(code: str) -> bool:
     """A SimpleFIN custom currency is expressed as a URL instead of an ISO code."""
     return "://" in code
+
+
+def _matching_errors(
+    errors: Sequence[RemoteError], remote_id: str, conn_id: Optional[str]
+) -> List[RemoteError]:
+    """``errlist`` entries that name this account directly, or name the connection
+    it belongs to -- a provider can report a connection-level problem (e.g. an auth
+    error) on an account it still returns, so presence in the response alone is not
+    enough to call the account's own sync a success.
+    """
+    return [
+        e
+        for e in errors
+        if e.account_id == remote_id
+        or (conn_id is not None and _same_connection(e.conn_id, conn_id))
+    ]
+
+
+def _same_connection(a: Optional[str], b: Optional[str]) -> bool:
+    """Whether two conn_ids name the same connection.
+
+    Not plain equality: SimpleFIN Bridge names a connection ``MX-MBR-<uuid>`` on its
+    accounts and in ``connections``, but ``MBR-<uuid>`` in the errlist entry about it
+    (seen on a real ``con.auth`` error). So one may carry an extra leading ``<PREFIX>-``
+    that the other lacks; the rest must match exactly.
+    """
+    if not a or not b:
+        return False
+    return a == b or a.endswith("-" + b) or b.endswith("-" + a)
+
+
+def _join_error_messages(errors: Sequence[RemoteError]) -> str:
+    return "; ".join(f"{e.code}: {e.msg}" for e in errors)
 
 
 # ------------------------------------------------------------------- connection setup
@@ -332,6 +383,8 @@ def list_connections(session: Session) -> List[ConnectionStatus]:
                     remote_name=mapping.remote_name,
                     synced_through=mapping.synced_through,
                     last_synced_at=mapping.last_synced_at,
+                    last_status=mapping.last_status,
+                    last_error=mapping.last_error,
                 )
             )
         statuses.append(
@@ -523,16 +576,28 @@ def _sync_one_connection(
         connection_name=connection.name, dry_run=dry_run, provider_label=provider.label
     )
 
-    secret = load_secret(connection.name)
-    if secret is None:
-        raise MissingCredentials(
-            f"No stored credentials for connection {connection.name!r}; run "
-            "'budget sync connect' again."
-        )
-
+    # Queried before the credentials check (and before the fetch) so a connection-level
+    # failure below has something to mark error on before it raises.
     mappings = list(
         session.scalars(select(SyncAccount).where(SyncAccount.connection_id == connection.id))
     )
+
+    secret = load_secret(connection.name)
+    if secret is None:
+        message = (
+            f"No stored credentials for connection {connection.name!r}; run "
+            "'budget sync connect' again."
+        )
+        # Nothing has been written yet (mappings above was only a read), so marking
+        # every mapping of this connection error and committing right here is safe --
+        # the function never reaches its own commit/rollback once it raises.
+        if not dry_run:
+            for mapping in mappings:
+                mapping.last_status = SYNC_ERROR
+                mapping.last_error = message
+            session.commit()
+        raise MissingCredentials(message)
+
     plans = {plan.mapping.remote_id: plan for plan in (
         _account_start(session, mapping, today, provider) for mapping in mappings
     )}
@@ -551,10 +616,23 @@ def _sync_one_connection(
             account_ids=[m.remote_id for m in mappings],
         )
     except AuthFailed as error:
-        raise SyncError(
+        message = (
             f"Access for connection {connection.name!r} was revoked; run "
             f"'budget sync connect' again. ({error})"
-        ) from error
+        )
+        if not dry_run:
+            for mapping in mappings:
+                mapping.last_status = SYNC_ERROR
+                mapping.last_error = message
+            session.commit()
+        raise SyncError(message) from error
+    except SimpleFINError as error:
+        if not dry_run:
+            for mapping in mappings:
+                mapping.last_status = SYNC_ERROR
+                mapping.last_error = str(error)
+            session.commit()
+        raise
 
     result.errors = [f"{e.code}: {e.msg}" for e in account_set.errors]
 
@@ -566,6 +644,12 @@ def _sync_one_connection(
     accounts_with_rows: set = set()
     sync_updates: List[tuple] = []  # (SyncAccount, latest_date_fetched_or_None)
     inverted_messages: List[str] = []
+    inverted_accounts: List[tuple] = []  # (SyncAccount, message), for the raise below
+    # mapping.id -> (status, error), applied to every mapping right before this
+    # connection's own commit/rollback -- never before, so a dry run's rollback (or
+    # the sign-inversion raise's own narrower commit, see below) discards or skips it
+    # the same way it already does synced_through/last_synced_at.
+    status_updates: Dict[int, tuple] = {}
 
     for remote_id, plan in plans.items():
         mapping = plan.mapping
@@ -580,23 +664,36 @@ def _sync_one_connection(
 
         remote_account = remote_by_id.get(remote_id)
         if remote_account is None:
+            # No conn_id to match on without the remote account itself; account_id is
+            # all errlist has to go on here.
+            matches = _matching_errors(account_set.errors, remote_id, None)
+            reason = (
+                _join_error_messages(matches)
+                if matches
+                else f"{mapping.remote_name!r} was not returned by {provider.label}."
+            )
+            status_updates[mapping.id] = (SYNC_ERROR, reason)
             result.accounts.append(account_result)
             continue
 
         if _is_url_currency(remote_account.currency):
-            account_result.warnings.append(
+            message = (
                 f"{remote_account.name!r} uses a custom currency "
                 f"({remote_account.currency}), which this app cannot record; skipped."
             )
+            account_result.warnings.append(message)
+            status_updates[mapping.id] = (SYNC_ERROR, message)
             result.accounts.append(account_result)
             continue
 
         local_currency = session.get(Currency, local_account.currency_id)
         if local_currency.value != remote_account.currency:
-            account_result.warnings.append(
+            message = (
                 f"{remote_account.name!r} is {remote_account.currency} but local "
                 f"account {local_account.name!r} is {local_currency.value}; skipped."
             )
+            account_result.warnings.append(message)
+            status_updates[mapping.id] = (SYNC_ERROR, message)
             result.accounts.append(account_result)
             continue
 
@@ -659,6 +756,18 @@ def _sync_one_connection(
             if plan.cutoff is not None and txn_date <= plan.cutoff:
                 account_result.inserted_before_cutoff += 1
 
+        # The account was returned, but a provider can still flag its connection (or
+        # the account itself) as broken alongside stale data -- e.g. SimpleFIN keeps
+        # returning a brokerage account after its link needs re-auth, with a con.auth
+        # errlist entry riding along. Presence in the response is not success.
+        account_errors = _matching_errors(
+            account_set.errors, remote_id, remote_account.conn_id
+        )
+        if account_errors:
+            status_updates[mapping.id] = (SYNC_ERROR, _join_error_messages(account_errors))
+        else:
+            status_updates[mapping.id] = (SYNC_OK, None)
+
         # Unconfirmed coverage: SimpleFIN can return less history than asked for. If
         # the raw response never reaches back to the anchor, say so -- "could not
         # confirm", not "gap", since a genuinely low-volume account can trigger this
@@ -710,6 +819,8 @@ def _sync_one_connection(
                     )
                     account_result.warnings.append(message)
                     inverted_messages.append(message)
+                    inverted_accounts.append((mapping, message))
+                    status_updates[mapping.id] = (SYNC_ERROR, message)
 
         insert_buffer.extend(account_inserts)
         if account_inserts:
@@ -724,8 +835,15 @@ def _sync_one_connection(
         result.accounts.append(account_result)
 
     if inverted_messages and not dry_run:
-        # Nothing has been written yet (everything above only reads), so raising here
-        # leaves the database untouched -- no rollback needed.
+        # Nothing has been written yet (everything above, including status_updates,
+        # only stages Python-side state -- see its comment), except for the inverted
+        # accounts' own status, set and committed right here: a refusal, not a
+        # connection failure, so only the accounts it actually flagged get marked, and
+        # nothing else (no synced_through, no transactions, no other account's status).
+        for mapping, message in inverted_accounts:
+            mapping.last_status = SYNC_ERROR
+            mapping.last_error = message
+        session.commit()
         raise SyncError(
             f"Connection {connection.name!r} looks sign-inverted: "
             + " ".join(inverted_messages)
@@ -784,6 +902,13 @@ def _sync_one_connection(
             if mapping.synced_through is None or latest_fetched > mapping.synced_through:
                 mapping.synced_through = latest_fetched
         mapping.last_synced_at = datetime.utcnow()
+
+    # Set unconditionally, same as synced_through/last_synced_at above -- a dry run's
+    # rollback below discards it along with everything else.
+    for mapping in mappings:
+        update = status_updates.get(mapping.id)
+        if update is not None:
+            mapping.last_status, mapping.last_error = update
     session.flush()
 
     # Grabbed before the possible rollback below, which expires every ORM attribute.

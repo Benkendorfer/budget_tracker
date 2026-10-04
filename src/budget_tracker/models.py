@@ -208,6 +208,10 @@ class SyncConnection(Base):
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 
+SYNC_OK = "ok"
+SYNC_ERROR = "error"
+
+
 class SyncAccount(Base):
     """Which local :class:`Account` a remote account's transactions land in.
 
@@ -238,6 +242,10 @@ class SyncAccount(Base):
     account_id: Mapped[int] = mapped_column(ForeignKey("account.id"))
     synced_through: Mapped[Optional[date]] = mapped_column(default=None)
     last_synced_at: Mapped[Optional[datetime]] = mapped_column(default=None)
+    # How the last real (non-dry) sync went for this account: SYNC_OK, SYNC_ERROR, or
+    # NULL before the first one. last_error says why, in the provider's words.
+    last_status: Mapped[Optional[str]] = mapped_column(String, default=None)
+    last_error: Mapped[Optional[str]] = mapped_column(String, default=None)
 
     connection: Mapped[SyncConnection] = relationship()
     account: Mapped[Account] = relationship()

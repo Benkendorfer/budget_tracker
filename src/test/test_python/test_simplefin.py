@@ -514,3 +514,18 @@ def test_redact_keeps_the_port():
 
 def test_redact_does_not_choke_on_garbage():
     assert simplefin.redact("not a url") == "not a url"
+
+
+def test_a_split_request_reports_a_repeated_error_once(monkeypatch):
+    """A connection-level error comes back on every window of a split request; the
+    user saw "con.auth ... Auth required" printed twice."""
+    error = {"code": "con.auth", "msg": "Auth required", "conn_id": "MBR-1"}
+    calls = _install(
+        monkeypatch, lambda req, timeout: _json_response({"accounts": [], "errlist": [error]})
+    )
+    start = date(2026, 1, 1)
+    result = simplefin.fetch_accounts(
+        ACCESS_URL, start=start, end=start + timedelta(days=simplefin.REQUEST_WINDOW_DAYS + 5)
+    )
+    assert len(calls) == 2
+    assert [e.msg for e in result.errors] == ["Auth required"]
