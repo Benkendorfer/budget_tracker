@@ -6,7 +6,7 @@ import asyncio
 
 from textual.widgets import DataTable
 
-from budget_tracker import vendors
+from budget_tracker import categories, vendors
 from budget_tracker.tui import BudgetApp
 
 from conftest import _category_of, _panel_state, _rows_of, _setup
@@ -141,7 +141,7 @@ def test_categorize_rule_categorises_matching_vendors(tmp_path, monkeypatch):
     async def run():
         app = BudgetApp()
         async with app.run_test() as pilot:
-            app._run_command("categorize rule COFFEE* = Coffee")
+            app._run_command("rule categorize COFFEE* = Coffee")
             await pilot.pause()
             return (
                 [t.category for t in app._txns],
@@ -150,7 +150,29 @@ def test_categorize_rule_categorises_matching_vendors(tmp_path, monkeypatch):
 
     category_cells, messages = asyncio.run(run())
     assert category_cells == ["Coffee"] * 3  # a rule overwrites the bank's own category
-    assert any("3 transactions categorised" in m for m in messages)
+    assert any("3 transactions categorized" in m for m in messages)
+
+
+def test_rule_categorize_makes_a_category_rule_not_a_vendor_rule(tmp_path, monkeypatch):
+    """`rule <pattern> = <name>` is a vendor rename, so the `categorize` keyword has to
+    be claimed before that parse -- or `rule categorize COFFEE* = Coffee` would become a
+    rename rule whose pattern is the literal text "categorize COFFEE*"."""
+    _setup(tmp_path, monkeypatch)
+
+    async def run():
+        app = BudgetApp()
+        async with app.run_test() as pilot:
+            app._run_command("rule categorize COFFEE* = Coffee")
+            await pilot.pause()
+            with app.session_factory() as session:
+                return (
+                    [r.pattern for r in vendors.list_rules(session)],
+                    [r.pattern for r in categories.list_rules(session)],
+                )
+
+    vendor_patterns, category_patterns = asyncio.run(run())
+    assert vendor_patterns == []
+    assert category_patterns == ["COFFEE*"]
 
 
 def test_manual_category_outranks_a_later_rule(tmp_path, monkeypatch):
@@ -175,7 +197,7 @@ def test_rules_panel_lists_both_kinds_of_rule(tmp_path, monkeypatch):
         app = BudgetApp()
         async with app.run_test() as pilot:
             app._run_command("rule COFFEE* = Coffee")
-            app._run_command("categorize rule *SHOP A = Treats")
+            app._run_command("rule categorize *SHOP A = Treats")
             await pilot.pause()
             app._run_command("categorize rules")
             await pilot.pause()
@@ -195,7 +217,7 @@ def test_rules_panel_lists_both_kinds_of_rule(tmp_path, monkeypatch):
     ]
     assert state[1] is True and focused == "rules"
     assert "2 rules" in state[2] and "2 vendors named" in state[2]
-    assert "2 txns categorised" in state[2]
+    assert "2 txns categorized" in state[2]
 
 
 def test_a_manual_category_is_not_counted_against_a_rule(tmp_path, monkeypatch):
@@ -207,7 +229,7 @@ def test_a_manual_category_is_not_counted_against_a_rule(tmp_path, monkeypatch):
         async with app.run_test() as pilot:
             app._run_command("categorize COFFEE SHOP A = Treats")
             await pilot.pause()
-            app._run_command("categorize rule COFFEE* = Coffee")
+            app._run_command("rule categorize COFFEE* = Coffee")
             await pilot.pause()
             app._run_command("rules")
             await pilot.pause()
@@ -226,7 +248,7 @@ def test_rules_panel_columns_fit_the_main_panel(tmp_path, monkeypatch):
         app = BudgetApp()
         async with app.run_test(size=(130, 40)) as pilot:
             app._run_command("rule COFFEE* = Coffee")
-            app._run_command("categorize rule COFFEE* = Coffee and cake")
+            app._run_command("rule categorize COFFEE* = Coffee and cake")
             await pilot.pause()
             app._run_command("rules")
             await pilot.pause()

@@ -499,12 +499,26 @@ def build_parser() -> argparse.ArgumentParser:
 
     sync_map = sync_subparsers.add_parser(
         "map",
-        help="Map (or re-map) a connection's remote accounts to local accounts.",
+        help=(
+            "Map newly linked remote accounts to local accounts "
+            "(--all to revisit the mapped ones)."
+        ),
     )
     sync_map.add_argument(
         "--connection",
         help=f"Which connection to map (default: {sync_module.DEFAULT_CONNECTION!r}).",
     )
+    sync_map.add_argument(
+        "--all",
+        action="store_true",
+        help="Also ask about accounts that are already mapped, to change them.",
+    )
+
+    sync_unmap = sync_subparsers.add_parser(
+        "unmap",
+        help="Unlink a local account from its remote account (transactions are kept).",
+    )
+    sync_unmap.add_argument("account", help="The local account to unlink.")
 
     sync_subparsers.add_parser(
         "status", help="List every connection's mappings and last sync time."

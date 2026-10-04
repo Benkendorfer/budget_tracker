@@ -686,6 +686,15 @@ def _txn_query(filters: Filters):
     return query
 
 
+# Orders get_transactions understands. "size" is by absolute amount, largest first, so a
+# big refund ranks beside a big charge. It compares raw minor units across currencies --
+# CHF 500 ranks with $500 -- which is close enough to read a view by, and keeps the sort
+# in SQL, where it has to be: the page below is limited, so sorting only the rows that
+# made it onto the page would miss the large ones further back.
+ORDER_DATE = "date"
+ORDER_SIZE = "size"
+
+
 def get_transactions(
     session: Session,
     account_id: Optional[int] = None,
@@ -695,6 +704,7 @@ def get_transactions(
     text_filter: Optional[TextFilter] = None,
     date_range: Optional[DateRange] = None,
     filters: Optional[Filters] = None,
+    order: str = ORDER_DATE,
 ) -> List[TxnRow]:
     resolved = resolve_filters(
         filters, account_id, category_id, vendor_filter, text_filter, date_range
@@ -711,7 +721,15 @@ def get_transactions(
             selectinload(Transaction.currency),
             selectinload(Transaction.account),
         )
-        .order_by(Transaction.posted_date.desc(), Transaction.id.desc())
+        .order_by(
+            *(
+                (func.abs(Transaction.value_minor).desc(),)
+                if order == ORDER_SIZE
+                else ()
+            ),
+            Transaction.posted_date.desc(),
+            Transaction.id.desc(),
+        )
         .limit(limit)
     )
     txns = list(session.scalars(query))

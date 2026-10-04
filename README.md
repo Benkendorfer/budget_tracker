@@ -81,9 +81,9 @@ vendor not listed. Type commands into the bar at the bottom:
 | `format <name> invert on\|off` | Flip whether a positive amount means money leaving the account for that layout (see below) |
 | `rename <raw vendor> = <display name>` | Give one vendor a readable name (see below) |
 | `rule <pattern> = <display name>` | Rename every matching vendor, now and in future imports |
-| `categorize <vendor> = <category>` | Categorise that vendor's transactions by hand (see below) |
+| `categorize <vendor> = <category>` | Categorize that vendor's transactions by hand (see below) |
 | `categorize <vendor> =` | Undo a manual category |
-| `categorize rule <pattern> = <category>` | Categorise every matching vendor, now and in future imports |
+| `rule categorize <pattern> = <category>` | Categorize every matching vendor, now and in future imports (`categorize rule …` also works) |
 | `categorize rules` | Open the rules panel (`categorize` on its own does the same) |
 | `category Food > Dining > Restaurants` | Build/move a category into that spot, creating any missing levels (see below) |
 | `category Dining` | Move an existing category to the top level |
@@ -99,6 +99,8 @@ vendor not listed. Type commands into the bar at the bottom:
 | `filter <text>` | Search description, vendor name, and raw vendor name |
 | `filter <field>:<text>` | Search one of `description`, `vendor`, `raw` |
 | `filter` | Clear the text filter |
+| `sort size` | Sort the current view by amount, largest first, counting money in and out alike; changing a filter or leaving the transactions goes back to date order |
+| `sort date` | Back to newest first |
 | `stats` | Pick a time window, then see spending per category (see below) |
 | `stats <window>` | Skip the picker: `stats 6m`, `stats 1 year`, `stats 2025-01-01..2025-06-30` |
 | `chart` | Pick a time window, then see money over time as bars (see below) |
@@ -258,7 +260,7 @@ budget sync connect
 budget sync --dry-run           # see what the next sync would do, without writing
 budget sync                     # sync every connection
 budget sync status
-budget sync map                 # re-map a connection's accounts
+budget sync map                 # map newly linked accounts (--all to revisit mapped ones)
 budget sync disconnect
 ```
 
@@ -373,8 +375,8 @@ budget category-rule add "*COFFEE*" "Dining" # by pattern, now and in future imp
 ```
 
 In the app the same two are `categorize COFFEE SHOP A = Dining` and
-`categorize rule *COFFEE* = Dining`. `ctrl+t` prefills the first for whichever vendor you
-are pointing at, so categorising a row you are looking at is one keystroke and a word.
+`rule categorize *COFFEE* = Dining`. `ctrl+t` prefills the first for whichever vendor you
+are pointing at, so categorizing a row you are looking at is one keystroke and a word.
 Leaving the right-hand side blank undoes a manual category — `categorize COFFEE SHOP A =`,
 or `budget categorize "COFFEE SHOP A" --clear` — the same way a bare `filter` clears the
 filter.
@@ -1092,7 +1094,8 @@ is a complement to CSV imports, not a replacement for your bank's own statements
 
 ```bash
 budget sync status       # every connection's mappings, synced-through date, last run
-budget sync map          # map more accounts, or re-map one (shows the current mapping)
+budget sync map          # map accounts linked since; mapped ones are skipped
+budget sync map --all    # also revisit mapped accounts, to change one
 budget sync              # pull new transactions from every connection
 budget sync disconnect   # remove a connection and its keychain entry (keeps transactions)
 ```

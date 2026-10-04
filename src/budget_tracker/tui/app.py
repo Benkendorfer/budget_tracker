@@ -158,8 +158,8 @@ class BudgetApp(App):
     BINDINGS = [
         ("ctrl+r", "refresh", "Refresh"),
         ("ctrl+l", "clear_filters", "Clear"),
-        ("ctrl+n", "rename_vendor", "Rename"),
-        ("ctrl+t", "categorize_vendor", "Categorise"),
+        ("ctrl+n", "rename_vendor", "Rename vendor"),
+        ("ctrl+t", "categorize_vendor", "Categorize"),
         ("escape", "show_transactions", "Transactions"),
         # DataTable binds left/right itself (cursor movement between cells), which would
         # otherwise eat these before an ordinary App binding ever saw them. priority=True
@@ -242,6 +242,15 @@ class BudgetApp(App):
         # _fill_txns() to whatever is still in self._txns, so a selection never
         # silently outlives the rows it was made on.
         self._selected_ids: Set[int] = set()
+        # The filters #txns was last filled under. A refill under the same filters is an
+        # edit (a rule, a category, a rename) and keeps the user's place; a refill under
+        # different ones is a new view and starts at the top. See _fill_txns.
+        self._txns_filters: Optional[queries.Filters] = None
+        self._txns_order = queries.ORDER_DATE
+        # Set by `sort size` to the filters it was issued under. The size order belongs
+        # to that one view: any filter change, or leaving the transactions panel, puts
+        # the list back in date order (see _txn_order and _set_panel).
+        self._size_sort_filters: Optional[queries.Filters] = None
         self._rules: List[queries.RuleRow] = []
         self._category_rules: List[queries.CategoryRuleRow] = []
         self._candidates: List[ImportCandidate] = []
@@ -378,7 +387,7 @@ class BudgetApp(App):
         yield Input(
             placeholder=(
                 "command: import | unimport | filter | categorize | category | sel | "
-                "section | format | stats | chart | pie | trips | rates | sync | "
+                "section | format | stats | chart | pie | trips | rates | sync | sort | "
                 "rules | all | refresh | help | quit"
             ),
             id="command",
@@ -608,6 +617,7 @@ class BudgetApp(App):
             txns = queries.get_transactions(
                 session,
                 filters=self._active_filters(),
+                order=self._txn_order(),
             )
             totals = queries.get_totals(
                 session,
@@ -771,12 +781,44 @@ class BudgetApp(App):
         return labels
 
     def _fill_txns(self, txns: List[queries.TxnRow]) -> None:
+        """Refill #txns, keeping the cursor on the same transaction across an edit.
+
+        Every command that writes (a rule, a category, a rename, a bulk edit) ends in
+        reload(), and clearing the table sends the cursor and scroll back to the top --
+        so editing row 300 meant scrolling back down to row 300 for the next one. When
+        the filters are unchanged the cursor returns to the same transaction, at the
+        same height on screen; if that row has left the view (re-categorized out of a
+        category filter, say) it stays at the same index, i.e. on the next row down.
+        A changed filter is a different list, where the top is the right place to be.
+        """
         table = self.query_one("#txns", DataTable)
+        filters = self._active_filters()
+        order = self._txn_order()
+        # A re-sort is a new list too: starting at the top shows its largest rows.
+        same_view = (
+            filters == self._txns_filters
+            and order == self._txns_order
+            and table.row_count > 0
+        )
+        old_row, old_column = table.cursor_row, table.cursor_column
+        old_id = self._txns[old_row].id if 0 <= old_row < len(self._txns) else None
+        screen_offset = old_row - int(table.scroll_y)
+
         self._txns = txns
+        self._txns_filters = filters
+        self._txns_order = order
         # Drop any selected id no longer among the rows just fetched -- see
         # self._selected_ids.
         self._selected_ids &= {txn.id for txn in txns}
         transactions.fill_txns(table, txns, self._currencies, self._selected_ids)
+
+        if not same_view or not txns:
+            return
+        row = next((i for i, txn in enumerate(txns) if txn.id == old_id), None)
+        if row is None:
+            row = min(old_row, len(txns) - 1)
+        table.move_cursor(row=row, column=old_column, scroll=False)
+        table.scroll_to(y=max(0, row - screen_offset), animate=False)
 
     def _toggle_txn_selected(self, row: int) -> None:
         """Toggle the row under ``row`` in and out of the selection.
@@ -1194,7 +1236,7 @@ class BudgetApp(App):
             status.update(
                 f"{count} rule{'s' if count != 1 else ''}   "
                 f"{named} vendors named   "
-                f"{owned} txns categorised   "
+                f"{owned} txns categorized   "
                 "escape to return to transactions"
             )
             return
@@ -1247,6 +1289,8 @@ class BudgetApp(App):
         if self.text_filter is not None:
             scope.append(f'{self.text_filter.field}~"{self.text_filter.text}"')
         scope_label = f" [filtered: {', '.join(scope)}]" if scope else ""
+        if self._size_sort_filters is not None:
+            scope_label += "  by size"
         transfers_label = (
             f"   ({totals.transfer_count} transfers excluded)"
             if totals.transfer_count
@@ -1726,6 +1770,8 @@ class BudgetApp(App):
             self._do_rates(arg)
         elif name == "sync":
             self._do_sync(arg)
+        elif name == "sort":
+            self._do_sort(arg)
         elif name == "help":
             self.notify(
                 "import — browse data/to_import; enter imports the selected file,\n"
@@ -1741,11 +1787,12 @@ class BudgetApp(App):
                 "rule <pattern> = <display name> — rename every matching vendor,\n"
                 "  now and on future imports (e.g. rule Kindle Svcs* = Kindle)\n"
                 "rules — list the rules you have defined (escape returns)\n"
-                "categorize <vendor> = <category> — categorise that vendor's\n"
+                "categorize <vendor> = <category> — categorize that vendor's\n"
                 "  transactions by hand (cat is short for categorize)\n"
                 "categorize <vendor> = — undo a manual category\n"
-                "categorize rule <pattern> = <category> — categorise every matching\n"
-                "  vendor, now and on future imports\n"
+                "rule categorize <pattern> = <category> — categorize every matching\n"
+                "  vendor, now and on future imports (e.g. rule categorize *COFFEE* =\n"
+                "  Dining)\n"
                 "categorize rules — list the rules you have defined (escape returns)\n"
                 "category Food > Dining > Restaurants — build/move a category into\n"
                 "  that spot, creating any missing levels\n"
@@ -1782,6 +1829,9 @@ class BudgetApp(App):
                 "filter <text> — search description, vendor, and raw name\n"
                 "filter vendor:<text> — search one field (description/vendor/raw)\n"
                 "filter — clear the text filter\n"
+                "sort size — this view, largest amounts first (in or out); changing\n"
+                "  a filter or leaving the transactions returns to date order\n"
+                "sort date — back to newest first\n"
                 "stats — pick a period, then see spending per category\n"
                 "stats <period> — skip the picker (e.g. stats 6m, stats 1 year,\n"
                 f"  stats {periods_panel.RANGE_EXAMPLE})\n"
@@ -2003,8 +2053,44 @@ class BudgetApp(App):
         self._drill_origin = origin
         self.screen.refresh_bindings()
 
+    def _txn_order(self) -> str:
+        """The order #txns should be in: size while `sort size`'s view lasts, else date.
+
+        The view ends the moment the filters differ from the ones `sort size` was given,
+        whichever command changed them -- so there is no list of filter-changing
+        commands to keep in step with.
+        """
+        if (
+            self._size_sort_filters is not None
+            and self._size_sort_filters != self._active_filters()
+        ):
+            self._size_sort_filters = None
+        return queries.ORDER_SIZE if self._size_sort_filters is not None else queries.ORDER_DATE
+
+    SORT_USAGE = "Usage: sort size | sort date"
+
+    def _do_sort(self, arg: str) -> None:
+        """``sort size``: this view, largest first; ``sort date``: back to newest first."""
+        arg = arg.strip().lower()
+        if arg in ("size", "amount"):
+            if self._panel != "txns":
+                self._set_panel("txns")
+            self._size_sort_filters = self._active_filters()
+        elif arg == "date":
+            self._size_sort_filters = None
+        else:
+            self.notify(self.SORT_USAGE, severity="warning")
+            return
+        self.reload()
+
     def _set_panel(self, panel: str) -> None:
         """Show one of the main-view panels; escape always returns to transactions."""
+        # Leaving the transactions puts them back in date order, so returning finds the
+        # default view. Refilled now, while the table is still the panel on show, so the
+        # reload does not also rebuild whichever panel is being opened.
+        if panel != "txns" and self._size_sort_filters is not None:
+            self._size_sort_filters = None
+            self.reload()
         # Leaving the drilled-down view for any other panel invalidates "back to
         # stats"/"back to chart"/"back to trips". _drill_into_category()/
         # _drill_into_bar()/_drill_into_trip_row() and _go_back_from_drill() all set
@@ -2034,7 +2120,7 @@ class BudgetApp(App):
             self.notify(
                 "No vendor rules yet, and no category rules. Add one with:\n"
                 "  rule <pattern> = <display name>\n"
-                "  categorize rule <pattern> = <category>"
+                "  rule categorize <pattern> = <category>"
             )
 
     def _show_imports(self) -> None:
@@ -2181,8 +2267,18 @@ class BudgetApp(App):
         self.notify(message)
 
     def _do_rule(self, arg: str) -> None:
+        """``rule <pattern> = <display name>`` renames; ``rule categorize ...`` categorizes.
+
+        Both kinds of rule start with ``rule`` so they read as one family. A vendor
+        pattern that genuinely starts with the word "categorize" is not a realistic
+        merchant string, so the keyword is safe to claim.
+        """
         if not arg:
             self._show_rules()
+            return
+        head, _, rest = arg.partition(" ")
+        if head.lower() in {"categorize", "categorise", "cat"}:
+            self._do_category_rule(rest.strip())
             return
         if "=" not in arg:
             self.notify(
@@ -2203,7 +2299,7 @@ class BudgetApp(App):
         self.notify(f"{pattern!r} → {display!r} ({changed} vendors updated)")
 
     CATEGORIZE_USAGE = "Usage: categorize <vendor> = <category>   (blank category undoes it)"
-    CATEGORY_RULE_USAGE = "Usage: categorize rule <pattern> = <category>"
+    CATEGORY_RULE_USAGE = "Usage: rule categorize <pattern> = <category>"
 
     def _do_categorize(self, arg: str) -> None:
         """``categorize <vendor> = <category>``, its blank-category undo, and its rules."""
@@ -2212,6 +2308,7 @@ class BudgetApp(App):
             self._show_rules()
             return
         head, _, rest = arg.partition(" ")
+        # The older spelling of `rule categorize`, kept so it still works.
         if head.lower() == "rule":
             self._do_category_rule(rest.strip())
             return
@@ -2231,7 +2328,7 @@ class BudgetApp(App):
                 return
             if value:
                 changed = categories.set_category(session, vendor, value)
-                message = f"{vendor!r} → {value!r} ({changed} transactions categorised)"
+                message = f"{vendor!r} → {value!r} ({changed} transactions categorized)"
             else:
                 # Mirrors a bare `filter`: leaving the right-hand side empty undoes it.
                 changed = categories.clear_category(session, vendor)
@@ -2258,7 +2355,7 @@ class BudgetApp(App):
         self.reload()
         # markup=False: patterns are globs, and may carry brackets.
         self.notify(
-            f"{pattern!r} → {value!r} ({changed} transactions categorised)", markup=False
+            f"{pattern!r} → {value!r} ({changed} transactions categorized)", markup=False
         )
 
     SEL_USAGE = (

@@ -565,7 +565,7 @@ def test_footer_shows_the_chart_keys(tmp_path, monkeypatch):
     rendered = asyncio.run(run())
     footer = next(line for line in rendered.splitlines() if "palette" in line)
     for label in (
-        "Refresh", "Clear", "Rename", "Categorise", "Transactions", "Bucket", "Measure",
+        "Refresh", "Clear", "Rename vendor", "Categorize", "Transactions", "Bucket", "Measure",
     ):
         assert label in footer, f"{label!r} missing or truncated: {footer.strip()!r}"
 

@@ -48,6 +48,8 @@ def _cmd_sync(args: argparse.Namespace) -> int:
         return _sync_connect(args)
     if command == "map":
         return _sync_map(args)
+    if command == "unmap":
+        return _sync_unmap(args)
     if command == "status":
         return _sync_status(args)
     if command == "disconnect":
@@ -235,8 +237,49 @@ def _sync_map(args: argparse.Namespace) -> int:
             return 0
 
         current = _current_mapping(session, name)
-        _walk_account_mapping(session, name, account_set.accounts, current)
+        # The usual reason to run 'map' again is a newly linked account, so by default
+        # only those are asked about; --all brings the mapped ones back to change them.
+        if args.all:
+            to_walk = list(account_set.accounts)
+        else:
+            to_walk = [r for r in account_set.accounts if r.id not in current]
+            for remote in account_set.accounts:
+                if remote.id in current:
+                    print(f"Already mapped: {remote.name!r} -> {current[remote.id]!r}")
+        if to_walk:
+            _walk_account_mapping(session, name, to_walk, current)
+        else:
+            print("\nEvery remote account is already mapped. Use --all to change one.")
         _print_remote_errors(account_set.errors)
+    return 0
+
+
+def _sync_unmap(args: argparse.Namespace) -> int:
+    """Break the link between a local account and whatever remote account feeds it.
+
+    Named by the *local* account, the one the user knows: after a bank is re-linked on
+    SimpleFIN, the old remote account is gone from every listing, so it could not be
+    picked out by its remote name. Transactions already synced stay where they are.
+    """
+    engine = get_engine()
+    init_db(engine)
+    session_factory = get_sessionmaker(engine)
+    with session_factory() as session:
+        mapping = session.scalar(
+            select(SyncAccount)
+            .join(SyncAccount.account)
+            .where(SyncAccount.account.has(name=args.account.strip()))
+        )
+        if mapping is None:
+            print(f"No account named {args.account!r} is linked to a sync connection.")
+            return 1
+        connection_name = mapping.connection.name
+        remote_name = mapping.remote_name
+        sync_module.unmap_account(session, connection_name, mapping.remote_id)
+    print(
+        f"Unlinked {args.account!r} from {remote_name!r} ({connection_name}). Its "
+        "transactions are kept; run 'budget sync map' to link it to another account."
+    )
     return 0
 
 

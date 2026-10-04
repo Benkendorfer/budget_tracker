@@ -570,7 +570,7 @@ def test_categorize_command_categorises_a_vendor(tmp_path, monkeypatch):
     assert shop_a == "Coffee"  # both of that vendor's rows, reloaded into the table
     assert shop_b == "Dining"  # the bank's own category, untouched
     assert any("Coffee (2)" in label for label in sidebar)
-    assert any("2 transactions categorised" in m for m in messages)
+    assert any("2 transactions categorized" in m for m in messages)
 
 
 def test_categorize_with_a_blank_category_clears_it(tmp_path, monkeypatch):
@@ -630,7 +630,7 @@ def test_categorize_an_unknown_vendor_notifies(tmp_path, monkeypatch):
     message, severity = notifications[-1]
     assert "No vendor named 'NOT A VENDOR'" in message
     assert severity == "error"
-    assert "categorised" not in message  # not reported as a successful 0
+    assert "categorized" not in message  # not reported as a successful 0
     assert category_cells == ["Dining"] * 3
 
 
@@ -641,7 +641,7 @@ def test_categorize_without_an_equals_sign_warns(tmp_path, monkeypatch):
         app = BudgetApp()
         async with app.run_test() as pilot:
             app._run_command("categorize COFFEE SHOP A Coffee")
-            app._run_command("categorize rule COFFEE*")
+            app._run_command("rule categorize COFFEE*")
             await pilot.pause()
             return [(n.message, n.severity) for n in app._notifications]
 
@@ -651,7 +651,7 @@ def test_categorize_without_an_equals_sign_warns(tmp_path, monkeypatch):
         "warning",
     )
     assert notifications[1] == (
-        "Usage: categorize rule <pattern> = <category>",
+        "Usage: rule categorize <pattern> = <category>",
         "warning",
     )
 
@@ -734,7 +734,7 @@ def test_footer_shows_every_shortcut_at_a_normal_width(tmp_path, monkeypatch):
     rendered = asyncio.run(run())
     footer = next(line for line in rendered.splitlines() if "palette" in line)
     # Every shortcut the statistics panel offers, the last one included.
-    for label in ("Refresh", "Clear", "Rename", "Categorise", "Transactions", "Fold all"):
+    for label in ("Refresh", "Clear", "Rename vendor", "Categorize", "Transactions", "Fold all"):
         assert label in footer, f"{label!r} missing or truncated: {footer.strip()!r}"
 
 

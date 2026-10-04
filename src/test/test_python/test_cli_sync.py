@@ -251,7 +251,7 @@ def test_map_rerun_shows_and_keeps_the_current_mapping_by_default(tmp_path, monk
     _fake_fetch(monkeypatch, AccountSet(accounts=(_racct(),)))
     _answers(monkeypatch, "")  # keep the current mapping
 
-    assert cli.main(["sync", "map"]) == 0
+    assert cli.main(["sync", "map", "--all"]) == 0
     out = capsys.readouterr().out
     assert "Currently mapped to 'Amex 1008'." in out
 
@@ -276,10 +276,55 @@ def test_map_rerun_can_change_the_mapping(tmp_path, monkeypatch, capsys):
     # Candidates are listed alphabetically by queries.get_accounts: Amex 1008, New Card.
     _answers(monkeypatch, "2")
 
-    assert cli.main(["sync", "map"]) == 0
+    assert cli.main(["sync", "map", "--all"]) == 0
     with session_factory() as session:
         mapping = session.scalar(select(SyncAccount))
         assert session.get(Account, mapping.account_id).name == "New Card"
+
+
+def test_map_asks_only_about_unmapped_accounts_by_default(tmp_path, monkeypatch, capsys):
+    session_factory = _db(tmp_path, monkeypatch)
+    _import_amex(session_factory, tmp_path)
+    secrets = _fake_credentials(monkeypatch)
+    secrets["simplefin"] = SECRET_ACCESS_URL
+    with session_factory() as session:
+        session.add(SyncConnection(name="simplefin"))
+        session.commit()
+        sync_module.map_account(session, "simplefin", _racct(), "Amex 1008")
+
+    savings = _racct(remote_id="r-savings", name="Savings")
+    _fake_fetch(monkeypatch, AccountSet(accounts=(_racct(), savings)))
+    # Exactly one answer: a question about the mapped Amex card would run out of input.
+    _answers(monkeypatch, "n", "Bank Savings")
+
+    assert cli.main(["sync", "map"]) == 0
+    out = capsys.readouterr().out
+    assert "Already mapped: 'Amex Card' -> 'Amex 1008'" in out
+    assert "Remote account: 'Savings'" in out
+    assert "Remote account: 'Amex Card'" not in out
+
+    with session_factory() as session:
+        names = sorted(
+            session.get(Account, m.account_id).name for m in session.scalars(select(SyncAccount))
+        )
+    assert names == ["Amex 1008", "Bank Savings"]
+
+
+def test_map_with_everything_mapped_points_at_all(tmp_path, monkeypatch, capsys):
+    session_factory = _db(tmp_path, monkeypatch)
+    _import_amex(session_factory, tmp_path)
+    secrets = _fake_credentials(monkeypatch)
+    secrets["simplefin"] = SECRET_ACCESS_URL
+    with session_factory() as session:
+        session.add(SyncConnection(name="simplefin"))
+        session.commit()
+        sync_module.map_account(session, "simplefin", _racct(), "Amex 1008")
+
+    _fake_fetch(monkeypatch, AccountSet(accounts=(_racct(),)))
+    _answers(monkeypatch)  # no questions expected at all
+
+    assert cli.main(["sync", "map"]) == 0
+    assert "Use --all to change one." in capsys.readouterr().out
 
 
 # ------------------------------------------------------------------------------ status
@@ -566,3 +611,38 @@ def test_no_secret_is_ever_printed(tmp_path, monkeypatch, capsys):
     assert SECRET_ACCESS_URL not in everything
     assert "sekrit-pw-998" not in everything
     assert "alice:sekrit-pw-998" not in everything
+
+
+# ------------------------------------------------------------------------------- unmap
+
+
+def test_unmap_frees_a_local_account_for_a_relinked_remote(tmp_path, monkeypatch, capsys):
+    """Re-linking a bank on SimpleFIN gives its accounts new ids; the local account must
+    be unlinked from the old one before the new one can take its place."""
+    session_factory = _db(tmp_path, monkeypatch)
+    _import_amex(session_factory, tmp_path)
+    secrets = _fake_credentials(monkeypatch)
+    secrets["simplefin"] = SECRET_ACCESS_URL
+    with session_factory() as session:
+        session.add(SyncConnection(name="simplefin"))
+        session.commit()
+        sync_module.map_account(session, "simplefin", _racct(remote_id="old-id"), "Amex 1008")
+
+    assert cli.main(["sync", "unmap", "Amex 1008"]) == 0
+    assert "Unlinked 'Amex 1008'" in capsys.readouterr().out
+
+    relinked = _racct(remote_id="new-id")
+    _fake_fetch(monkeypatch, AccountSet(accounts=(relinked,)))
+    _answers(monkeypatch, "1")  # Amex 1008, the only USD account
+    assert cli.main(["sync", "map"]) == 0
+
+    with session_factory() as session:
+        [mapping] = session.scalars(select(SyncAccount)).all()
+        assert mapping.remote_id == "new-id"
+        assert session.get(Account, mapping.account_id).name == "Amex 1008"
+
+
+def test_unmap_an_unlinked_account_fails(tmp_path, monkeypatch, capsys):
+    _db(tmp_path, monkeypatch)
+    assert cli.main(["sync", "unmap", "Nope"]) == 1
+    assert "No account named 'Nope'" in capsys.readouterr().out
