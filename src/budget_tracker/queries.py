@@ -778,7 +778,7 @@ def get_transactions(
                 amount_minor=txn.value_minor,
                 currency=txn.currency.value,
                 account=txn.account.name,
-                is_transfer=txn.transfer_group_id is not None,
+                is_transfer=_is_transfer_leg(txn.transfer_group_id),
                 tags=tuple(sorted(tag_names.get(txn.id, ()))),
                 trip=trip_names.get(txn.id),
             )
@@ -804,6 +804,50 @@ def _currencies_present(session: Session, base, condition=None) -> Set[str]:
     return set(session.scalars(query))
 
 
+def _real_rows(base):
+    """The ``real`` predicate every money figure in this module is filtered to: rows
+    that are not one leg of a transfer.
+
+    Both legs of a transfer are real rows, but they move money between the user's own
+    accounts, so counting them would inflate spending and income alike. A filter --
+    rather than relying on the two legs canceling out -- also keeps the figures right
+    when some other filter selects only one leg of the pair.
+
+    This is the one shared definition of "counts as income/spending" at the SQL level;
+    every aggregate below builds its ``real`` condition by calling this rather than
+    repeating ``transfer_group_id.is_(None)``. See :func:`_is_transfer_leg` for the
+    equivalent on an already-loaded row rather than a subquery column.
+    """
+    return base.c.transfer_group_id.is_(None)
+
+
+def _is_transfer_leg(transfer_group_id: Optional[int]) -> bool:
+    """Python-level mirror of :func:`_real_rows`, for an ORM row already in hand
+    instead of a SQL subquery column (see :class:`TxnRow`)."""
+    return transfer_group_id is not None
+
+
+def _signed_sums(amount, counts=None):
+    """``(total, outflow, inflow)`` aggregates over a signed amount column.
+
+    ``counts`` is a condition selecting the rows whose money should be added up; rows
+    outside it still exist and are still counted, they just contribute 0. That is how
+    transfers are kept out of the figures without being erased from the tallies.
+
+    This is the other half of "counts as income/spending": every site splits outflow
+    (negatives) from inflow (positives) through this, rather than repeating the
+    ``case((amount < 0, ...))`` / ``case((amount > 0, ...))`` pair inline. A zero-amount
+    row counts toward neither, which only matters for the total -- it is nonetheless
+    always ``outflow + inflow``, since a zero contributes nothing to either side.
+    """
+    def summed(condition):
+        if counts is not None:
+            condition = condition & counts
+        return func.coalesce(func.sum(case((condition, amount), else_=0)), 0)
+
+    return summed(true()), summed(amount < 0), summed(amount > 0)
+
+
 def get_totals(
     session: Session,
     account_id: Optional[int] = None,
@@ -820,32 +864,21 @@ def get_totals(
     base = _txn_query(resolved).subquery()
     amount = base.c.value_minor
     count = session.scalar(select(func.count()).select_from(base)) or 0
+    real = _real_rows(base)
     transfer_count = (
-        session.scalar(
-            select(func.count())
-            .select_from(base)
-            .where(base.c.transfer_group_id.is_not(None))
-        )
-        or 0
+        session.scalar(select(func.count()).select_from(base).where(~real)) or 0
     )
-
-    # Both legs of a transfer are real rows, but they move money between your own
-    # accounts, so counting them would inflate spending and income alike. Filtering
-    # (rather than relying on the legs canceling out) also keeps the figures right
-    # when a filter selects only one leg.
-    real = base.c.transfer_group_id.is_(None)
 
     # Fast path: everything real is already in home_currency (true for every database
     # today), so this is exactly the query that ran before conversion existed.
     if _currencies_present(session, base, real) <= {home_currency}:
-        total = lambda condition: (  # noqa: E731 - reads better than three near-copies
-            session.scalar(select(func.coalesce(func.sum(amount), 0)).where(condition)) or 0
-        )
+        _net, outflow, inflow = _signed_sums(amount, real)
+        outflow_minor, inflow_minor = session.execute(select(outflow, inflow)).one()
         return Totals(
             count=count,
-            net_minor=total(real),
-            outflow_minor=total(real & (amount < 0)),
-            inflow_minor=total(real & (amount > 0)),
+            net_minor=outflow_minor + inflow_minor,
+            outflow_minor=outflow_minor,
+            inflow_minor=inflow_minor,
             transfer_count=transfer_count,
         )
 
@@ -853,14 +886,9 @@ def get_totals(
     # cents would be meaningless, so amounts are grouped by (currency, posted_date) --
     # small enough to pull into Python -- and converted at each day's own rate rather
     # than one rate for the whole window, since rates move.
+    _total, outflow, inflow = _signed_sums(amount)
     groups = session.execute(
-        select(
-            Currency.value,
-            base.c.posted_date,
-            func.count(),
-            func.coalesce(func.sum(case((amount < 0, amount), else_=0)), 0),
-            func.coalesce(func.sum(case((amount > 0, amount), else_=0)), 0),
-        )
+        select(Currency.value, base.c.posted_date, func.count(), outflow, inflow)
         .select_from(base)
         .join(Currency, Currency.id == base.c.currency_id)
         .where(real)
@@ -901,21 +929,6 @@ def get_totals(
     )
 
 
-def _signed_sums(amount, counts=None):
-    """``(total, outflow, inflow)`` aggregates over a signed amount column.
-
-    ``counts`` is a condition selecting the rows whose money should be added up; rows
-    outside it still exist and are still counted, they just contribute 0. That is how
-    transfers are kept out of the figures without being erased from the tallies.
-    """
-    def summed(condition):
-        if counts is not None:
-            condition = condition & counts
-        return func.coalesce(func.sum(case((condition, amount), else_=0)), 0)
-
-    return summed(true()), summed(amount < 0), summed(amount > 0)
-
-
 def get_category_totals(
     session: Session,
     account_id: Optional[int] = None,
@@ -942,7 +955,7 @@ def get_category_totals(
     )
     base = _txn_query(resolved).subquery()
     amount = base.c.value_minor
-    real = base.c.transfer_group_id.is_(None)
+    real = _real_rows(base)
 
     if _currencies_present(session, base, real) <= {home_currency}:
         total, outflow, inflow = _signed_sums(amount, real)
@@ -985,14 +998,11 @@ def get_category_totals(
         .group_by(base.c.category_id)
     ).all()
 
+    _total, outflow, inflow = _signed_sums(amount)
     money_groups = session.execute(
         select(
-            base.c.category_id,
-            Currency.value,
-            base.c.posted_date,
-            func.count(),
-            func.coalesce(func.sum(case((amount < 0, amount), else_=0)), 0),
-            func.coalesce(func.sum(case((amount > 0, amount), else_=0)), 0),
+            base.c.category_id, Currency.value, base.c.posted_date, func.count(),
+            outflow, inflow,
         )
         .select_from(base)
         .join(Currency, Currency.id == base.c.currency_id)
@@ -1057,7 +1067,7 @@ def get_bucket_totals(
     )
     base = _txn_query(resolved).subquery()
     amount = base.c.value_minor
-    real = base.c.transfer_group_id.is_(None)
+    real = _real_rows(base)
 
     if _currencies_present(session, base, real) <= {home_currency}:
         _total, outflow, inflow = _signed_sums(amount)
@@ -1077,14 +1087,9 @@ def get_bucket_totals(
 
     # Slow path: grouped by (currency, posted_date) -- finer than the bucket itself --
     # so each day converts at its own rate before being rolled up into its bucket.
+    _total, outflow_expr, inflow_expr = _signed_sums(amount)
     groups = session.execute(
-        select(
-            Currency.value,
-            base.c.posted_date,
-            func.count(),
-            func.coalesce(func.sum(case((amount < 0, amount), else_=0)), 0),
-            func.coalesce(func.sum(case((amount > 0, amount), else_=0)), 0),
-        )
+        select(Currency.value, base.c.posted_date, func.count(), outflow_expr, inflow_expr)
         .select_from(base)
         .join(Currency, Currency.id == base.c.currency_id)
         .where(real)
@@ -1173,7 +1178,7 @@ def get_category_bucket_totals(
     )
     base = _txn_query(resolved).subquery()
     amount = base.c.value_minor
-    real = base.c.transfer_group_id.is_(None)
+    real = _real_rows(base)
     key = func.strftime(key_format, base.c.posted_date)
     label = func.strftime(label_format, base.c.posted_date)
 
@@ -1215,11 +1220,11 @@ def get_category_bucket_totals(
         .group_by(key, label, base.c.category_id)
     ).all()
 
+    _total, outflow_expr, inflow_expr = _signed_sums(amount)
     money_groups = session.execute(
         select(
             key, base.c.category_id, Currency.value, base.c.posted_date,
-            func.coalesce(func.sum(case((amount < 0, amount), else_=0)), 0),
-            func.coalesce(func.sum(case((amount > 0, amount), else_=0)), 0),
+            outflow_expr, inflow_expr,
         )
         .select_from(base)
         .join(Currency, Currency.id == base.c.currency_id)
@@ -1352,7 +1357,7 @@ def get_trips(session: Session, home_currency: str = HOME_CURRENCY) -> List[Trip
         .join(Transaction, Transaction.id == TransactionTag.transaction_id)
         .where(TransactionTag.tag_id.in_(trip_ids))
     ).subquery()
-    real = base.c.transfer_group_id.is_(None)
+    real = _real_rows(base)
 
     # trip_id -> {bucket -> net_minor}; net, not yet negated into cost. This module's
     # own BUCKETS (day/week/month/year, above) is a different vocabulary entirely --
@@ -1380,11 +1385,11 @@ def get_trips(session: Session, home_currency: str = HOME_CURRENCY) -> List[Trip
     else:
         # Slow path, mirroring get_totals: grouped by (trip, category, currency, day),
         # each group converted at that day's own rate and summed in Python.
+        _total, outflow_expr, inflow_expr = _signed_sums(base.c.value_minor)
         money_groups = session.execute(
             select(
                 base.c.trip_id, base.c.category_id, Currency.value, base.c.posted_date,
-                func.coalesce(func.sum(case((base.c.value_minor < 0, base.c.value_minor), else_=0)), 0),
-                func.coalesce(func.sum(case((base.c.value_minor > 0, base.c.value_minor), else_=0)), 0),
+                outflow_expr, inflow_expr,
             )
             .select_from(base)
             .join(Currency, Currency.id == base.c.currency_id)

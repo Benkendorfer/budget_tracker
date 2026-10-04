@@ -3,17 +3,30 @@
 Layout: an accordion sidebar (accounts, vendors, categories, tags, trips -- one
 section open at a time; click a row to filter), a scrollable transactions table, a
 totals line, and a command bar at the bottom.
+
+``BudgetApp`` itself holds only what is genuinely cross-cutting: its CSS, bindings,
+``compose()``/``on_mount()``, the sidebar/filter/reload plumbing, and the command
+dispatcher. What each command actually *does* lives one family per module under
+``tui/commands/`` (selection, rules, categories, transfers, imports, filters, rates,
+sync, trips, the period picker, stats, chart, pie, drill-down, events, and key-binding
+actions) -- each a plain mixin class, composed onto ``BudgetApp`` below. A method's
+name and the ``self.`` state it reads/writes are unchanged by which module it lives
+in, so this is purely an organizational split: ``app._do_sel(...)``,
+``app._show_stats(...)``, ``BudgetApp.SORT_USAGE``, and so on all still work exactly as
+before.
+
+None of those mixins override a Textual ``App`` attribute or method -- watch for that
+if you add one. A past bug named a method ``_filters``, which shadowed ``App``'s own
+attribute of that name (a list of line filters) and broke every test; the active
+filters are ``self._active_filters()`` here for exactly that reason.
 """
 
 from __future__ import annotations
 
-import re
-from datetime import date
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set, Tuple, Union
 
 from rich.text import Text
-from sqlalchemy.orm import Session
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -30,78 +43,58 @@ from textual.widgets import (
     Static,
 )
 
-from .. import (
-    accounts,
-    categories,
-    charts,
-    formats,
-    importer,
-    models,
-    queries,
-    rates,
-    stats,
-    sync,
-    tags as tags_module,
-    transfers,
-    trips,
-    vendors,
-)
+# import_csv and IMPORT_PROBLEMS are not called from this module -- ImportCommands
+# (commands/imports.py) does the importing. Both are re-exported here, as plain module
+# attributes, because the tests patch and import them as
+# `budget_tracker.tui.app.import_csv`/`...IMPORT_PROBLEMS` (a pre-existing fixture this
+# split does not get to change), and ImportCommands reads them back off this live
+# module object at call time precisely so that patch takes effect -- see
+# commands/imports.py's `_app_module()`.
+from .. import charts, models, queries, stats, tags as tags_module
 from ..db import DuplicateCategoryNamesError, get_engine, get_sessionmaker, init_db
-from ..importer import (
-    ImportCandidate,
-    InboxFolder,
-    UnknownImport,
-    delete_import,
-    import_csv,
-    inspect_csv,
-    list_inbox,
-    read_header_and_rows,
-)
-from . import chart as chart_panel
-from . import imports as imports_panel
+from ..importer import ImportCandidate, InboxFolder, import_csv  # noqa: F401
 from . import periods as periods_panel
-from . import pie as pie_panel
-from . import rules as rules_panel
-from . import stats as stats_panel
 from . import transactions
 from . import trips as trips_panel
-from .formatting import CHART_WIDTH, _fmt_amount, _range_label, _truncate
+from .commands.actions import ActionCommands
+from .commands.categories import CategoryCommands
+from .commands.chart import ChartCommands
+from .commands.drilldown import DrillDownCommands
+from .commands.events import EventCommands
+from .commands.filters import FilterCommands
+from .commands.imports import IMPORT_PROBLEMS, ImportCommands, TO_IMPORT_DIR  # noqa: F401
+from .commands.periods import PeriodPickerCommands
+from .commands.pie import PieCommands
+from .commands.rates import RatesCommands
+from .commands.rules import RuleCommands
+from .commands.selection import SelectionCommands
+from .commands.stats import StatsCommands
+from .commands.sync import SyncCommands
+from .commands.transfers import TransferCommands
+from .commands.trips import TripCommands
+from .formatting import _fmt_amount, _range_label, _truncate
 from .imports import _Setup
 
-_REPO_ROOT = Path(__file__).resolve().parents[3]
-TO_IMPORT_DIR = _REPO_ROOT / "data" / "to_import"
 
-
-# Every way an import can refuse a file for a reason the user can act on. Gathered into
-# one tuple because the app imports from three places and only one of them used to catch
-# anything -- the other two crashed the whole app with a traceback, which is how a Wise
-# file taking the wrong branch became a stack trace instead of a message.
-IMPORT_PROBLEMS = (
-    formats.AccountRequired,
-    formats.UnknownFormat,
-    formats.AccountCurrencyMismatch,
-)
-
-# The chart panel's own 'b' cycle, kept separate from queries.BUCKETS now that the
-# latter also offers "year" — daily bars are only useful on the chart, over a window
-# short enough to read, so adding "year" there must not change what 'b' cycles through.
-_CHART_BUCKETS = ("day", "week", "month")
-
-# The pie panel's own 'b' cycle: no daily bucket (a year by day is 365 rows), but a
-# yearly one, since a multi-year window benefits from it in a way the chart's shorter
-# windows rarely do.
-_SHARE_BUCKETS = ("week", "month", "year")
-
-
-
-def _set_vendor_then_categorize(session: Session, txn_ids, value: str) -> int:
-    """``sel vendor = <name>``: moving rows to another vendor can bring them under a
-    category rule (or out from under one), so the rules are re-run afterwards."""
-    changed = vendors.set_vendor(session, txn_ids, value)
-    categories.apply_category_rules(session)
-    return changed
-
-class BudgetApp(App):
+class BudgetApp(
+    SelectionCommands,
+    RuleCommands,
+    CategoryCommands,
+    TransferCommands,
+    ImportCommands,
+    FilterCommands,
+    RatesCommands,
+    SyncCommands,
+    TripCommands,
+    PeriodPickerCommands,
+    StatsCommands,
+    ChartCommands,
+    PieCommands,
+    DrillDownCommands,
+    EventCommands,
+    ActionCommands,
+    App,
+):
     CSS = """
     #sidebar { width: 36; }
     #accounts, #vendors, #categories, #tags, #trips {
@@ -313,8 +306,9 @@ class BudgetApp(App):
         # (see reload()'s guard) plus its own per-bucket query (see _build_pie()).
         self._pie: Optional[charts.StackedShareChart] = None
         # The pie panel's own bucket, cycled by 'b' independently of the chart's — see
-        # _SHARE_BUCKETS. Monthly by default; sticky across a new period the same way
-        # the chart's measure is, not re-derived from the window's length.
+        # commands/pie.py's _SHARE_BUCKETS. Monthly by default; sticky across a new
+        # period the same way the chart's measure is, not re-derived from the window's
+        # length.
         self._pie_bucket = "month"
         # The trips panel's own data (dates, cost, bucket breakdown) -- not scoped by
         # the app's other filters, since queries.get_trips takes none: a trip is
@@ -408,21 +402,6 @@ class BudgetApp(App):
             id="command",
         )
         yield Footer()
-
-    @property
-    def _drilled_from_stats(self) -> bool:
-        """True only right after a statistics drill-down — see ``_drill_origin``."""
-        return self._drill_origin == "stats"
-
-    @property
-    def _drilled_from_chart(self) -> bool:
-        """True only right after a chart drill-down — see ``_drill_origin``."""
-        return self._drill_origin == "chart"
-
-    @property
-    def _drilled_from_trips(self) -> bool:
-        """True only right after a trips-panel drill-down — see ``_drill_origin``."""
-        return self._drill_origin == "trips"
 
     def check_action(self, action: str, parameters: tuple) -> Optional[bool]:
         """Gate the priority left/right bindings so they only act where they mean something.
@@ -906,365 +885,6 @@ class BudgetApp(App):
         self._fill_txns(self._txns)
         self._refresh_status()
 
-    def _fill_rules(self) -> None:
-        rules_panel.fill_rules(
-            self.query_one("#rules", DataTable), self._rules, self._category_rules
-        )
-
-    def _fill_imports(self) -> None:
-        imports_panel.fill_imports(
-            self.query_one("#imports", DataTable),
-            self._import_nav,
-            self._import_folders,
-            self._candidates,
-            self._imports,
-        )
-
-    def _build_report(self) -> None:
-        with self.session_factory() as session:
-            self._report = stats.build_report(
-                session,
-                self.window,
-                filters=self._active_filters().replace(date_range=None),
-            )
-
-    def _fill_stats(self) -> None:
-        """Render the report, honouring folded subtrees. See stats_panel.fill_stats()."""
-        table = self.query_one("#stats_table", DataTable)
-        self._stats_rows, self._foldable_ids = stats_panel.fill_stats(
-            table, self._report, self._collapsed
-        )
-
-    def _toggle_fold(self, row: int) -> None:
-        """Space on a stats row: collapse/expand its subtree if it has one.
-
-        A leaf row, the TOTAL row, or an out-of-range row does nothing — not a crash,
-        not a notification, since space is not obviously "for" the stats table the way
-        enter or the arrows are.
-        """
-        if not stats_panel.toggle_fold(row, self._stats_rows, self._foldable_ids, self._collapsed):
-            return
-        self._fill_stats()
-        # The toggled row's own subtree is what grows or shrinks, always right after it,
-        # so its own row index is unchanged by the toggle — the cursor can just stay put.
-        table = self.query_one("#stats_table", DataTable)
-        if 0 <= row < table.row_count:
-            table.move_cursor(row=row)
-
-    def _toggle_fold_all(self) -> None:
-        """``f``: fold every group if any is expanded, else unfold them all.
-
-        "Any expanded" rather than "all collapsed" so the key always visibly does
-        something — a mix of folded and unfolded groups collapses fully on the first
-        press instead of silently unfolding the already-collapsed ones.
-        """
-        if not self._foldable_ids:
-            return
-        table = self.query_one("#stats_table", DataTable)
-        row = table.cursor_row
-        stats_panel.toggle_fold_all(self._foldable_ids, self._collapsed)
-        self._fill_stats()
-        # Collapsing/expanding everything moves rows around far more than a single
-        # toggle does, so there is no single "same row" to return to — just keep the
-        # cursor in range rather than landing on an arbitrary category.
-        if table.row_count:
-            table.move_cursor(row=min(row, table.row_count - 1))
-
-    # ---------------------------------------------------------------- chart
-    def _build_chart(self) -> None:
-        """Fetch the series and scale it, under exactly the filters everything else uses.
-
-        The same filters go to the transfer count as to the series, so the "N transfers
-        excluded" the status line prints is the count actually missing from these bars.
-        """
-        with self.session_factory() as session:
-            series = stats.spending_series(
-                session,
-                self.window,
-                self._bucket,
-                filters=self._active_filters().replace(date_range=None),
-            )
-            totals = queries.get_totals(
-                session,
-                filters=self._active_filters().replace(
-                    date_range=(self.window.start, self.window.end)
-                ),
-            )
-        self._chart = charts.build(series, measure=self._measure, width=CHART_WIDTH)
-        self._chart_transfers = totals.transfer_count
-        self._chart_unconverted = totals.unconverted_count
-
-    def _fill_chart(self) -> None:
-        """Redraw the table, columns included — two headers name the current measure."""
-        table = self.query_one("#chart", DataTable)
-        chart_panel.fill_chart(table, self._chart, self._measure, self._bucket)
-
-    def _chart_status(self) -> str:
-        """One line, under the same 92-column budget as every other panel's status."""
-        return chart_panel.chart_status(
-            self._chart,
-            self.window,
-            self._measure,
-            self._bucket,
-            self._chart_transfers,
-            self.category_filter,
-            self._categories,
-            self.account_filter,
-            self.vendor_filter,
-            self.text_filter,
-            self._chart_unconverted,
-        )
-
-    # ------------------------------------------------------------------- pie
-    def _build_pie(self) -> None:
-        """Fetch this window's per-bucket category series and turn it, with the
-        already-built report, into the stacked share chart. See pie_panel.build_stacked().
-        """
-        if self.window is None:
-            self._pie = None
-            return
-        with self.session_factory() as session:
-            buckets = stats.category_share_series(
-                session,
-                self.window,
-                self._pie_bucket,
-                filters=self._active_filters().replace(date_range=None),
-            )
-        self._pie = pie_panel.build_stacked(self._report, buckets)
-
-    def _fill_pie(self) -> None:
-        """Render the top bar, the per-bucket bars, and their shared legend."""
-        pie_panel.fill_pie(self.query_one("#pie", Static), self._pie, self.window)
-
-    def _pie_status(self) -> str:
-        """One line, the same shape as _stats_status()/_chart_status()."""
-        return pie_panel.pie_status(self._report, self._pie, self._pie_bucket)
-
-    # ----------------------------------------------------------------- trips
-    def _build_trips(self) -> None:
-        """Fetch every trip's dates, cost, and bucket breakdown -- no window, no
-        filters: queries.get_trips takes none (a trip is already its own scope)."""
-        with self.session_factory() as session:
-            self._trip_data = queries.get_trips(session)
-
-    def _fill_trips(self) -> None:
-        """Redraw the table (columns included -- the Breakdown column's width is
-        adaptive, see trips_panel.bar_width) and the shared legend beneath it."""
-        table = self.query_one("#trip_table", DataTable)
-        width = trips_panel.bar_width(self.query_one("#main").size.width)
-        self._trip_rows, self._trips_foldable_ids = trips_panel.fill_trips(
-            table, self._trip_data, self._trips_expanded, width
-        )
-        self.query_one("#trips_legend", Static).update(trips_panel.legend())
-
-    def _toggle_trip_fold(self, row: int) -> None:
-        """Space on a trip row: unfold/fold its trips.BUCKETS rows. See check_action()."""
-        if not trips_panel.toggle_fold(
-            row, self._trip_rows, self._trips_foldable_ids, self._trips_expanded
-        ):
-            return
-        self._fill_trips()
-        table = self.query_one("#trip_table", DataTable)
-        if 0 <= row < table.row_count:
-            table.move_cursor(row=row)
-
-    def _toggle_trip_fold_all(self) -> None:
-        """``f`` on the trips table: unfold/fold every trip. See check_action()."""
-        if not self._trips_foldable_ids:
-            return
-        table = self.query_one("#trip_table", DataTable)
-        row = table.cursor_row
-        trips_panel.toggle_fold_all(self._trips_foldable_ids, self._trips_expanded)
-        self._fill_trips()
-        if table.row_count:
-            table.move_cursor(row=min(row, table.row_count - 1))
-
-    def _show_trips(self) -> None:
-        """``trips``: seed the bucket map if it is still empty, then open the panel.
-
-        Seeding is idempotent (trips.seed_default_buckets checks the table itself, not
-        the individual names) so calling it on every open costs one cheap query once
-        the user has actually edited the map, and makes the map useful the very first
-        time without a separate setup step.
-        """
-        with self.session_factory() as session:
-            trips.seed_default_buckets(session)
-            session.commit()
-        self._build_trips()
-        self._fill_trips()
-        # Opening the panel starts with nothing highlighted, however the table was left
-        # last time -- see trips_panel.TripTable.
-        self.query_one("#trip_table", trips_panel.TripTable).hide_cursor()
-        self._set_panel("trips")
-
-    TRIP_USAGE = (
-        "Usage: trip bucket <category>[, <category>...] = <bucket>   "
-        "(blank bucket unmaps it) | trip buckets | "
-        "trip dates <trip> = <start>..<end>   (leave either side of the '..' empty to "
-        "set just the other; blank derives both again)"
-    )
-
-    def _do_trip(self, arg: str) -> None:
-        """``trip bucket ... = ...`` sets the map; ``trip buckets`` shows it;
-        ``trip dates ... = ...`` overrides a trip's dates."""
-        arg = arg.strip()
-        head, _, rest = arg.partition(" ")
-        if head.lower() == "buckets":
-            self._notify_trip_buckets()
-            return
-        if head.lower() == "bucket":
-            self._do_trip_bucket(rest.strip())
-            return
-        if head.lower() == "dates":
-            self._do_trip_dates(rest.strip())
-            return
-        self.notify(self.TRIP_USAGE, severity="warning")
-
-    def _do_trip_dates(self, arg: str) -> None:
-        """``trip dates <trip> = <start>..<end>``, overriding the derived dates.
-
-        A trip takes its dates from its transactions, which is wrong in the two cases
-        that matter: a flight booked months ahead drags the start back to the booking,
-        and a trip whose last purchase was days before flying home ends early. Neither
-        can be fixed by editing a transaction. A blank right-hand side goes back to
-        deriving them, the way every other ``=`` command in this app undoes.
-        """
-        if "=" not in arg:
-            self.notify(self.TRIP_USAGE, severity="warning")
-            return
-        name, value = (part.strip() for part in arg.split("=", 1))
-        if not name:
-            self.notify(self.TRIP_USAGE, severity="warning")
-            return
-        if value:
-            start_text, separator, end_text = value.partition("..")
-            if not separator:
-                self.notify(self.TRIP_USAGE, severity="warning")
-                return
-            # An empty side of the ".." leaves that end alone rather than clearing it,
-            # so "= 2026-05-14.." fixes a start without the user having to restate an
-            # end that was already right. Clearing both is the bare "trip dates X ="
-            # below, matching how every other blank right-hand side in this app undoes.
-            try:
-                start = (
-                    date.fromisoformat(start_text.strip())
-                    if start_text.strip()
-                    else tags_module.KEEP
-                )
-                end = (
-                    date.fromisoformat(end_text.strip())
-                    if end_text.strip()
-                    else tags_module.KEEP
-                )
-            except ValueError:
-                self.notify("Dates must be YYYY-MM-DD.", severity="error")
-                return
-            if start is tags_module.KEEP and end is tags_module.KEEP:
-                self.notify(self.TRIP_USAGE, severity="warning")
-                return
-        else:
-            start = end = None
-
-        with self.session_factory() as session:
-            try:
-                found = tags_module.set_trip_dates(session, name, start, end)
-            except ValueError as error:
-                self.notify(str(error), severity="error", markup=False)
-                return
-            if not found:
-                self.notify(f"No trip named {name!r}.", severity="error", markup=False)
-                return
-            session.commit()
-        if self._panel == "trips":
-            self._build_trips()
-            self._fill_trips()
-        self.reload()
-        if start is None and end is None:
-            message = f"{name}: dates back to whatever its transactions say."
-        elif end is tags_module.KEEP:
-            message = f"{name}: starts {start}."
-        elif start is tags_module.KEEP:
-            message = f"{name}: ends {end}."
-        else:
-            message = f"{name}: {start} .. {end}."
-        # Setting one end is checked against the other's *override*, which is the right
-        # place to refuse outright. But the end the user actually sees may still be the
-        # derived one, and a manual start after a derived end reads as a trip that ended
-        # before it began. Refusing that would make correcting both ends impossible one
-        # at a time -- the reason for setting them separately at all -- so say so and
-        # let them finish.
-        if self._trip_dates_are_inverted(name):
-            message += " Its start is now after its end; set the other end too."
-            self.notify(message, severity="warning", markup=False)
-            return
-        self.notify(message, markup=False)
-
-    def _trip_dates_are_inverted(self, name: str) -> bool:
-        """Whether ``name`` now *shows* a start after its end, override or derived."""
-        with self.session_factory() as session:
-            for row in queries.get_trips(session):
-                if row.name == name:
-                    return (
-                        row.start is not None
-                        and row.end is not None
-                        and row.start > row.end
-                    )
-        return False
-
-    def _do_trip_bucket(self, arg: str) -> None:
-        """``trip bucket <categories> = <bucket>`` -- category (or comma-separated
-        list) on the left, bucket on the right, matching every other ``=`` command in
-        this app. A blank right-hand side unmaps, the way ``categorize <vendor> =``
-        already does.
-        """
-        if "=" not in arg:
-            self.notify(self.TRIP_USAGE, severity="warning")
-            return
-        left, value = (part.strip() for part in arg.split("=", 1))
-        category_names = [name.strip() for name in left.split(",") if name.strip()]
-        if not category_names:
-            self.notify(self.TRIP_USAGE, severity="warning")
-            return
-        with self.session_factory() as session:
-            try:
-                if value:
-                    changed = trips.set_bucket(session, category_names, value)
-                    message = (
-                        f"{', '.join(category_names)} → {value} "
-                        f"({changed} categor{'y' if changed == 1 else 'ies'})"
-                    )
-                else:
-                    changed = trips.clear_bucket(session, category_names)
-                    message = (
-                        f"{', '.join(category_names)}: unmapped "
-                        f"({changed} categor{'y' if changed == 1 else 'ies'})"
-                    )
-            except ValueError as error:
-                self.notify(str(error), severity="error", markup=False)
-                return
-            session.commit()
-        if self._panel == "trips":
-            self._build_trips()
-            self._fill_trips()
-            self._refresh_status()
-        self.notify(message, markup=False)
-
-    def _notify_trip_buckets(self) -> None:
-        with self.session_factory() as session:
-            mapping = trips.list_buckets(session)
-        lines = [
-            f"{bucket}: {', '.join(mapping[bucket]) if mapping[bucket] else '(none)'}"
-            for bucket in trips.BUCKETS
-        ]
-        self.notify("\n".join(lines), title="Trip buckets", markup=False, timeout=8)
-
-    def _fill_periods(self) -> None:
-        periods_panel.fill_periods(self.query_one("#periods", DataTable))
-
-    def _stats_status(self) -> str:
-        """One line under the status budget. See stats_panel.stats_status()."""
-        return stats_panel.stats_status(self._report)
-
     def _refresh_status(self) -> None:
         status = self.query_one("#status", Static)
         if self._panel == "stats" and self._report is not None:
@@ -1377,778 +997,6 @@ class BudgetApp(App):
             f"in {_fmt_amount(totals.inflow_minor)}{selected_label}"
         )
 
-    # ---------------------------------------------------------------- events
-    def on_list_view_selected(self, event: ListView.Selected) -> None:
-        index = event.list_view.index or 0
-        list_id = event.list_view.id
-        if list_id == "vendors" and index > self._vendor_shown_count():
-            # The trailing "N more" row: not a vendor, just a count. See
-            # VENDOR_SIDEBAR_CAP -- clicking it should not silently filter by whatever
-            # real vendor happens to sit at that row index.
-            self.notify(
-                "That row is just a count, not a vendor. "
-                "Use 'filter vendor:<text>' to find one further down the list.",
-                severity="warning",
-            )
-            return
-        # A sidebar filter is a new view; the flag it might invalidate is checked in
-        # _set_drilled_from() (no-op if it was already clear).
-        self._set_drilled_from(None)
-        if list_id == "accounts":
-            self.account_filter = None if index == 0 else self._accounts[index - 1].id
-        elif list_id == "vendors":
-            if index == 0:
-                self.vendor_filter = None
-            else:
-                vendor = self._vendors[index - 1]
-                self.vendor_filter = (vendor.kind, vendor.id)
-        elif list_id == "categories":
-            self.category_filter = None if index == 0 else self._categories[index - 1].id
-        elif list_id == "tags":
-            self.tag_filter = None if index == 0 else self._tags[index - 1].id
-        elif list_id == "trips":
-            self.trip_filter = None if index == 0 else self._trips[index - 1].id
-        self.reload()
-
-    def on_txn_table_select_clicked(
-        self, event: transactions.TxnTable.SelectClicked
-    ) -> None:
-        """A click straight on the Sel column toggles that row, first click included."""
-        self._toggle_txn_selected(event.row)
-
-    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        """Enter on a row in the imports panel imports that file."""
-        if event.data_table.id == "stats_table":
-            self._drill_into_category(event.cursor_row)
-            return
-        if event.data_table.id == "chart":
-            self._drill_into_bar(event.cursor_row)
-            return
-        if event.data_table.id == "trip_table":
-            self._drill_into_trip_row(event.cursor_row)
-            return
-        if event.data_table.id == "setup":
-            if self._setup is not None and self._setup.question is not None:
-                choices = self._setup.question.choices
-                if 0 <= event.cursor_row < len(choices):
-                    self._answer_setup(str(choices[event.cursor_row]))
-            return
-        if event.data_table.id == "periods":
-            row = event.cursor_row
-            if row == len(stats.PRESETS):  # the Custom… row, always last
-                self._ask_range()
-            elif 0 <= row < len(stats.PRESETS):
-                self._open_period(stats.resolve(stats.PRESETS[row][0]))
-            return
-        if event.data_table.id == "txns":
-            # Enter, and a click on a row the cursor is already on, both fire this;
-            # either toggles the row, same as 'x'. A first click on the Sel column of
-            # some other row is handled by TxnTable.SelectClicked instead, because
-            # DataTable does not post this message for one. See _toggle_txn_selected().
-            self._toggle_txn_selected(event.cursor_row)
-            return
-        if event.data_table.id != "imports":
-            return
-        row = event.cursor_row
-        # The navigation rows come first, so a candidate's index is offset by them.
-        if 0 <= row < len(self._import_nav):
-            self._open_import_dir(self._import_nav[row])
-            return
-        row -= len(self._import_nav)
-        if not 0 <= row < len(self._candidates):
-            return
-        self._import_candidate(self._candidates[row])
-
-    def _import_candidate(self, candidate: ImportCandidate) -> None:
-        """Import the file, first walking through whatever it still needs.
-
-        A file with a built-in reader (e.g. a Wise transfer log) is recognized from its
-        own columns rather than a saved layout, so ``candidate.format_name`` is a label,
-        not a row in the csv_format table — there is nothing for the setup walkthrough
-        to look up or ask about. Import it directly instead; import_csv already routes
-        on the file's signature regardless of any format argument.
-        """
-        if candidate.format_name == importer.WISE_FORMAT_NAME:
-            with self.session_factory() as session:
-                try:
-                    result = import_csv(session, candidate.path)
-                except IMPORT_PROBLEMS as error:
-                    self.notify(str(error), severity="error", markup=False)
-                    return
-            self.reload()
-            self._show_imports()
-            self.notify(
-                f"{candidate.path.name}: {result.inserted} added, "
-                f"{result.skipped_duplicates} skipped."
-            )
-            self._fetch_rates_after_import([result.import_id])
-            return
-        setup = _Setup(path=candidate.path)
-        if candidate.format_name is None:
-            # An unseen layout: infer what we can, then ask about the rest.
-            fieldnames, rows = read_header_and_rows(candidate.path)
-            setup.fieldnames, setup.rows = fieldnames, rows
-            default = re.sub(r"[^a-z0-9]+", "_", candidate.path.stem.lower()).strip("_")
-            setup.values = formats.infer(default or "layout", fieldnames, rows).values
-        else:
-            with self.session_factory() as session:
-                setup.spec = formats.get_format(session, candidate.format_name)
-        self._setup = setup
-        self._advance_setup()
-
-    def _advance_setup(self) -> None:
-        """Ask the next question, or finish: save the layout and import."""
-        setup = self._setup
-        if setup is None:
-            return
-
-        question = imports_panel.next_setup_question(setup)
-        if question is None and setup.spec is None:
-            try:
-                spec = formats.spec_from_values(setup.values)
-            except formats.InvalidFormat as error:
-                self.notify(str(error), severity="error", markup=False)
-                self._cancel_setup()
-                return
-            with self.session_factory() as session:
-                formats.save_format(session, spec)
-                session.commit()
-            setup.spec = spec
-            self.notify(f"Learned layout {spec.name!r}.")
-            question = imports_panel.next_setup_question(setup)
-
-        if question is not None:
-            setup.question = question
-            self._show_setup_question()
-            return
-
-        self._finish_setup()
-
-    def _finish_setup(self) -> None:
-        setup = self._setup
-        self._setup = None
-        with self.session_factory() as session:
-            try:
-                result = import_csv(session, setup.path, account_name=setup.account_name)
-            except IMPORT_PROBLEMS as error:
-                # The walkthrough is already finished and its format saved, so there is
-                # nothing to go back to -- report and return to the file list rather
-                # than dying on a problem the user can act on.
-                self.notify(str(error), severity="error", markup=False)
-                self._show_imports()
-                return
-        self.reload()
-        self._show_imports()
-        self.notify(
-            f"{setup.path.name}: {result.inserted} added, "
-            f"{result.skipped_duplicates} skipped."
-        )
-        self._fetch_rates_after_import([result.import_id])
-
-    def _cancel_setup(self) -> None:
-        self._setup = None
-        self._show_imports()
-
-    def _show_setup_question(self) -> None:
-        table = self.query_one("#setup", DataTable)
-        question = self._setup.question
-        imports_panel.fill_setup_choices(table, question)
-        self._prompt_panel = "setup"
-        self._set_panel("setup")
-        self.query_one("#prompt", Static).update(imports_panel.setup_prompt_text(question))
-        # An empty choices table is just noise, so only show it when there is a list.
-        table.display = bool(question.choices)
-        if not question.choices:
-            self.query_one("#command", Input).focus()
-
-    # ----------------------------------------------------------- statistics
-    def _do_stats(self, arg: str) -> None:
-        """Bare ``stats`` opens the period picker; ``stats <spec>`` skips it."""
-        if not arg:
-            self._show_periods()
-            return
-        window = self._parse_window(arg)
-        if window is not None:
-            self._show_stats(window)
-
-    def _parse_window(self, text: str) -> Optional[stats.Window]:
-        try:
-            return stats.parse(text)
-        except ValueError as error:
-            # The message names every accepted spelling, and may quote the user's text.
-            self.notify(str(error), severity="error", markup=False)
-            return None
-
-    def _do_chart(self, arg: str) -> None:
-        """``chart`` opens the period picker; ``chart <period> [bucket] [measure]`` skips it.
-
-        Trailing ``day``/``week``/``month`` and ``net``/``spending``/``income`` words set
-        the bucket and the measure, in either order, so ``chart 1y month spending`` and
-        ``chart 1 year`` both read the way they look. Either word on its own re-draws the
-        chart already on screen — the same thing ``b`` and ``m`` do, for anyone who would
-        rather type it than remember a key.
-        """
-        arg = arg.strip()
-        if not arg:
-            self._show_periods("chart")
-            return
-
-        parts = arg.split()
-        bucket = measure = None
-        while parts:
-            tail = parts[-1].lower()
-            if bucket is None and tail in _CHART_BUCKETS:
-                bucket = tail
-            elif measure is None and tail in charts.MEASURE_ALIASES:
-                measure = charts.MEASURE_ALIASES[tail]
-            else:
-                break
-            parts = parts[:-1]
-        text = " ".join(parts)
-
-        if not text:
-            if self.window is None:
-                self.notify(
-                    "No period yet: try 'chart 3m "
-                    f"{bucket or measure}', or bare 'chart' to pick one.",
-                    severity="warning",
-                )
-                return
-            self._show_chart(self.window, bucket, measure)
-            return
-
-        window = self._parse_window(text)
-        if window is not None:
-            self._show_chart(window, bucket, measure)
-
-    def _show_periods(self, target: str = "stats") -> None:
-        self._picker_target = target
-        self._fill_periods()
-        self._range_pending = False
-        self._prompt_panel = None
-        self._set_panel("periods")
-
-    def _do_pie(self, arg: str) -> None:
-        """``pie`` opens the period picker; ``pie <period>`` skips it."""
-        if not arg:
-            self._show_periods("pie")
-            return
-        window = self._parse_window(arg)
-        if window is not None:
-            self._show_pie(window)
-
-    def _open_period(self, window: stats.Window) -> None:
-        """Send a period the picker just produced to whichever panel asked for it."""
-        if self._picker_target == "chart":
-            self._show_chart(window)
-        elif self._picker_target == "pie":
-            self._show_pie(window)
-        else:
-            self._show_stats(window)
-
-    def _show_stats(self, window: stats.Window) -> None:
-        self.window = window
-        self._range_pending = False
-        self._prompt_panel = None
-        self._build_report()
-        self._fill_stats()
-        self._set_panel("stats")
-
-    def _show_chart(
-        self,
-        window: stats.Window,
-        bucket: Optional[str] = None,
-        measure: Optional[str] = None,
-    ) -> None:
-        """Open the chart for ``window``, bucketed explicitly or by the window's length.
-
-        A bucket the user asked for is remembered across re-scopes, but a *new* window
-        re-derives its own: daily bars chosen for one month are unreadable stretched over
-        two years, and silently keeping them would be worse than overriding a choice the
-        user made about a range they have now left. The measure is not like that — it is
-        a question about the money, not about the range — so it simply sticks.
-        """
-        rebucket = bucket is not None or self._bucket is None or window != self.window
-        self.window = window
-        if rebucket:
-            self._bucket = bucket or charts.choose_bucket(window)
-        if measure is not None:
-            self._measure = measure
-        self._range_pending = False
-        self._prompt_panel = None
-        self._build_chart()
-        self._fill_chart()
-        self._set_panel("chart")
-
-    def _show_pie(self, window: stats.Window) -> None:
-        self.window = window
-        self._range_pending = False
-        self._prompt_panel = None
-        self._build_report()
-        self._build_pie()
-        self._fill_pie()
-        self._set_panel("pie")
-
-    def _ask_range(self) -> None:
-        """Ask for an explicit range, answered in the command bar below the picker."""
-        self._range_pending = True
-        self._prompt_panel = "periods"
-        prompt = self.query_one("#prompt", Static)
-        prompt.update(
-            Text.assemble(
-                ("Date range for the statistics\n", "bold"),
-                (
-                    f"Type it in the command bar below, as {periods_panel.RANGE_EXAMPLE}.  "
-                    "Escape returns to the list.",
-                    "dim",
-                ),
-            )
-        )
-        prompt.display = True
-        self.query_one("#command", Input).focus()
-
-    def _answer_range(self, text: str) -> None:
-        window = self._parse_window(text)
-        if window is None:
-            return  # a bad range leaves the prompt up, over the picker
-        self._open_period(window)
-
-    def _cancel_range(self) -> None:
-        # _show_periods() drops the pending question and hides the prompt with it.
-        self._show_periods()
-
-    def _answer_setup(self, text: str) -> None:
-        """Apply one answer, then move on to whatever is next."""
-        setup = self._setup
-        question = setup.question
-        answer = text.strip()
-        if not answer and question.default:
-            answer = question.default
-        if question.choices and answer.isdigit():
-            index = int(answer)
-            if 1 <= index <= len(question.choices):
-                answer = str(question.choices[index - 1])
-        if not answer and not question.allow_empty:
-            self.notify("An answer is needed; escape cancels.", severity="warning")
-            return
-
-        setup.asked.add(question.field)
-        if question.field == "name":
-            setup.values["name"] = answer
-        elif question.field == "account_prefix":
-            setup.values["account_prefix"] = (
-                answer if not answer or answer.endswith(" ") else answer + " "
-            )
-        elif question.field == "__account":
-            setup.account_name = answer
-        else:
-            setup.values = formats.apply_answers(
-                setup.values, {question.field: answer}, setup.fieldnames, setup.rows
-            )
-        setup.question = None
-        self._advance_setup()
-
-    def on_input_submitted(self, event: Input.Submitted) -> None:
-        text = event.value
-        event.input.value = ""
-        if self._setup is not None and self._setup.question is not None:
-            self._answer_setup(text)
-            return
-        if self._range_pending:
-            self._answer_range(text)
-            return
-        if self._pending_unimport is not None:
-            self._answer_unimport(text)
-            return
-        if self._pending_category is not None:
-            self._answer_category(text)
-            return
-        if self._pending_category_merge is not None:
-            self._answer_category_merge(text)
-            return
-        self._run_command(text.strip())
-
-    def _run_command(self, command: str) -> None:
-        if not command:
-            return
-        parts = command.split(maxsplit=1)
-        name = parts[0].lower()
-        arg = parts[1].strip() if len(parts) > 1 else ""
-
-        if name in {"quit", "q", "exit"}:
-            self.exit()
-        elif name == "refresh":
-            self.reload()
-            self.notify("Refreshed.")
-        elif name in {"all", "clear"}:
-            self.action_clear_filters()
-        elif name == "section":
-            self._do_section(arg)
-        elif name == "import":
-            self._do_import(arg)
-        elif name == "unimport":
-            self._do_unimport(arg)
-        elif name == "format":
-            self._do_format(arg)
-        elif name == "rename":
-            self._do_rename(arg)
-        elif name == "rule":
-            self._do_rule(arg)
-        elif name == "rules":
-            self._show_rules()
-        elif name in {"categorize", "categorise", "cat"}:
-            self._do_categorize(arg)
-        elif name == "category":
-            self._do_category(arg)
-        elif name == "sel":
-            self._do_sel(arg)
-        elif name == "transfers":
-            self._do_transfers(arg)
-        elif name == "merge":
-            self._do_merge(arg)
-        elif name == "filter":
-            self._do_filter(arg)
-        elif name == "stats":
-            self._do_stats(arg)
-        elif name in {"chart", "graph"}:
-            self._do_chart(arg)
-        elif name == "pie":
-            self._do_pie(arg)
-        elif name == "trips":
-            # Bare "trips" opens the panel; there is no windowed variant like
-            # stats/chart/pie -- a trip is already its own scope. Not "trip" (singular):
-            # that name is reserved for the bucket-map commands below, and "sel trip ="
-            # already exists for putting the selection on one.
-            self._show_trips()
-        elif name == "trip":
-            self._do_trip(arg)
-        elif name == "rates":
-            self._do_rates(arg)
-        elif name == "sync":
-            self._do_sync(arg)
-        elif name == "sort":
-            self._do_sort(arg)
-        elif name == "help":
-            self.notify(
-                "import — browse data/to_import; enter imports the selected file,\n"
-                "  and lists past imports (with their id) below the candidates\n"
-                "import all | import <path> — import without browsing\n"
-                "unimport <id> — delete a past import and its transactions;\n"
-                "  asks for confirmation, naming what it will destroy\n"
-                "format — list learned CSV layouts and their amount polarity\n"
-                "format <name> invert on|off — flip whether a positive amount means\n"
-                "  money out for that layout (future imports only; fix a bad import\n"
-                "  with unimport, then re-import)\n"
-                "rename <raw vendor> = <display name> — override / aggregate a vendor\n"
-                "rule <pattern> = <display name> — rename every matching vendor,\n"
-                "  now and on future imports (e.g. rule Kindle Svcs* = Kindle)\n"
-                "rules — list the rules you have defined (escape returns)\n"
-                "categorize <vendor> = <category> — categorize that vendor's\n"
-                "  transactions by hand (cat is short for categorize)\n"
-                "categorize <vendor> = — undo a manual category\n"
-                "rule categorize <pattern> = <category> — categorize every matching\n"
-                "  vendor, now and on future imports (e.g. rule categorize *COFFEE* =\n"
-                "  Dining)\n"
-                "categorize rules — list the rules you have defined (escape returns)\n"
-                "category Food > Dining > Restaurants — build/move a category into\n"
-                "  that spot, creating any missing levels\n"
-                "category Dining — move an existing category to the top level\n"
-                "  category names are unique across the whole tree, so if that would\n"
-                "  move an existing category rather than create one, you are asked to\n"
-                "  confirm what would move; a genuinely separate category needs its\n"
-                "  own distinct name, e.g. 'Dining (Travel)'\n"
-                "category | category list — show the category tree, indented\n"
-                "category merge <source> = <target> — fold one category into another:\n"
-                "  repoints its transactions, rules, and children, then deletes it\n"
-                "  (asks for confirmation, naming what will move)\n"
-                "section <name> — expand that sidebar section (accounts, vendors,\n"
-                "  categories, tags, trips), collapsing the rest; any unambiguous\n"
-                "  prefix works, e.g. section cat. Click a heading to do the same\n"
-                "x, or clicking a row — select/deselect a transaction for bulk edits\n"
-                "sel all — select every transaction currently listed\n"
-                "sel none — clear the selection\n"
-                "sel category = <name> — categorize everything selected (blank undoes)\n"
-                "sel vendor = <name> — point everything selected at that vendor\n"
-                "sel tag = <name> / sel untag = <name> — add or remove a tag\n"
-                "sel trip = <name> — put everything selected on a trip, replacing any\n"
-                "  other trip; sel untrip takes them off it\n"
-                "sel transfer — mark the 2 selected rows (one out, one in) as a\n"
-                "  transfer; any fee is split off and still counts as spending.\n"
-                "  sel untransfer undoes it\n"
-                "sel exclude — leave the selected rows out of every income and\n"
-                "  spending figure (greyed out, tagged #excluded), e.g. an ACATS move;\n"
-                "  sel include counts them again\n"
-                "  the selection survives an edit, so you can set a category and then\n"
-                "  a tag on the same rows without reselecting\n"
-                "  ctrl+n / ctrl+t prefill 'sel vendor = ' / 'sel category = ' once\n"
-                "  anything is selected, in place of their usual per-vendor behavior\n"
-                "transfers — pair up movements between your own accounts\n"
-                "transfers same-account — also pair legs within the same account;\n"
-                "  off by default, since it makes an accidental false pairing more\n"
-                "  likely (for providers whose sub-accounts you track as one account)\n"
-                "transfers reset — un-pair everything transfers detected\n"
-                "merge <account> = <account> — fold one account into another\n"
-                "filter <text> — search description, vendor, and raw name\n"
-                "filter vendor:<text> — search one field (description/vendor/raw)\n"
-                "filter — clear the text filter\n"
-                "sort size — this view, largest amounts first (in or out); changing\n"
-                "  a filter or leaving the transactions returns to date order\n"
-                "sort date — back to newest first\n"
-                "stats — pick a period, then see spending per category\n"
-                "stats <period> — skip the picker (e.g. stats 6m, stats 1 year,\n"
-                f"  stats {periods_panel.RANGE_EXAMPLE})\n"
-                "  enter, or the right arrow, on a category row lists that window's\n"
-                "  transactions; the left arrow goes back to the breakdown\n"
-                "  space, on a category row with children, folds/unfolds its subtree\n"
-                "  f folds/unfolds every group at once\n"
-                "chart — pick a period, then see money per day/week/month as bars\n"
-                "chart <period> [day|week|month] [net|spending|income] — skip the\n"
-                "  picker, set the bar width and what the bars measure (e.g.\n"
-                "  chart 1y month spending); the bucket defaults to the period's\n"
-                "  length. b cycles the bucket, m the measure. graph = chart\n"
-                "  net draws either side of a centre line: money out to the left,\n"
-                "  money in to the right, so an even month sits on the line\n"
-                "  click a category in the sidebar to chart just that category\n"
-                "  enter, or the right arrow, on a bar lists that bucket's\n"
-                "  transactions; the left arrow goes back to the chart\n"
-                "pie — pick a period, then see each category's share of spending as\n"
-                "  one bar for the whole window, plus one bar per bucket beneath it\n"
-                "  showing the same breakdown over time, all in the same colors\n"
-                "pie <period> — skip the picker (e.g. pie 6m, pie 1 year)\n"
-                "  b cycles the bucket: week, month (default), year — no daily\n"
-                "  only categories with real net spend get a segment — a category\n"
-                "  that is all refund, or a window with no spending, draws none;\n"
-                "  small categories fold into Other\n"
-                "trips — see each trip's dates, cost, and a travel-bucket breakdown\n"
-                "  as a color bar (trip buckets lists the buckets themselves)\n"
-                "  space folds/unfolds a trip into its buckets; f folds/unfolds every\n"
-                "  trip at once\n"
-                "  enter, or the right arrow, on a trip row lists that trip's\n"
-                "  transactions; on an unfolded bucket row, just that bucket's; the\n"
-                "  left arrow goes back to the trips panel\n"
-                "trip bucket <categories> = <bucket> — map category spending into a\n"
-                "  travel bucket; comma-separate several categories at once, e.g.\n"
-                "  trip bucket Car Rental, Taxi = car — a blank bucket unmaps it\n"
-                "trip buckets — show the bucket map, grouped by bucket\n"
-                "trip dates <trip> = <start>..<end> — set a trip's dates by hand, when\n"
-                "  the ones taken from its transactions are wrong (a flight booked\n"
-                "  months ahead drags the start back). Leave either side of the '..'\n"
-                "  empty to set just the other; a blank right-hand side derives both\n"
-                "  again. Derived dates show dimmed with a '*'\n"
-                "rates — list cached exchange rates (pair, source, span, count)\n"
-                "rates fetch — cache ECB reference rates for every foreign currency\n"
-                "  on file, over its whole date range; runs in the background so the\n"
-                "  app stays responsive (an import does this on its own already)\n"
-                "sync — pull new transactions from every sync connection (SimpleFIN, Synci),\n"
-                "  in the background; connect one first with 'budget sync connect' in\n"
-                "  a terminal (it asks for a one-time token on a hidden prompt, so\n"
-                "  that step stays CLI-only)\n"
-                "sync preview — show what a sync would do without writing anything\n"
-                "  (sync dry is a synonym)\n"
-                "all — clear filters   refresh — reload   quit — exit\n"
-                "Click a row in an open sidebar section — account, vendor, category,\n"
-                "  tag, or trip — to filter by it.\n"
-                "ctrl+n / ctrl+t — prefill rename / categorize for the selected\n"
-                "  transaction's vendor, or for the selected vendor in the sidebar.",
-                title="Commands",
-                timeout=8,
-            )
-        else:
-            self.notify(f"Unknown command: {name}", severity="warning")
-
-    def _do_import(self, arg: str) -> None:
-        if not arg:
-            # Bare "import" browses the inbox; enter on a row imports that file.
-            self._show_imports()
-            return
-        if arg == "all":
-            # The directory being browsed, not the whole tree: "all" should import what
-            # the panel is showing, not quietly reach into folders you have not opened.
-            paths = list(list_inbox(self._import_dir, TO_IMPORT_DIR).files)
-            if not paths:
-                self.notify(
-                    f"No CSVs in {self._import_label()}", severity="warning"
-                )
-                return
-        else:
-            path = Path(arg).expanduser()
-            if not path.is_file():
-                self.notify(f"File not found: {path}", severity="error")
-                return
-            paths = [path]
-
-        added = skipped = 0
-        imported = 0
-        import_ids: List[int] = []
-        problems: List[str] = []
-        with self.session_factory() as session:
-            for path in paths:
-                try:
-                    result = import_csv(session, path)
-                except IMPORT_PROBLEMS as error:
-                    problems.append(f"{path.name}: {error}")
-                    continue
-                imported += 1
-                added += result.inserted
-                skipped += result.skipped_duplicates
-                import_ids.append(result.import_id)
-        self.reload()
-        self.notify(
-            f"Imported {imported} file(s): {added} added, {skipped} skipped."
-        )
-        if import_ids:
-            self._fetch_rates_after_import(import_ids)
-        if problems:
-            # An unknown layout needs the interactive setup, and an account-less file
-            # needs --account; neither is something the app can decide for you.
-            self.notify(
-                "\n".join(problems) + "\n\nRun 'budget import <file>' to sort these out.",
-                title=f"{len(problems)} file(s) not imported",
-                severity="warning",
-                timeout=12,
-                markup=False,
-            )
-
-    def _do_unimport(self, arg: str) -> None:
-        """``unimport <id>`` — destructive, so it only asks; ``_answer_unimport`` acts.
-
-        The confirmation names the file, the transaction count, and any transfer
-        pairings it would break — read up front through
-        :func:`queries.preview_import_delete`, never guessed and never found out by
-        deleting first.
-        """
-        arg = arg.strip()
-        if not arg.isdigit():
-            self.notify(
-                "Usage: unimport <id>  (see the id column in 'import')",
-                severity="warning",
-            )
-            return
-        import_id = int(arg)
-        with self.session_factory() as session:
-            preview = queries.preview_import_delete(session, import_id)
-        if preview is None:
-            self.notify(f"No import with id {import_id}.", severity="error")
-            return
-
-        self._pending_unimport = preview
-        self._prompt_panel = self._panel
-        transfers_note = (
-            f", breaking {preview.transfers_broken} transfer pairing(s)"
-            if preview.transfers_broken
-            else ""
-        )
-        prompt = self.query_one("#prompt", Static)
-        # Text(), not markup: the source file name is user data and may hold brackets.
-        prompt.update(
-            Text.assemble(
-                (
-                    f"Delete import #{import_id} ({preview.source_file}): "
-                    f"{preview.transaction_count} transaction(s){transfers_note}?\n",
-                    "bold",
-                ),
-                ("Type yes to confirm; anything else, or escape, cancels.", "dim"),
-            )
-        )
-        prompt.display = True
-        self.query_one("#command", Input).focus()
-
-    def _answer_unimport(self, text: str) -> None:
-        pending = self._pending_unimport
-        self._cancel_unimport()
-        if text.strip().lower() != "yes":
-            self.notify("Unimport cancelled.")
-            return
-        with self.session_factory() as session:
-            try:
-                result = delete_import(session, pending.import_id)
-            except UnknownImport as error:
-                self.notify(str(error), severity="error", markup=False)
-                return
-            session.commit()
-        self.reload()
-        if self._panel == "imports":
-            self._show_imports()
-        message = (
-            f"Deleted import #{result.import_id} ({pending.source_file}): "
-            f"{result.transactions_deleted} transaction(s) removed"
-        )
-        if result.transfers_broken:
-            message += f", {result.transfers_broken} transfer pairing(s) broken"
-        self.notify(message + ".", markup=False)
-
-    def _cancel_unimport(self) -> None:
-        self._pending_unimport = None
-        self._prompt_panel = None
-        self.query_one("#prompt", Static).display = False
-
-    def _do_rename(self, arg: str) -> None:
-        if "=" not in arg:
-            self.notify(
-                "Usage: rename <raw vendor> = <display name>", severity="warning"
-            )
-            return
-        raw, display = (part.strip() for part in arg.split("=", 1))
-        if not raw or not display:
-            self.notify(
-                "Usage: rename <raw vendor> = <display name>", severity="warning"
-            )
-            return
-        with self.session_factory() as session:
-            ok = vendors.set_override(session, raw, display)
-            if ok:
-                # A category rule may be written against the new display name.
-                categories.apply_category_rules(session)
-                session.commit()
-        if not ok:
-            self.notify(f"No vendor named {raw!r}.", severity="error")
-            return
-        self.reload()
-        self.notify(f"{raw!r} → {display!r}")
-
-    def _set_drilled_from(self, origin: Optional[str]) -> None:
-        """Flip the "back to stats/chart" flag, and nudge the footer to match.
-
-        ``origin`` is ``"stats"``, ``"chart"``, or ``None`` to clear it. The footer only
-        recomputes on its own when focus changes; a filter typed into the command bar
-        clears this flag without moving focus, so the hint would go stale without an
-        explicit refresh.
-        """
-        if origin == self._drill_origin:
-            return
-        self._drill_origin = origin
-        self.screen.refresh_bindings()
-
-    def _txn_order(self) -> str:
-        """The order #txns should be in: size while `sort size`'s view lasts, else date.
-
-        The view ends the moment the filters differ from the ones `sort size` was given,
-        whichever command changed them -- so there is no list of filter-changing
-        commands to keep in step with.
-        """
-        if (
-            self._size_sort_filters is not None
-            and self._size_sort_filters != self._active_filters()
-        ):
-            self._size_sort_filters = None
-        return queries.ORDER_SIZE if self._size_sort_filters is not None else queries.ORDER_DATE
-
-    SORT_USAGE = "Usage: sort size | sort date"
-
-    def _do_sort(self, arg: str) -> None:
-        """``sort size``: this view, largest first; ``sort date``: back to newest first."""
-        arg = arg.strip().lower()
-        if arg in ("size", "amount"):
-            if self._panel != "txns":
-                self._set_panel("txns")
-            self._size_sort_filters = self._active_filters()
-        elif arg == "date":
-            self._size_sort_filters = None
-        else:
-            self.notify(self.SORT_USAGE, severity="warning")
-            return
-        self.reload()
-
     def _set_panel(self, panel: str) -> None:
         """Show one of the main-view panels; escape always returns to transactions."""
         # Leaving the transactions puts them back in date order, so returning finds the
@@ -2179,1264 +1027,219 @@ class BudgetApp(App):
             self.query_one(self.PANEL_FOCUS.get(panel, f"#{panel}")).focus()
         self._refresh_status()
 
-    def _show_rules(self) -> None:
-        self.reload()
-        self._set_panel("rules")
-        if not self._rules and not self._category_rules:
-            self.notify(
-                "No vendor rules yet, and no category rules. Add one with:\n"
-                "  rule <pattern> = <display name>\n"
-                "  rule categorize <pattern> = <category>"
-            )
+    def _set_drilled_from(self, origin: Optional[str]) -> None:
+        """Flip the "back to stats/chart" flag, and nudge the footer to match.
 
-    def _show_imports(self) -> None:
-        """Browse one directory of the inbox: where to go, what to import, plus history.
-
-        Only the CSVs *directly* here become candidates. Inspecting a whole tree up front
-        would mean reading every file under the inbox to draw one screen, and the folder
-        rows already say how many are down there.
+        ``origin`` is ``"stats"``, ``"chart"``, or ``None`` to clear it. The footer only
+        recomputes on its own when focus changes; a filter typed into the command bar
+        clears this flag without moving focus, so the hint would go stale without an
+        explicit refresh.
         """
-        listing = list_inbox(self._import_dir, TO_IMPORT_DIR)
-        self._import_nav = ([listing.parent] if listing.parent is not None else []) + [
-            folder.path for folder in listing.folders
-        ]
-        self._import_folders = list(listing.folders)
-        with self.session_factory() as session:
-            self._candidates = [inspect_csv(session, path) for path in listing.files]
-            self._imports = queries.get_imports(session)
-        self._fill_imports()
-        self._set_panel("imports")
-        if not self._candidates and not listing.folders:
-            self.notify(
-                f"Nothing to import in {self._import_label()}", severity="warning"
-            )
-
-    def _import_label(self) -> str:
-        """The current directory, named for the status line. See imports_panel.import_label()."""
-        return imports_panel.import_label(self._import_dir, TO_IMPORT_DIR)
-
-    def _open_import_dir(self, path: Path) -> None:
-        self._import_dir = path
-        self._show_imports()
-        # A fresh directory starts at its first row rather than wherever the cursor
-        # happened to be in the directory just left.
-        table = self.query_one("#imports", DataTable)
-        if table.row_count:
-            table.move_cursor(row=0)
-
-    def _do_section(self, arg: str) -> None:
-        """``section <name>`` expands that sidebar section, collapsing the rest.
-
-        ``<name>`` may be any unambiguous prefix of accounts/vendors/categories/tags/
-        trips, case-insensitive -- e.g. ``section cat`` for Categories, ``section tr``
-        for Trips (the only section starting "tr", since "tags" does not). A prefix
-        matching more than one name, like bare ``section t`` (tags and trips both
-        qualify), is refused rather than guessed at.
-        """
-        name = arg.strip().lower()
-        if not name:
-            self.notify(
-                "Usage: section <name>  (accounts, vendors, categories, tags, trips)",
-                severity="warning",
-            )
+        if origin == self._drill_origin:
             return
-        matches = [section for section in self.SECTIONS if section.startswith(name)]
-        if len(matches) == 1:
-            self._expand_section(matches[0])
-            return
-        if not matches:
-            self.notify(f"Unknown section: {arg!r}", severity="warning", markup=False)
-            return
-        self.notify(
-            f"Ambiguous section {arg!r}: matches {', '.join(matches)}.",
-            severity="warning",
-            markup=False,
-        )
-
-    def _do_filter(self, arg: str) -> None:
-        """`filter text` searches everything; `filter vendor:text` narrows the field."""
-        self._set_drilled_from(None)  # a new search is a new view, not the drill-down's
-        arg = arg.strip()
-        if not arg:
-            self.text_filter = None
-            self.reload()
-            self.notify("Text filter cleared.")
-            return
-
-        field, _, rest = arg.partition(":")
-        if rest.strip() and field.strip().lower() in queries.TEXT_FIELDS:
-            text_filter = queries.TextFilter(rest.strip(), field.strip().lower())
-        else:
-            # No recognised prefix, so the whole argument is the search text. This also
-            # means a colon inside ordinary text is treated literally.
-            text_filter = queries.TextFilter(arg, "all")
-        self.text_filter = text_filter
-        self.reload()
-        where = (
-            "description, vendor, and raw name"
-            if text_filter.field == "all"
-            else text_filter.field
-        )
-        self.notify(f"Filtering {where} for {text_filter.text!r}.", markup=False)
-
-    def _do_merge(self, arg: str) -> None:
-        if "=" not in arg:
-            self.notify("Usage: merge <source account> = <target account>", severity="warning")
-            return
-        source, target = (part.strip() for part in arg.split("=", 1))
-        if not source or not target:
-            self.notify("Usage: merge <source account> = <target account>", severity="warning")
-            return
-        with self.session_factory() as session:
-            try:
-                result = accounts.merge_accounts(session, source, target)
-            except accounts.AccountError as error:
-                self.notify(str(error), severity="error", markup=False)
-                return
-            session.commit()
-        self.reload()
-        message = (
-            f"Merged {result.source!r} into {result.target!r}: "
-            f"{result.moved_transactions} transactions moved."
-        )
-        if result.unpaired_transfers:
-            message += f"\n{result.unpaired_transfers} same-account transfer legs un-paired."
-        self.notify(message, markup=False, timeout=8)
-
-    def _do_transfers(self, arg: str) -> None:
-        arg = arg.strip()
-        with self.session_factory() as session:
-            if arg in {"reset", "clear"}:
-                reset = transfers.clear_transfers(session)
-                session.commit()
-                message = f"Un-paired {reset} transaction(s)."
-            elif arg == "same-account":
-                # Opt-in only: see transfers.detect_transfers for why this is not the
-                # default (a false same-account pairing silently drops two real
-                # transactions from the totals).
-                pairs = transfers.detect_transfers(session, allow_same_account=True)
-                session.commit()
-                message = f"Found {pairs} new transfer pair(s) (same-account allowed)."
-            elif arg:
-                self.notify(
-                    f"Unknown transfers option: {arg!r}. Try 'transfers', "
-                    "'transfers same-account', or 'transfers reset'.",
-                    severity="warning",
-                    markup=False,
-                )
-                return
-            else:
-                pairs = transfers.detect_transfers(session)
-                session.commit()
-                message = f"Found {pairs} new transfer pair(s)."
-        self.reload()
-        self.notify(message)
-
-    def _do_rule(self, arg: str) -> None:
-        """``rule <pattern> = <display name>`` renames; ``rule categorize ...`` categorizes.
-
-        Both kinds of rule start with ``rule`` so they read as one family. A vendor
-        pattern that genuinely starts with the word "categorize" is not a realistic
-        merchant string, so the keyword is safe to claim.
-        """
-        if not arg:
-            self._show_rules()
-            return
-        head, _, rest = arg.partition(" ")
-        if head.lower() in {"categorize", "categorise", "cat"}:
-            self._do_category_rule(rest.strip())
-            return
-        if "=" not in arg:
-            self.notify(
-                "Usage: rule <pattern> = <display name>", severity="warning"
-            )
-            return
-        pattern, display = (part.strip() for part in arg.split("=", 1))
-        if not pattern or not display:
-            self.notify(
-                "Usage: rule <pattern> = <display name>", severity="warning"
-            )
-            return
-        with self.session_factory() as session:
-            vendors.add_rule(session, pattern, display)
-            changed = vendors.apply_rules(session)
-            # Renames change display names, and a category rule may match those -- so
-            # the category rules run after, as they do at the end of every import.
-            categories.apply_category_rules(session)
-            session.commit()
-        self.reload()
-        self.notify(f"{pattern!r} → {display!r} ({changed} vendors updated)")
-
-    CATEGORIZE_USAGE = "Usage: categorize <vendor> = <category>   (blank category undoes it)"
-    CATEGORY_RULE_USAGE = "Usage: rule categorize <pattern> = <category>"
-
-    def _do_categorize(self, arg: str) -> None:
-        """``categorize <vendor> = <category>``, its blank-category undo, and its rules."""
-        arg = arg.strip()
-        if not arg or arg.lower() == "rules":
-            self._show_rules()
-            return
-        head, _, rest = arg.partition(" ")
-        # The older spelling of `rule categorize`, kept so it still works.
-        if head.lower() == "rule":
-            self._do_category_rule(rest.strip())
-            return
-        if "=" not in arg:
-            self.notify(self.CATEGORIZE_USAGE, severity="warning")
-            return
-        vendor, value = (part.strip() for part in arg.split("=", 1))
-        if not vendor:
-            self.notify(self.CATEGORIZE_USAGE, severity="warning")
-            return
-
-        with self.session_factory() as session:
-            # Checked up front because both calls return 0 for an unknown vendor and for
-            # one with nothing to change, and those deserve different answers.
-            if queries.resolve_vendor_filter(session, vendor) is None:
-                self.notify(f"No vendor named {vendor!r}.", severity="error", markup=False)
-                return
-            if value:
-                changed = categories.set_category(session, vendor, value)
-                message = f"{vendor!r} → {value!r} ({changed} transactions categorized)"
-            else:
-                # Mirrors a bare `filter`: leaving the right-hand side empty undoes it.
-                changed = categories.clear_category(session, vendor)
-                message = f"{vendor!r}: cleared the category on {changed} transactions."
-            session.commit()
-        self.reload()
-        self.notify(message, markup=False)
-
-    def _do_category_rule(self, arg: str) -> None:
-        if not arg:
-            self._show_rules()
-            return
-        if "=" not in arg:
-            self.notify(self.CATEGORY_RULE_USAGE, severity="warning")
-            return
-        pattern, value = (part.strip() for part in arg.split("=", 1))
-        if not pattern or not value:
-            self.notify(self.CATEGORY_RULE_USAGE, severity="warning")
-            return
-        with self.session_factory() as session:
-            categories.add_rule(session, pattern, value)
-            changed = categories.apply_category_rules(session)
-            session.commit()
-        self.reload()
-        # markup=False: patterns are globs, and may carry brackets.
-        self.notify(
-            f"{pattern!r} → {value!r} ({changed} transactions categorized)", markup=False
-        )
-
-    SEL_USAGE = (
-        "Usage: sel all | sel none | sel category = <name> | sel vendor = <name> | "
-        "sel tag = <name> | sel untag = <name> | sel trip = <name> | sel untrip | "
-        "sel transfer | sel untransfer | sel exclude | sel include"
-    )
-
-    def _do_sel(self, arg: str) -> None:
-        """Act on the multi-select — the one place transactions are edited per row.
-
-        Every other write in this app keys off a vendor and hits all of that vendor's
-        transactions; these key off the rows the user actually picked. Parsed as a bare
-        subject or ``<subject> = <value>``, so an empty right-hand side undoes, the way
-        a bare ``filter`` and ``categorize <vendor> =`` already do.
-        """
-        arg = arg.strip()
-        if not arg:
-            self.notify(self.SEL_USAGE, severity="warning")
-            return
-        subject, separator, value = (part.strip() for part in arg.partition("="))
-        subject = subject.lower()
-        if subject == "all" and not separator:
-            self._sel_all()
-            return
-        if subject == "none" and not separator:
-            self._sel_none()
-            return
-        if subject == "untrip" and not separator:
-            self._sel_write(tags_module.clear_trip, "taken off their trip")
-            return
-        if subject == "transfer" and not separator:
-            self._sel_transfer()
-            return
-        if subject == "exclude" and not separator:
-            self._sel_write(
-                transfers.exclude,
-                "excluded from income and spending (rows already a transfer are left "
-                "as they are)",
-            )
-            return
-        if subject == "include" and not separator:
-            self._sel_write(transfers.include, "counted again")
-            return
-        if subject == "untransfer" and not separator:
-            self._sel_write(
-                transfers.unmark_manual_transfer, "taken out of their manual transfer"
-            )
-            return
-        if subject in self.SEL_WRITE_SUBJECTS:
-            if not separator:
-                self.notify(self.SEL_USAGE, severity="warning")
-                return
-            self._sel_apply(subject, value)
-            return
-        self.notify(
-            f"Unknown 'sel' command: {arg!r}\n{self.SEL_USAGE}",
-            severity="warning",
-            markup=False,
-        )
-
-    def _sel_transfer(self) -> None:
-        """``sel transfer``: mark the two selected legs as one transfer, by hand.
-
-        For pairs detection cannot see -- a Wise fee makes the legs differ. The fee is
-        split off as its own row and stays in the spending figures (the money really is
-        gone), and the pop-up says exactly how much that was, so nothing disappears
-        from the totals unannounced.
-        """
-        ids = sorted(self._selected_ids)
-        if len(ids) != 2:
-            self.notify(
-                f"sel transfer needs both legs selected: exactly 2 rows, one out and "
-                f"one in ({len(ids)} selected).",
-                severity="warning",
-            )
-            return
-        with self.session_factory() as session:
-            try:
-                result = transfers.mark_manual_transfer(session, ids)
-            except transfers.ManualTransferError as error:
-                self.notify(str(error), severity="error", markup=False)
-                return
-            session.commit()
-        self.reload()
-
-        legs = (
-            f"{result.outflow_account} {_fmt_amount(result.outflow_minor)} ⇄ "
-            f"{result.inflow_account} {_fmt_amount(result.inflow_minor)}"
-        )
-        if result.difference_minor is None:
-            detail = (
-                "Different currencies, so no fee could be worked out without a rate; "
-                "nothing was split off."
-            )
-        elif result.difference_minor == 0:
-            detail = "The legs match exactly; no fee."
-        else:
-            kind = "fee" if result.difference_minor < 0 else "difference"
-            detail = (
-                f"Difference {_fmt_amount(result.difference_minor)} {result.currency}, "
-                f"kept as a separate 'Transfer {kind}' row in {result.fee_account} "
-                f"(category {transfers.FEE_CATEGORY}), so it still counts."
-            )
-        self.notify(
-            f"{legs}\n{detail}\nTagged #{transfers.MANUAL_TRANSFER_TAG}; "
-            "sel untransfer undoes it.",
-            title="Manual transfer",
-            severity="warning" if result.difference_minor else "information",
-            timeout=15,
-            markup=False,
-        )
-
-    # The `sel <subject> = <value>` verbs, and whether the value is allowed to be blank.
-    # Only `category` is: a blank right-hand side undoes it, matching
-    # `categorize <vendor> =`. Blanking a vendor or a tag has no obvious meaning, so
-    # those are a usage error rather than a silent no-op.
-    SEL_WRITE_SUBJECTS = {
-        "category": True,
-        "vendor": False,
-        "tag": False,
-        "untag": False,
-        "trip": False,
-    }
-
-    def _sel_apply(self, subject: str, value: str) -> None:
-        """Run one ``sel <subject> = <value>`` verb over the selection."""
-        if not value and not self.SEL_WRITE_SUBJECTS[subject]:
-            self.notify(self.SEL_USAGE, severity="warning")
-            return
-
-        if subject == "category":
-            if value:
-                self._sel_write(
-                    lambda session, ids: categories.set_category_for(session, ids, value),
-                    f"categorized {value!r}",
-                )
-            else:
-                # Mirrors `categorize <vendor> =`: a blank right-hand side undoes.
-                self._sel_write(categories.clear_category_for, "cleared of their category")
-        elif subject == "vendor":
-            self._sel_write(
-                lambda session, ids: _set_vendor_then_categorize(session, ids, value),
-                f"pointed at vendor {value!r}",
-            )
-        elif subject == "tag":
-            self._sel_write(
-                lambda session, ids: tags_module.add_tag(session, ids, value),
-                f"tagged {value!r}",
-            )
-        elif subject == "untag":
-            self._sel_write(
-                lambda session, ids: tags_module.remove_tag(session, ids, value),
-                f"untagged {value!r}",
-            )
-        elif subject == "trip":
-            self._sel_write(
-                lambda session, ids: tags_module.set_trip(session, ids, value),
-                f"put on trip {value!r}",
-            )
-
-    def _sel_write(self, write, description: str) -> None:
-        """Apply ``write(session, ids)`` to the selection, then reload and report.
-
-        The selection deliberately survives: setting a category and then a tag on the
-        same rows is the common case, and having to reselect between the two would make
-        the feature tedious enough not to use. The core modules do not commit -- callers
-        own the transaction -- so this does, the way :meth:`_do_categorize` does.
-        """
-        if not self._selected_ids:
-            self.notify("Nothing selected.", severity="warning")
-            return
-        ids = sorted(self._selected_ids)
-        with self.session_factory() as session:
-            changed = write(session, ids)
-            session.commit()
-        self.reload()
-        # markup=False: a category, vendor or tag name may contain square brackets,
-        # which Rich would otherwise read as markup.
-        self.notify(
-            f"{changed} transaction{'s' if changed != 1 else ''} {description}.",
-            markup=False,
-        )
-
-    def _sel_all(self) -> None:
-        """Select every transaction the table is currently showing."""
-        self._selected_ids = {txn.id for txn in self._txns}
-        self._render_selection()
-        count = len(self._selected_ids)
-        self.notify(f"Selected {count} transaction{'s' if count != 1 else ''}.")
-
-    def _sel_none(self) -> None:
-        """Clear the selection."""
-        self._selected_ids = set()
-        self._render_selection()
-        self.notify("Selection cleared.")
-
-    def _do_category(self, arg: str) -> None:
-        """``category <path>`` builds/moves a category; bare or ``list`` shows the tree.
-
-        Distinct from ``categorize``: this manages the category hierarchy itself
-        (creating, nesting, re-parenting), not which category a vendor's transactions
-        get. A one-element path is a move to the top level (:func:`categories.ensure_path`).
-
-        Names are unique across the whole tree, so a path level that already exists
-        somewhere else is a *relocation* of that whole category, not a new one — see
-        :func:`categories.preview_path`. That is confirmed before it happens, the same
-        shape as ``unimport``.
-        """
-        arg = arg.strip()
-        if not arg or arg.lower() == "list":
-            self._notify_category_tree()
-            return
-        head, _, rest = arg.partition(" ")
-        if head.lower() == "merge":
-            self._do_category_merge(rest.strip())
-            return
-        with self.session_factory() as session:
-            try:
-                preview = categories.preview_path(session, arg)
-            except categories.CategoryError as error:
-                self.notify(str(error), severity="warning", markup=False)
-                return
-            if preview.relocations:
-                self._ask_category_relocation(arg, preview)
-                return
-            category = categories.ensure_path(session, arg)
-            path = categories.format_path(session, category)
-            session.commit()
-        self.reload()
-        self.notify(f"{path!r} ready.", markup=False)
-
-    def _ask_category_relocation(self, path: str, preview: categories.PathPreview) -> None:
-        self._pending_category = path
-        self._prompt_panel = self._panel
-        moved = "; ".join(
-            f"{r.name!r} from {r.from_parent or 'the top level'} to "
-            f"{r.to_parent or 'the top level'} ({r.transaction_count} transaction(s))"
-            for r in preview.relocations
-        )
-        prompt = self.query_one("#prompt", Static)
-        # Text(), not markup: a category name is user data and may hold brackets.
-        prompt.update(
-            Text.assemble(
-                (f"{path!r} would relocate {moved}.\n", "bold"),
-                (
-                    "Type yes to confirm; anything else, or escape, cancels. A "
-                    "separate category needs its own distinct name, e.g. "
-                    "'Dining (Travel)'.",
-                    "dim",
-                ),
-            )
-        )
-        prompt.display = True
-        self.query_one("#command", Input).focus()
-
-    def _answer_category(self, text: str) -> None:
-        path = self._pending_category
-        self._cancel_category()
-        if text.strip().lower() != "yes":
-            self.notify("Category move cancelled.")
-            return
-        with self.session_factory() as session:
-            try:
-                category = categories.ensure_path(session, path, confirm_relocation=True)
-                result_path = categories.format_path(session, category)
-            except categories.CategoryError as error:
-                self.notify(str(error), severity="warning", markup=False)
-                return
-            session.commit()
-        self.reload()
-        self.notify(f"{result_path!r} ready.", markup=False)
-
-    def _cancel_category(self) -> None:
-        self._pending_category = None
-        self._prompt_panel = None
-        self.query_one("#prompt", Static).display = False
-
-    CATEGORY_MERGE_USAGE = "Usage: category merge <source> = <target>"
-
-    def _do_category_merge(self, arg: str) -> None:
-        """``category merge <source> = <target>`` — destructive, so it only previews.
-
-        :func:`categories.merge_category` has no dry-run of its own, so the preview is
-        the real call made inside a session that is never committed: closing it below
-        discards everything it did, and the counts on the returned
-        :class:`categories.MergeResult` are exactly what a real merge would move,
-        read before the source category was deleted. ``_answer_category_merge`` re-runs
-        it for real, and commits, only once the user has confirmed.
-        """
-        if "=" not in arg:
-            self.notify(self.CATEGORY_MERGE_USAGE, severity="warning")
-            return
-        source, target = (part.strip() for part in arg.split("=", 1))
-        if not source or not target:
-            self.notify(self.CATEGORY_MERGE_USAGE, severity="warning")
-            return
-        with self.session_factory() as session:
-            try:
-                result = categories.merge_category(session, source, target)
-            except categories.CategoryError as error:
-                self.notify(str(error), severity="warning", markup=False)
-                return
-            # Not committed: leaving the `with` block below rolls this back.
-
-        self._pending_category_merge = (source, target)
-        self._prompt_panel = self._panel
-        prompt = self.query_one("#prompt", Static)
-        prompt.update(
-            Text.assemble(
-                (
-                    f"Merge {result.source!r} into {result.target!r}: "
-                    f"{result.moved_transactions} transaction(s), "
-                    f"{result.moved_rules} rule(s), "
-                    f"{result.moved_children} child categor"
-                    f"{'y' if result.moved_children == 1 else 'ies'} moved, then "
-                    f"{result.source!r} is deleted.\n",
-                    "bold",
-                ),
-                ("Type yes to confirm; anything else, or escape, cancels.", "dim"),
-            )
-        )
-        prompt.display = True
-        self.query_one("#command", Input).focus()
-
-    def _answer_category_merge(self, text: str) -> None:
-        source, target = self._pending_category_merge
-        self._cancel_category_merge()
-        if text.strip().lower() != "yes":
-            self.notify("Merge cancelled.")
-            return
-        with self.session_factory() as session:
-            try:
-                result = categories.merge_category(session, source, target)
-            except categories.CategoryError as error:
-                self.notify(str(error), severity="error", markup=False)
-                return
-            session.commit()
-        self.reload()
-        self.notify(
-            f"Merged {result.source!r} into {result.target!r}: "
-            f"{result.moved_transactions} transaction(s), {result.moved_rules} rule(s), "
-            f"{result.moved_children} child categories moved.",
-            markup=False,
-        )
-
-    def _cancel_category_merge(self) -> None:
-        self._pending_category_merge = None
-        self._prompt_panel = None
-        self.query_one("#prompt", Static).display = False
-
-    def _notify_category_tree(self) -> None:
-        if not self._categories:
-            self.notify("No categories yet. Add one with: category Food > Dining")
-            return
-        lines = [f"{'  ' * c.depth}{c.name} ({c.count})" for c in self._categories]
-        self.notify("\n".join(lines), title="Categories", markup=False, timeout=8)
-
-    FORMAT_USAGE = "Usage: format | format <name> invert on|off"
-
-    def _do_format(self, arg: str) -> None:
-        """Bare ``format`` lists learned layouts; ``format <name> invert on|off`` flips one.
-
-        A positive amount means money leaving the account on some providers' exports and
-        money arriving on others; flipping ``invert_amount`` here fixes every future
-        import of that layout, without touching anything already imported (undo a bad
-        import with ``unimport`` first, then re-import).
-        """
-        arg = arg.strip()
-        if not arg:
-            self._notify_formats()
-            return
-        parts = arg.split()
-        if len(parts) < 3 or parts[-2].lower() != "invert" or parts[-1].lower() not in (
-            "on",
-            "off",
-        ):
-            self.notify(self.FORMAT_USAGE, severity="warning")
-            return
-        name = " ".join(parts[:-2])
-        invert = parts[-1].lower() == "on"
-        with self.session_factory() as session:
-            try:
-                spec = formats.set_invert_amount(session, name, invert)
-            except formats.UnknownFormat as error:
-                self.notify(str(error), severity="error", markup=False)
-                return
-            session.commit()
-        state = "on" if spec.invert_amount else "off"
-        self.notify(f"{spec.name!r}: invert {state}.", markup=False)
-
-    def _notify_formats(self) -> None:
-        with self.session_factory() as session:
-            specs = formats.list_formats(session)
-        if not specs:
-            self.notify("No CSV layouts learned yet. Import a file to learn one.")
-            return
-        lines = [
-            f"{s.name} — {s.amount_style}, invert "
-            + ("on" if s.invert_amount else "off")
-            for s in specs
-        ]
-        self.notify("\n".join(lines), title="Formats", markup=False, timeout=8)
-
-    # ------------------------------------------------------------------ rates
-    def _run_rate_fetch(self, job: Callable[[Session], Optional[str]]) -> None:
-        """Run ``job(session)`` off the event loop and report whatever it returns.
-
-        ``fetch_ecb_rates`` alone can take up to 40 seconds per attempt, twice over —
-        see its own docstring — so nothing that might call it runs on the UI thread.
-        This is the one place that talks to a worker thread for it, shared by the
-        post-import auto-fetch (``_fetch_rates_after_import``) and the ``rates fetch``
-        command (``_do_rates_fetch``), so neither has to repeat the plumbing.
-
-        ``job`` gets its own session (worker threads do not share one with the main
-        thread) and returns the message to show, or ``None`` to say nothing — an import
-        that turned out to need no foreign currency at all has nothing worth a
-        notification. Never raises past this point: a database or network hiccup here
-        must not take the whole app down, only report as "did not work".
-        """
-
-        def runner() -> None:
-            try:
-                with self.session_factory() as session:
-                    message = job(session)
-                    session.commit()
-            except Exception as error:  # noqa: BLE001 - reported, not swallowed
-                message = f"Rate fetch failed: {error}"
-            if message:
-                self.call_from_thread(self._on_rate_fetch_done, message)
-
-        self.run_worker(runner, thread=True, group="rates", exit_on_error=False)
-
-    def _on_rate_fetch_done(self, message: str) -> None:
-        """Runs on the UI thread (via call_from_thread) once a rate fetch worker lands."""
-        self.notify(message, markup=False)
-        self.reload()
-
-    def _fetch_rates_after_import(self, import_ids: List[int]) -> None:
-        """Cache whatever ECB rates the import(s) that just finished need, if any.
-
-        The decision -- which currencies, what span, whether anything is even missing
-        -- is entirely rates.fetch_rates_for_import's; this only loops over the ids and
-        turns its answer into a line of text. Offline or unreachable is reported, never
-        raised: the import this follows has already committed and succeeded.
-        """
-
-        def job(session: Session) -> Optional[str]:
-            messages = []
-            for import_id in import_ids:
-                outcome = rates.fetch_rates_for_import(session, import_id, queries.HOME_CURRENCY)
-                if not outcome.attempted:
-                    continue  # nothing but home_currency in this import
-                quotes = ", ".join(outcome.quotes)
-                if outcome.error is not None:
-                    messages.append(
-                        f"Could not fetch {queries.HOME_CURRENCY} -> {quotes} rates: "
-                        f"{outcome.error} Run 'rates fetch' later."
-                    )
-                else:
-                    messages.append(
-                        f"Fetched {outcome.written} rate(s) for "
-                        f"{queries.HOME_CURRENCY} -> {quotes}."
-                    )
-            return "\n".join(messages) if messages else None
-
-        self._run_rate_fetch(job)
-
-    RATES_USAGE = "Usage: rates | rates fetch"
-
-    def _do_rates(self, arg: str) -> None:
-        """Bare ``rates`` lists what is cached; ``rates fetch`` caches what is missing."""
-        arg = arg.strip().lower()
-        if arg in ("", "list"):
-            self._notify_rates()
-            return
-        if arg == "fetch":
-            self._do_rates_fetch()
-            return
-        self.notify(self.RATES_USAGE, severity="warning")
-
-    def _notify_rates(self) -> None:
-        with self.session_factory() as session:
-            rows = queries.get_exchange_rates(session)
-        if not rows:
-            self.notify("No exchange rates cached yet. Run: rates fetch")
-            return
-        lines = []
-        for row in rows:
-            span = (
-                row.first_day if row.first_day == row.last_day
-                else f"{row.first_day}..{row.last_day}"
-            )
-            plural = "" if row.count == 1 else "s"
-            lines.append(
-                f"{row.base} -> {row.quote}   {row.source:<8} {span:<23} "
-                f"{row.count} rate{plural}"
-            )
-        self.notify("\n".join(lines), title="Exchange rates", markup=False, timeout=8)
-
-    def _do_rates_fetch(self) -> None:
-        """Fetch ECB rates for every foreign currency on file, over its whole range —
-        the same derivation ``budget rates fetch`` uses (queries.default_rate_fetch_span),
-        so the two never drift.
-        """
-
-        def job(session: Session) -> str:
-            derived = queries.default_rate_fetch_span(session, queries.HOME_CURRENCY)
-            if derived is None:
-                return (
-                    "No transactions in the database to derive a date range from."
-                )
-            start, end, quotes = derived
-            if not quotes:
-                return f"Only one currency on file ({queries.HOME_CURRENCY}); nothing to fetch."
-            try:
-                written = rates.fetch_ecb_rates(
-                    session, start, end, queries.HOME_CURRENCY, quotes
-                )
-            except rates.FrankfurterError as error:
-                return f"Could not fetch ECB rates: {error}"
-            return (
-                f"Fetched {written} rate(s) for "
-                f"{queries.HOME_CURRENCY} -> {', '.join(quotes)}."
-            )
-
-        self.notify("Fetching exchange rates…")
-        self._run_rate_fetch(job)
-
-    # ------------------------------------------------------------------- sync
-    SYNC_USAGE = "Usage: sync | sync preview"
-
-    def _do_sync(self, arg: str) -> None:
-        """``sync`` pulls every connected account; ``sync preview``/``sync dry`` only
-        reports what it would do. Connecting a server at all needs a hidden prompt for
-        the one-time setup token, so that step stays CLI-only (``budget sync
-        connect``) -- this command only ever runs an already-connected server.
-        """
-        arg = arg.strip().lower()
-        if arg in ("", "preview", "dry"):
-            dry_run = arg != ""
-        else:
-            self.notify(self.SYNC_USAGE, severity="warning")
-            return
-
-        if any(w.group == "sync" and not w.is_finished for w in self.workers):
-            self.notify("A sync is already running.", severity="warning")
-            return
-
-        with self.session_factory() as session:
-            connections = sync.list_connections(session)
-        if not connections:
-            self.notify(
-                "No sync connection yet. Run 'budget sync connect' in a terminal "
-                "to add one -- it needs a hidden prompt for the one-time setup "
-                "token, so that step stays CLI-only.",
-                severity="warning",
-            )
-            return
-
-        self.notify("Syncing…")
-
-        def runner() -> None:
-            try:
-                with self.session_factory() as session:
-                    results = sync.run_sync(session, dry_run=dry_run)
-            except Exception as error:  # noqa: BLE001 - reported, not swallowed
-                self.call_from_thread(self._on_sync_error, error)
-                return
-            self.call_from_thread(self._on_sync_done, results, dry_run)
-
-        self.run_worker(runner, thread=True, group="sync", exit_on_error=False)
-
-    def _on_sync_error(self, error: Exception) -> None:
-        """Runs on the UI thread. Covers ``sync.SyncError`` and its subclasses (a
-        missing credential, a revoked connection, an inverted-sign provider),
-        ``simplefin.SimpleFINError`` (network/protocol trouble) and
-        ``credentials.CredentialsUnavailable`` (no usable keychain backend) alike --
-        all of them name something the user needs to act on, not a bug to chase.
-        """
-        self.notify(str(error), title="Sync failed", severity="error", markup=False)
-
-    def _on_sync_done(self, results: List[sync.SyncResult], dry_run: bool) -> None:
-        """Runs on the UI thread once a sync worker lands.
-
-        One summary notification covers everything ``run_sync`` reported. Any account
-        with a gap warning also gets its own, separate, long-lived warning
-        notification -- a hole in coverage is exactly the kind of thing a summary line
-        among many is easy to miss.
-        """
-        lines: List[str] = []
-        gap_lines: List[str] = []
-        import_ids: List[int] = []
-
-        for result in results:
-            lines.append(f"{result.connection_name}:")
-            if result.import_id is not None:
-                import_ids.append(result.import_id)
-            for account in result.accounts:
-                lines.append(
-                    f"  {account.account_name} ({account.remote_name}): "
-                    f"{account.inserted} inserted, {account.matched_existing} "
-                    f"matched existing, {account.already_synced} already synced"
-                )
-                if account.inserted_before_cutoff:
-                    # New rows dated inside what a CSV import already covered: either
-                    # it missed them, or they are a near-duplicate the match did not
-                    # catch. Either way, worth a look.
-                    lines.append(
-                        f"    {account.inserted_before_cutoff} of those are dated on or "
-                        "before your last CSV import -- worth checking"
-                    )
-                for warning in account.warnings:
-                    lines.append(f"    {warning}")
-                if account.gap_warning:
-                    gap_lines.append(f"{account.account_name}: {account.remote_name}")
-                    gap_lines.extend(f"  {warning}" for warning in account.warnings)
-            for error in result.errors:
-                lines.append(f"  remote error: {error}")
-            for remote_name in result.unmapped:
-                lines.append(f"  not mapped to a local account: {remote_name}")
-
-        if dry_run:
-            lines.append("Preview only -- nothing was written.")
-
-        self.notify(
-            "\n".join(lines),
-            title="Sync preview" if dry_run else "Sync",
-            markup=False,
-            timeout=10,
-        )
-
-        if gap_lines:
-            self.notify(
-                "\n".join(gap_lines),
-                title="Sync -- possible gap in coverage",
-                severity="warning",
-                markup=False,
-                timeout=20,
-            )
-
-        if not dry_run:
-            # A real sync always needs a reload even when nothing was inserted: it still
-            # wrote each account's sync_status/sync_error (see models.SyncAccount), and
-            # the accounts sidebar's colors come from exactly that -- see
-            # queries.get_accounts. import_ids only gates the rate fetch below, which
-            # has nothing to do once there is no new import.
-            self.reload()
-            if import_ids:
-                self._fetch_rates_after_import(import_ids)
-
-    # ------------------------------------------------------------- drill-down
-    def _drill_into_category(self, row: int) -> None:
-        """Enter, or the right arrow, on a statistics row lists the transactions behind it.
-
-        The report's window comes along as a date filter. Without it the table would show
-        every transaction that category ever had, and the figures the user just clicked
-        would not match the rows they are now looking at.
-        """
-        if self._report is None or not 0 <= row < len(self._stats_rows):
-            return
-        stat = self._stats_rows[row]
-        # Remember what the drill-down is about to overwrite, and where it came from, so
-        # a left arrow can undo exactly this rather than blanking filters the user set
-        # themselves, and can put the cursor back where it was. trip_filter and
-        # category_ids_filter are untouched by this drill-down, but are still snapshot
-        # here so _go_back_from_drill can restore all four the same way regardless of
-        # which drill-down produced this view.
-        self._pre_drill_category_filter = self.category_filter
-        self._pre_drill_date_filter = self.date_filter
-        self._pre_drill_trip_filter = self.trip_filter
-        self._pre_drill_category_ids_filter = self.category_ids_filter
-        self._drill_source_row = row
-        self.category_filter = stat.category_id
-        self.date_filter = (self._report.window.start, self._report.window.end)
-        # Panel first: reload() only rebuilds the report while the stats panel is up, and
-        # rebuilding it under the new filter would rewrite the rows we just read.
-        self._set_panel("txns")
-        self._set_drilled_from("stats")
-        self.reload()
-
-    def _drill_into_bar(self, row: int) -> None:
-        """Enter, or the right arrow, on a chart row lists the transactions behind that bar.
-
-        The bar's own bucket becomes the date filter — clamped to the window's edges via
-        charts.bucket_date_range(), since the first and last buckets are usually partial
-        — intersected with whatever account/category/vendor/text filters already scope
-        the chart. Without the clamp, a bucket at either edge of the window would pull in
-        transactions the chart never drew, and the drilled-down rows would not sum back
-        to the bar just clicked.
-
-        Unlike a statistics drill-down this never touches the category filter — a bar is
-        a slice of time, not of category — so _pre_drill_category_filter just records the
-        filter already in place, and going back "restores" it as a no-op.
-        """
-        if self._chart is None or self.window is None or self._bucket is None:
-            return
-        if not 0 <= row < len(self._chart.bars):
-            return
-        bar = self._chart.bars[row]
-        self._pre_drill_category_filter = self.category_filter
-        self._pre_drill_date_filter = self.date_filter
-        self._pre_drill_trip_filter = self.trip_filter
-        self._pre_drill_category_ids_filter = self.category_ids_filter
-        self._drill_source_row = row
-        self.date_filter = charts.bucket_date_range(bar.key, self._bucket, self.window)
-        # Panel first: reload() only rebuilds the chart while the chart panel is up, and
-        # rebuilding it under the new date filter would rewrite the bars we just read.
-        self._set_panel("txns")
-        self._set_drilled_from("chart")
-        self.reload()
-
-    def _drill_into_trip_row(self, row: int) -> None:
-        """Enter, or the right arrow, on a trip row lists that trip's transactions; on
-        one of its unfolded bucket rows, that trip's transactions in that bucket alone.
-
-        A bucket is several unrelated categories at once (trips.resolve_buckets), which
-        is exactly what queries.Filters.category_ids is for -- not a subtree, an
-        explicit set. misc's set always includes None, or every uncategorized
-        transaction on the trip would silently vanish from its own drill-down (see
-        tui.trips.bucket_category_ids).
-        """
-        if not 0 <= row < len(self._trip_rows):
-            return
-        panel_row = self._trip_rows[row]
-        # Same snapshot-everything discipline as _drill_into_category()/
-        # _drill_into_bar(): category_filter/date_filter are untouched by this
-        # drill-down, but are still recorded so _go_back_from_drill can restore all
-        # four uniformly.
-        self._pre_drill_category_filter = self.category_filter
-        self._pre_drill_date_filter = self.date_filter
-        self._pre_drill_trip_filter = self.trip_filter
-        self._pre_drill_category_ids_filter = self.category_ids_filter
-        self._drill_source_row = row
-        self.trip_filter = panel_row.trip.id
-        if panel_row.bucket_index is None:
-            self.category_ids_filter = None
-        else:
-            bucket = trips.BUCKETS[panel_row.bucket_index]
-            with self.session_factory() as session:
-                mapping = trips.resolve_buckets(session)
-            self.category_ids_filter = trips_panel.bucket_category_ids(mapping, bucket)
-        # Panel first: reload() only rebuilds the trips panel while it is up, and
-        # rebuilding it under the new filters would rewrite the rows we just read.
-        self._set_panel("txns")
-        self._set_drilled_from("trips")
-        self.reload()
-
-    def _go_back_from_drill(self) -> None:
-        """Left arrow, undoing exactly the drill-down that produced this view.
-
-        Mirrors _drill_into_category()/_drill_into_bar()/_drill_into_trip_row():
-        restores the four filters any of them might have overwritten (each may be
-        None, or may be a filter the user had set before drilling in -- see their own
-        snapshot comments), rebuilds whichever panel the drill-down came from, and
-        returns its cursor to the row that was drilled from.
-        """
-        origin = self._drill_origin
-        row = self._drill_source_row
-        self.category_filter = self._pre_drill_category_filter
-        self.date_filter = self._pre_drill_date_filter
-        self.trip_filter = self._pre_drill_trip_filter
-        self.category_ids_filter = self._pre_drill_category_ids_filter
-        self._pre_drill_category_filter = None
-        self._pre_drill_date_filter = None
-        self._pre_drill_trip_filter = None
-        self._pre_drill_category_ids_filter = None
-        self._drill_source_row = None
-        self._set_drilled_from(None)
-        # reload() while the panel is still "txns" resyncs the transactions/totals to the
-        # restored filters without rebuilding the report, chart, or trips panel (see
-        # their own guards), so whichever one is being returned to is rebuilt
-        # explicitly below, the same way _show_stats()/_show_chart()/_show_trips() does.
-        self.reload()
-        if origin == "chart":
-            self._build_chart()
-            self._fill_chart()
-            self._set_panel("chart")
-            if row is not None:
-                table = self.query_one("#chart", DataTable)
-                if 0 <= row < table.row_count:
-                    table.move_cursor(row=row)
-            return
-        if origin == "trips":
-            self._build_trips()
-            self._fill_trips()
-            self._set_panel("trips")
-            table = self.query_one("#trip_table", trips_panel.TripTable)
-            # Coming back from a drill-down is not a fresh open of the panel -- the
-            # cursor was already visible on the row the user drilled from (they had to
-            # touch the table to get there), so it stays visible rather than hiding
-            # again the way _show_trips() makes a genuinely new open start clean.
-            table.show_cursor = True
-            if row is not None and 0 <= row < table.row_count:
-                table.move_cursor(row=row)
-            return
-        self._build_report()
-        self._fill_stats()
-        self._set_panel("stats")
-        if row is not None:
-            table = self.query_one("#stats_table", DataTable)
-            if 0 <= row < table.row_count:
-                table.move_cursor(row=row)
-
-    # --------------------------------------------------------------- actions
-    def _selected_vendor(self) -> Optional[queries.VendorRow]:
-        """The vendor ctrl+n targets: the active filter, else the highlighted row."""
-        if self.vendor_filter is not None:
-            kind, vendor_id = self.vendor_filter
-            for vendor in self._vendors:
-                if (vendor.kind, vendor.id) == (kind, vendor_id):
-                    return vendor
-            return None
-        # Index 0 is the "— All —" row, so the list is offset by one. Bounded by what is
-        # actually mounted (see VENDOR_SIDEBAR_CAP), not the full vendor count, or this
-        # would resolve the trailing "N more" row to whatever real vendor happens to sit
-        # at that index.
-        index = self.query_one("#vendors", ListView).index or 0
-        if not 1 <= index <= self._vendor_shown_count():
-            return None
-        return self._vendors[index - 1]
-
-    def _prefill_command(self, text: str) -> None:
-        command = self.query_one("#command", Input)
-        command.value = text
-        command.cursor_position = len(text)
-        command.focus()
-
-    def _cursor_txn(self) -> Optional[queries.TxnRow]:
-        """The transaction under the table cursor, when the table has focus."""
-        table = self.query_one("#txns", DataTable)
-        if self.focused is not table:
-            return None
-        row = table.cursor_row
-        if not 0 <= row < len(self._txns):
-            return None
-        return self._txns[row]
-
-    def _prefill_for_vendor(self, verb: str) -> None:
-        """Prefill ``<verb> <raw vendor> = `` for whichever vendor is being pointed at.
-
-        In the transaction table, that is the selected transaction's vendor. Rows carry
-        the raw merchant string, so this works even for already-grouped vendors.
-        Otherwise the sidebar decides: the active vendor filter, else the highlighted row.
-        """
-        txn = self._cursor_txn()
-        if txn is not None:
-            if not txn.vendor_raw:
-                self.notify("That transaction has no vendor.", severity="warning")
-                return
-            self._prefill_command(f"{verb} {txn.vendor_raw} = ")
-            return
-
-        vendor = self._selected_vendor()
-        if vendor is None:
-            self.notify("Select a vendor in the sidebar first.", severity="warning")
-            return
-        if vendor.kind != "raw":
-            # These commands are keyed on the raw vendor string, which the sidebar no
-            # longer shows once a group exists, so we can only prefill the verb.
-            self.notify(
-                f"{vendor.name!r} is an override group — pick a raw vendor instead.",
-                severity="warning",
-            )
-            self._prefill_command(f"{verb} ")
-            return
-        self._prefill_command(f"{verb} {vendor.name} = ")
-
-    def action_drill_down(self) -> None:
-        """The right arrow's twin of enter on a statistics row, a chart bar, or a
-        trips-panel row."""
-        if self._panel == "chart":
-            table = self.query_one("#chart", DataTable)
-            self._drill_into_bar(table.cursor_row)
-            return
-        if self._panel == "trips":
-            table = self.query_one("#trip_table", DataTable)
-            self._drill_into_trip_row(table.cursor_row)
-            return
-        table = self.query_one("#stats_table", DataTable)
-        self._drill_into_category(table.cursor_row)
-
-    def action_drill_up(self) -> None:
-        """The left arrow's "back" out of a statistics or chart drill-down."""
-        self._go_back_from_drill()
-
-    def action_toggle_stats_fold(self) -> None:
-        """Space on a statistics row: fold/unfold its subtree.
-
-        Same key, on the trips panel, folds/unfolds a trip's buckets instead --
-        see check_action() for the gate and _toggle_trip_fold() for what it does.
-        """
-        if self._panel == "trips":
-            table = self.query_one("#trip_table", DataTable)
-            self._toggle_trip_fold(table.cursor_row)
-            return
-        table = self.query_one("#stats_table", DataTable)
-        self._toggle_fold(table.cursor_row)
-
-    def action_toggle_all_stats_folds(self) -> None:
-        """``f``: fold/unfold every group in the statistics table, or every trip in
-        the trips panel. See check_action()."""
-        if self._panel == "trips":
-            self._toggle_trip_fold_all()
-            return
-        self._toggle_fold_all()
-
-    def action_toggle_selected(self) -> None:
-        """``x`` on the transactions table: select/deselect the row under the cursor.
-
-        See check_action() for the gate, and _toggle_txn_selected() for what it does.
-        """
-        table = self.query_one("#txns", DataTable)
-        self._toggle_txn_selected(table.cursor_row)
-
-    def action_cycle_bucket(self) -> None:
-        """``b``: on the chart, step day → week → month → day; on the pie, step
-        week → month → year → week. See check_action() for which panel gets which.
-
-        A cycle rather than three keys, and it does not skip a bucket that would be
-        unwieldy for the window: charting two years by day is a bad idea but it is the
-        user's to make, and a key that silently refuses to do anything is worse.
-        """
-        if self._panel == "pie":
-            if self.window is None:
-                return
-            order = _SHARE_BUCKETS
-            self._pie_bucket = order[(order.index(self._pie_bucket) + 1) % len(order)]
-            self._redraw_pie()
-            return
-        if self.window is None or self._bucket is None:
-            return
-        order = _CHART_BUCKETS
-        self._bucket = order[(order.index(self._bucket) + 1) % len(order)]
-        self._redraw_chart()
-
-    def action_cycle_measure(self) -> None:
-        """``m`` on the chart: step net → spending → income → net. See check_action()."""
-        if self.window is None:
-            return
-        order = charts.MEASURES
-        self._measure = order[(order.index(self._measure) + 1) % len(order)]
-        self._redraw_chart()
-
-    def _redraw_chart(self) -> None:
-        self._build_chart()
-        self._fill_chart()
-        self._refresh_status()
-
-    def _redraw_pie(self) -> None:
-        """The report is unaffected by which bucket is charted, so only the per-bucket
-        series and the stacked chart built from it need rebuilding."""
-        self._build_pie()
-        self._fill_pie()
-        self._refresh_status()
-
-    def action_rename_vendor(self) -> None:
-        # A non-empty selection wins: bulk-editing several rows is what ctrl+n is for
-        # once any are checked, over renaming just the one under the cursor.
-        if self._selected_ids:
-            self._prefill_command("sel vendor = ")
-            return
-        self._prefill_for_vendor("rename")
-
-    def action_categorize_vendor(self) -> None:
-        if self._selected_ids:
-            self._prefill_command("sel category = ")
-            return
-        self._prefill_for_vendor("categorize")
-
-    def action_show_transactions(self) -> None:
-        # Escape is the general-purpose "leave this view" key, so it drops the
-        # drill-down's back-link even when the panel is already "txns".
-        self._set_drilled_from(None)
-        if self._setup is not None:
-            self.notify(f"Setup for {self._setup.path.name} cancelled.")
-            self._cancel_setup()
+        self._drill_origin = origin
+        self.screen.refresh_bindings()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        text = event.value
+        event.input.value = ""
+        if self._setup is not None and self._setup.question is not None:
+            self._answer_setup(text)
             return
         if self._range_pending:
-            self.notify("Custom range cancelled.")
-            self._cancel_range()
+            self._answer_range(text)
             return
         if self._pending_unimport is not None:
-            self.notify("Unimport cancelled.")
-            self._cancel_unimport()
+            self._answer_unimport(text)
             return
         if self._pending_category is not None:
-            self.notify("Category move cancelled.")
-            self._cancel_category()
+            self._answer_category(text)
             return
         if self._pending_category_merge is not None:
-            self.notify("Merge cancelled.")
-            self._cancel_category_merge()
+            self._answer_category_merge(text)
             return
-        if self._panel != "txns":
-            self._set_panel("txns")
+        self._run_command(text.strip())
 
-    def action_refresh(self) -> None:
+    def _do_refresh(self, arg: str) -> None:
         self.reload()
+        self.notify("Refreshed.")
 
-    def action_clear_filters(self) -> None:
-        self._set_drilled_from(None)
-        self.account_filter = None
-        self.vendor_filter = None
-        self.category_filter = None
-        self.text_filter = None
-        self.date_filter = None
-        self.tag_filter = None
-        self.trip_filter = None
-        self.category_ids_filter = None
-        self.reload()
-        self.notify("Filters cleared.")
+    def _run_command(self, command: str) -> None:
+        if not command:
+            return
+        parts = command.split(maxsplit=1)
+        name = parts[0].lower()
+        arg = parts[1].strip() if len(parts) > 1 else ""
+
+        if name in {"quit", "q", "exit"}:
+            self.exit()
+            return
+        if name == "help":
+            self._show_help()
+            return
+
+        # name -> handler(arg). Built per call (cheap: ~25 entries, only on Enter) so
+        # every handler can be a plain bound method; aliases just appear twice.
+        handlers: Dict[str, Callable[[str], None]] = {
+            "refresh": self._do_refresh,
+            "all": lambda arg: self.action_clear_filters(),
+            "clear": lambda arg: self.action_clear_filters(),
+            "section": self._do_section,
+            "import": self._do_import,
+            "unimport": self._do_unimport,
+            "format": self._do_format,
+            "rename": self._do_rename,
+            "rule": self._do_rule,
+            "rules": lambda arg: self._show_rules(),
+            "categorize": self._do_categorize,
+            "categorise": self._do_categorize,
+            "cat": self._do_categorize,
+            "category": self._do_category,
+            "sel": self._do_sel,
+            "transfers": self._do_transfers,
+            "merge": self._do_merge,
+            "filter": self._do_filter,
+            "stats": self._do_stats,
+            "chart": self._do_chart,
+            "graph": self._do_chart,
+            "pie": self._do_pie,
+            "trips": lambda arg: self._show_trips(),
+            "trip": self._do_trip,
+            "rates": self._do_rates,
+            "sync": self._do_sync,
+            "sort": self._do_sort,
+        }
+        handler = handlers.get(name)
+        if handler is None:
+            self.notify(f"Unknown command: {name}", severity="warning")
+            return
+        handler(arg)
+
+    def _show_help(self) -> None:
+        self.notify(
+            "import — browse data/to_import; enter imports the selected file,\n"
+            "  and lists past imports (with their id) below the candidates\n"
+            "import all | import <path> — import without browsing\n"
+            "unimport <id> — delete a past import and its transactions;\n"
+            "  asks for confirmation, naming what it will destroy\n"
+            "format — list learned CSV layouts and their amount polarity\n"
+            "format <name> invert on|off — flip whether a positive amount means\n"
+            "  money out for that layout (future imports only; fix a bad import\n"
+            "  with unimport, then re-import)\n"
+            "rename <raw vendor> = <display name> — override / aggregate a vendor\n"
+            "rule <pattern> = <display name> — rename every matching vendor,\n"
+            "  now and on future imports (e.g. rule Kindle Svcs* = Kindle)\n"
+            "rules — list the rules you have defined (escape returns)\n"
+            "categorize <vendor> = <category> — categorize that vendor's\n"
+            "  transactions by hand (cat is short for categorize)\n"
+            "categorize <vendor> = — undo a manual category\n"
+            "rule categorize <pattern> = <category> — categorize every matching\n"
+            "  vendor, now and on future imports (e.g. rule categorize *COFFEE* =\n"
+            "  Dining)\n"
+            "categorize rules — list the rules you have defined (escape returns)\n"
+            "category Food > Dining > Restaurants — build/move a category into\n"
+            "  that spot, creating any missing levels\n"
+            "category Dining — move an existing category to the top level\n"
+            "  category names are unique across the whole tree, so if that would\n"
+            "  move an existing category rather than create one, you are asked to\n"
+            "  confirm what would move; a genuinely separate category needs its\n"
+            "  own distinct name, e.g. 'Dining (Travel)'\n"
+            "category | category list — show the category tree, indented\n"
+            "category merge <source> = <target> — fold one category into another:\n"
+            "  repoints its transactions, rules, and children, then deletes it\n"
+            "  (asks for confirmation, naming what will move)\n"
+            "section <name> — expand that sidebar section (accounts, vendors,\n"
+            "  categories, tags, trips), collapsing the rest; any unambiguous\n"
+            "  prefix works, e.g. section cat. Click a heading to do the same\n"
+            "x, or clicking a row — select/deselect a transaction for bulk edits\n"
+            "sel all — select every transaction currently listed\n"
+            "sel none — clear the selection\n"
+            "sel category = <name> — categorize everything selected (blank undoes)\n"
+            "sel vendor = <name> — point everything selected at that vendor\n"
+            "sel tag = <name> / sel untag = <name> — add or remove a tag\n"
+            "sel trip = <name> — put everything selected on a trip, replacing any\n"
+            "  other trip; sel untrip takes them off it\n"
+            "sel transfer — mark the 2 selected rows (one out, one in) as a\n"
+            "  transfer; any fee is split off and still counts as spending.\n"
+            "  sel untransfer undoes it\n"
+            "sel exclude — leave the selected rows out of every income and\n"
+            "  spending figure (greyed out, tagged #excluded), e.g. an ACATS move;\n"
+            "  sel include counts them again\n"
+            "  the selection survives an edit, so you can set a category and then\n"
+            "  a tag on the same rows without reselecting\n"
+            "  ctrl+n / ctrl+t prefill 'sel vendor = ' / 'sel category = ' once\n"
+            "  anything is selected, in place of their usual per-vendor behavior\n"
+            "transfers — pair up movements between your own accounts\n"
+            "transfers same-account — also pair legs within the same account;\n"
+            "  off by default, since it makes an accidental false pairing more\n"
+            "  likely (for providers whose sub-accounts you track as one account)\n"
+            "transfers reset — un-pair everything transfers detected\n"
+            "merge <account> = <account> — fold one account into another\n"
+            "filter <text> — search description, vendor, and raw name\n"
+            "filter vendor:<text> — search one field (description/vendor/raw)\n"
+            "filter — clear the text filter\n"
+            "sort size — this view, largest amounts first (in or out); changing\n"
+            "  a filter or leaving the transactions returns to date order\n"
+            "sort date — back to newest first\n"
+            "stats — pick a period, then see spending per category\n"
+            "stats <period> — skip the picker (e.g. stats 6m, stats 1 year,\n"
+            f"  stats {periods_panel.RANGE_EXAMPLE})\n"
+            "  enter, or the right arrow, on a category row lists that window's\n"
+            "  transactions; the left arrow goes back to the breakdown\n"
+            "  space, on a category row with children, folds/unfolds its subtree\n"
+            "  f folds/unfolds every group at once\n"
+            "chart — pick a period, then see money per day/week/month as bars\n"
+            "chart <period> [day|week|month] [net|spending|income] — skip the\n"
+            "  picker, set the bar width and what the bars measure (e.g.\n"
+            "  chart 1y month spending); the bucket defaults to the period's\n"
+            "  length. b cycles the bucket, m the measure. graph = chart\n"
+            "  net draws either side of a centre line: money out to the left,\n"
+            "  money in to the right, so an even month sits on the line\n"
+            "  click a category in the sidebar to chart just that category\n"
+            "  enter, or the right arrow, on a bar lists that bucket's\n"
+            "  transactions; the left arrow goes back to the chart\n"
+            "pie — pick a period, then see each category's share of spending as\n"
+            "  one bar for the whole window, plus one bar per bucket beneath it\n"
+            "  showing the same breakdown over time, all in the same colors\n"
+            "pie <period> — skip the picker (e.g. pie 6m, pie 1 year)\n"
+            "  b cycles the bucket: week, month (default), year — no daily\n"
+            "  only categories with real net spend get a segment — a category\n"
+            "  that is all refund, or a window with no spending, draws none;\n"
+            "  small categories fold into Other\n"
+            "trips — see each trip's dates, cost, and a travel-bucket breakdown\n"
+            "  as a color bar (trip buckets lists the buckets themselves)\n"
+            "  space folds/unfolds a trip into its buckets; f folds/unfolds every\n"
+            "  trip at once\n"
+            "  enter, or the right arrow, on a trip row lists that trip's\n"
+            "  transactions; on an unfolded bucket row, just that bucket's; the\n"
+            "  left arrow goes back to the trips panel\n"
+            "trip bucket <categories> = <bucket> — map category spending into a\n"
+            "  travel bucket; comma-separate several categories at once, e.g.\n"
+            "  trip bucket Car Rental, Taxi = car — a blank bucket unmaps it\n"
+            "trip buckets — show the bucket map, grouped by bucket\n"
+            "trip dates <trip> = <start>..<end> — set a trip's dates by hand, when\n"
+            "  the ones taken from its transactions are wrong (a flight booked\n"
+            "  months ahead drags the start back). Leave either side of the '..'\n"
+            "  empty to set just the other; a blank right-hand side derives both\n"
+            "  again. Derived dates show dimmed with a '*'\n"
+            "rates — list cached exchange rates (pair, source, span, count)\n"
+            "rates fetch — cache ECB reference rates for every foreign currency\n"
+            "  on file, over its whole date range; runs in the background so the\n"
+            "  app stays responsive (an import does this on its own already)\n"
+            "sync — pull new transactions from every sync connection (SimpleFIN, Synci),\n"
+            "  in the background; connect one first with 'budget sync connect' in\n"
+            "  a terminal (it asks for a one-time token on a hidden prompt, so\n"
+            "  that step stays CLI-only)\n"
+            "sync preview — show what a sync would do without writing anything\n"
+            "  (sync dry is a synonym)\n"
+            "all — clear filters   refresh — reload   quit — exit\n"
+            "Click a row in an open sidebar section — account, vendor, category,\n"
+            "  tag, or trip — to filter by it.\n"
+            "ctrl+n / ctrl+t — prefill rename / categorize for the selected\n"
+            "  transaction's vendor, or for the selected vendor in the sidebar.",
+            title="Commands",
+            timeout=8,
+        )
 
 
 def run() -> None:

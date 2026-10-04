@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -518,6 +518,34 @@ class _PendingInsert:
     import_hash: str
 
 
+@dataclass
+class _MappingOutcome:
+    """What one mapping's sync produced, applied to its ORM row right before this
+    connection's own commit/rollback -- never before, so a dry run's rollback discards
+    all of it together. ``synced`` is True only for a mapping that reached the fetch
+    loop (remote account present, currency ok); that is what gates touching
+    ``last_synced_at``/``synced_through`` at all, independent of whether ``status`` is
+    also set.
+    """
+
+    status: Optional[str] = None
+    error: Optional[str] = None
+    synced: bool = False
+    latest_fetched: Optional[date] = None
+
+
+@dataclass
+class _Classification:
+    """The result of classifying every mapped account's remote transactions."""
+
+    account_results: List[AccountSyncResult] = field(default_factory=list)
+    insert_buffer: List[_PendingInsert] = field(default_factory=list)
+    accounts_with_rows: set = field(default_factory=set)
+    outcomes: Dict[int, _MappingOutcome] = field(default_factory=dict)  # by mapping.id
+    inverted: List[Tuple[SyncAccount, str]] = field(default_factory=list)
+    inverted_messages: List[str] = field(default_factory=list)
+
+
 def run_sync(
     session: Session,
     name: Optional[str] = None,
@@ -562,6 +590,429 @@ def run_sync(
     ]
 
 
+def _fail_connection(
+    session: Session, mappings: Sequence[SyncAccount], message: str, dry_run: bool
+) -> None:
+    """Mark every mapping of a connection as errored and commit, for a failure that
+    happens before anything else is written -- a missing secret or a fetch failure.
+    Skipped on a dry run, since there would be nothing to roll back; the caller raises
+    either way.
+    """
+    if dry_run:
+        return
+    for mapping in mappings:
+        mapping.last_status = SYNC_ERROR
+        mapping.last_error = message
+    session.commit()
+
+
+def _build_plans(
+    session: Session, mappings: Sequence[SyncAccount], today: date, provider: Provider
+) -> Dict[str, _AccountPlan]:
+    return {
+        plan.mapping.remote_id: plan
+        for plan in (_account_start(session, mapping, today, provider) for mapping in mappings)
+    }
+
+
+def _fetch_remote(
+    session: Session,
+    connection: SyncConnection,
+    provider: Provider,
+    secret: str,
+    mappings: Sequence[SyncAccount],
+    plans: Dict[str, _AccountPlan],
+    today: date,
+    fetch: Callable[..., AccountSet],
+    dry_run: bool,
+) -> AccountSet:
+    """Fetch this connection's window. A failure here is connection-level, not
+    account-level -- the whole fetch failed, not one account's data -- so every
+    mapping is marked error (unless this is a dry run) and the exception propagates.
+    """
+    window_start = min(
+        (p.start for p in plans.values()),
+        default=today - timedelta(days=_max_lookback_days(provider)),
+    )
+    window_end = today + timedelta(days=1)
+
+    try:
+        return fetch(
+            secret,
+            start=window_start,
+            end=window_end,
+            account_ids=[m.remote_id for m in mappings],
+        )
+    except AuthFailed as error:
+        message = (
+            f"Access for connection {connection.name!r} was revoked; run "
+            f"'budget sync connect' again. ({error})"
+        )
+        _fail_connection(session, mappings, message, dry_run)
+        raise SyncError(message) from error
+    except SimpleFINError as error:
+        _fail_connection(session, mappings, str(error), dry_run)
+        raise
+
+
+def _currency_issue(
+    remote_account: RemoteAccount, local_account: Account, local_currency: Currency
+) -> Optional[str]:
+    """None, or why this account can't be synced into ``local_account`` as-is."""
+    if _is_url_currency(remote_account.currency):
+        return (
+            f"{remote_account.name!r} uses a custom currency "
+            f"({remote_account.currency}), which this app cannot record; skipped."
+        )
+    if local_currency.value != remote_account.currency:
+        return (
+            f"{remote_account.name!r} is {remote_account.currency} but local "
+            f"account {local_account.name!r} is {local_currency.value}; skipped."
+        )
+    return None
+
+
+def _collect_account_inserts(
+    session: Session,
+    plan: _AccountPlan,
+    local_account: Account,
+    local_currency: Currency,
+    remote_account: RemoteAccount,
+    claimed_csv_ids: set,
+    account_result: AccountSyncResult,
+) -> Tuple[List[_PendingInsert], List[RemoteTransaction]]:
+    """Walk one account's remote transactions, updating ``account_result``'s counters
+    as it goes, and return the rows that are genuinely new -- not already synced
+    (``import_hash`` present), not matched to an existing CSV row -- alongside every
+    non-pending row considered, which the caller needs for ``synced_through``.
+    """
+    # Pending rows are kept regardless of date -- their ``posted`` is the epoch (1970)
+    # -- so the loop below can count them as skipped rather than silently dropping
+    # them here.
+    #
+    # Filtered on ``posted``, not ``transacted``/``txn_date`` -- the server's own
+    # start-date filter works on posted dates, and so must ours: a charge that
+    # stays pending for a while posts well after its purchase date, and by the time
+    # it posts, ``plan.start`` (anchored on synced_through) may have moved past its
+    # purchase date already. Filtering on the purchase date would then drop it on
+    # every sync from here on, having never been inserted while pending. The row
+    # that gets inserted still carries ``txn_date = transacted or posted`` (see
+    # below) -- only which rows make it into the window changes here.
+    txns_in_window = [
+        t for t in remote_account.transactions if t.pending or t.posted >= plan.start
+    ]
+
+    account_inserts: List[_PendingInsert] = []
+    for txn in txns_in_window:
+        if txn.pending:
+            account_result.skipped_pending += 1
+            continue
+        account_result.fetched += 1
+        txn_date = txn.transacted or txn.posted
+        import_hash = importer._row_hash("simplefin", remote_account.id, txn.id)
+        already = session.scalar(
+            select(Transaction.id).where(Transaction.import_hash == import_hash)
+        )
+        if already is not None:
+            account_result.already_synced += 1
+            continue
+
+        scale = 10 ** local_currency.decimal_places
+        value_minor = int((txn.amount * scale).to_integral_value())
+
+        match_id = _find_csv_match(
+            session, local_account.id, value_minor, txn_date, claimed_csv_ids
+        )
+        if match_id is not None:
+            claimed_csv_ids.add(match_id)
+            account_result.matched_existing += 1
+            continue
+
+        account_inserts.append(
+            _PendingInsert(
+                local_account=local_account,
+                currency=local_currency,
+                remote_txn=txn,
+                txn_date=txn_date,
+                value_minor=value_minor,
+                import_hash=import_hash,
+            )
+        )
+        account_result.inserted += 1
+        if plan.cutoff is not None and txn_date <= plan.cutoff:
+            account_result.inserted_before_cutoff += 1
+
+    return account_inserts, txns_in_window
+
+
+def _add_coverage_warning(
+    remote_account: RemoteAccount, plan: _AccountPlan, account_result: AccountSyncResult
+) -> None:
+    """Flag when the raw (unwindowed) response doesn't reach back to the anchor --
+    SimpleFIN can return less history than asked for. Worded "could not confirm", not
+    "gap": a genuinely low-volume account can trigger this honestly with nothing
+    actually missing.
+    """
+    if plan.anchor is None:
+        return
+    posted_all = [t for t in remote_account.transactions if not t.pending]
+    if not posted_all:
+        account_result.warnings.append(
+            f"Could not confirm the data reaches back to "
+            f"{plan.anchor.isoformat()}; no transactions were returned for "
+            "this account, so there may be a gap."
+        )
+        account_result.gap_warning = True
+        return
+    earliest = min(t.transacted or t.posted for t in posted_all)
+    if earliest > plan.anchor:
+        account_result.warnings.append(
+            f"Could not confirm the data reaches back to "
+            f"{plan.anchor.isoformat()}; the earliest transaction "
+            f"received was {earliest.isoformat()}, so there may be a gap "
+            "between them."
+        )
+        account_result.gap_warning = True
+
+
+def _sign_inversion_message(
+    session: Session,
+    local_account: Account,
+    remote_account: RemoteAccount,
+    plan: _AccountPlan,
+    account_inserts: Sequence[_PendingInsert],
+    claimed_csv_ids: set,
+) -> Optional[str]:
+    """None, or a message if unmatched rows inside the CSV-overlap window would mostly
+    match if the amount were negated -- the provider's sign convention is backwards,
+    not that 15+ purchases all genuinely vanished (Amex's polarity was wrong once
+    already).
+    """
+    if plan.cutoff is None:
+        return None
+    overlap_unmatched = [i for i in account_inserts if i.txn_date <= plan.cutoff]
+    if len(overlap_unmatched) < 3:
+        return None
+    flipped = sum(
+        1
+        for item in overlap_unmatched
+        if _find_csv_match(
+            session, local_account.id, -item.value_minor, item.txn_date, claimed_csv_ids
+        )
+        is not None
+    )
+    if flipped * 2 < len(overlap_unmatched):
+        return None
+    return (
+        f"{remote_account.name!r}: {flipped} of "
+        f"{len(overlap_unmatched)} unmatched transactions would match "
+        "the existing CSV rows with the amount sign flipped. The "
+        "provider's sign convention looks inverted."
+    )
+
+
+def _classify_accounts(
+    session: Session,
+    plans: Dict[str, _AccountPlan],
+    remote_by_id: Dict[str, RemoteAccount],
+    account_set: AccountSet,
+    provider: Provider,
+) -> _Classification:
+    """Classify every mapped account's remote transactions into already-synced,
+    matched-to-a-CSV-row, and genuinely new, and collect the coverage/sign-inversion
+    warnings that come with it. Writes nothing; the caller decides what to do with the
+    result.
+    """
+    classification = _Classification()
+    claimed_csv_ids: set = set()
+
+    for remote_id, plan in plans.items():
+        mapping = plan.mapping
+        local_account = session.get(Account, mapping.account_id)
+        account_result = AccountSyncResult(
+            account_name=local_account.name,
+            remote_name=mapping.remote_name,
+            start=plan.start,
+        )
+        account_result.warnings.extend(plan.warnings)
+        account_result.gap_warning = plan.gap_warning
+        classification.account_results.append(account_result)
+
+        remote_account = remote_by_id.get(remote_id)
+        if remote_account is None:
+            # No conn_id to match on without the remote account itself; account_id is
+            # all errlist has to go on here.
+            matches = _matching_errors(account_set.errors, remote_id, None)
+            reason = (
+                _join_error_messages(matches)
+                if matches
+                else f"{mapping.remote_name!r} was not returned by {provider.label}."
+            )
+            classification.outcomes[mapping.id] = _MappingOutcome(
+                status=SYNC_ERROR, error=reason
+            )
+            continue
+
+        local_currency = session.get(Currency, local_account.currency_id)
+        issue = _currency_issue(remote_account, local_account, local_currency)
+        if issue is not None:
+            account_result.warnings.append(issue)
+            classification.outcomes[mapping.id] = _MappingOutcome(
+                status=SYNC_ERROR, error=issue
+            )
+            continue
+
+        account_inserts, txns_in_window = _collect_account_inserts(
+            session,
+            plan,
+            local_account,
+            local_currency,
+            remote_account,
+            claimed_csv_ids,
+            account_result,
+        )
+
+        # The account was returned, but a provider can still flag its connection (or
+        # the account itself) as broken alongside stale data -- e.g. SimpleFIN keeps
+        # returning a brokerage account after its link needs re-auth, with a con.auth
+        # errlist entry riding along. Presence in the response is not success.
+        account_errors = _matching_errors(
+            account_set.errors, remote_id, remote_account.conn_id
+        )
+        if account_errors:
+            status, error = SYNC_ERROR, _join_error_messages(account_errors)
+        else:
+            status, error = SYNC_OK, None
+
+        _add_coverage_warning(remote_account, plan, account_result)
+
+        inverted_message = _sign_inversion_message(
+            session, local_account, remote_account, plan, account_inserts, claimed_csv_ids
+        )
+        if inverted_message is not None:
+            account_result.warnings.append(inverted_message)
+            status, error = SYNC_ERROR, inverted_message
+            classification.inverted.append((mapping, inverted_message))
+            classification.inverted_messages.append(inverted_message)
+
+        classification.insert_buffer.extend(account_inserts)
+        if account_inserts:
+            classification.accounts_with_rows.add(local_account.id)
+
+        latest_fetched = max(
+            (t.transacted or t.posted for t in txns_in_window if not t.pending),
+            default=None,
+        )
+        classification.outcomes[mapping.id] = _MappingOutcome(
+            status=status, error=error, synced=True, latest_fetched=latest_fetched
+        )
+
+    return classification
+
+
+def _refuse_for_sign_inversion(
+    session: Session,
+    connection: SyncConnection,
+    inverted: Sequence[Tuple[SyncAccount, str]],
+    messages: Sequence[str],
+) -> None:
+    """A refusal, not a connection failure: commit only the flagged accounts' status
+    (nothing else -- no synced_through, no transactions, no other account's status)
+    and raise. Never called on a dry run; see ``_sync_one_connection``.
+    """
+    for mapping, message in inverted:
+        mapping.last_status = SYNC_ERROR
+        mapping.last_error = message
+    session.commit()
+    raise SyncError(
+        f"Connection {connection.name!r} looks sign-inverted: " + " ".join(messages)
+    )
+
+
+def _write_inserts(
+    session: Session,
+    connection: SyncConnection,
+    today: date,
+    insert_buffer: Sequence[_PendingInsert],
+    accounts_with_rows: set,
+) -> Optional[Import]:
+    """Create the Import and its Transaction rows, then run the same post-insert
+    pipeline as ``importer.import_csv`` (vendor rules, category rules, transfer
+    detection), in the same order. None if there is nothing to insert.
+    """
+    if not insert_buffer:
+        return None
+
+    import_record = Import(
+        source_file=f"sync:{connection.name} {today.isoformat()}",
+        sync_connection_id=connection.id,
+        row_count=len(insert_buffer),
+    )
+    if len(accounts_with_rows) == 1:
+        import_record.account_id = next(iter(accounts_with_rows))
+    session.add(import_record)
+    session.flush()
+
+    for item in insert_buffer:
+        description = item.remote_txn.description
+        vendor = (
+            importer._get_or_create_vendor(session, description) if description else None
+        )
+        session.add(
+            Transaction(
+                account_id=item.local_account.id,
+                category_id=None,
+                currency_id=item.currency.id,
+                import_id=import_record.id,
+                vendor_id=vendor.id if vendor else None,
+                posted_date=item.txn_date,
+                description=description,
+                raw_description=description,
+                value_minor=item.value_minor,
+                category_source="unset",
+                import_hash=item.import_hash,
+            )
+        )
+
+    # Same post-insert sequence as importer.import_csv, and in the same order.
+    from .vendors import apply_rules
+
+    apply_rules(session)
+
+    from .categories import apply_category_rules
+
+    apply_category_rules(session)
+
+    from .transfers import detect_transfers
+
+    detect_transfers(session)
+
+    return import_record
+
+
+def _apply_mapping_outcomes(
+    mappings: Sequence[SyncAccount], outcomes: Dict[int, _MappingOutcome]
+) -> None:
+    """Write every mapping's final synced_through/last_synced_at/status. Called right
+    before this connection's own commit/rollback -- never before -- so a dry run's
+    rollback discards all of it together.
+    """
+    for mapping in mappings:
+        outcome = outcomes.get(mapping.id)
+        if outcome is None:
+            continue
+        if outcome.synced:
+            if outcome.latest_fetched is not None:
+                if (
+                    mapping.synced_through is None
+                    or outcome.latest_fetched > mapping.synced_through
+                ):
+                    mapping.synced_through = outcome.latest_fetched
+            mapping.last_synced_at = datetime.utcnow()
+        if outcome.status is not None:
+            mapping.last_status, mapping.last_error = outcome.status, outcome.error
+
+
 def _sync_one_connection(
     session: Session,
     connection: SyncConnection,
@@ -571,6 +1022,11 @@ def _sync_one_connection(
     load_secret: Callable[[str], Optional[str]],
     fetch: Callable[..., AccountSet],
 ) -> SyncResult:
+    """Sync one connection: fetch its window, classify each mapped account's remote
+    transactions, refuse outright if the provider's sign convention looks inverted,
+    write whatever is left, and record status -- rolling all of it back together on a
+    dry run.
+    """
     provider = provider_of(connection)
     result = SyncResult(
         connection_name=connection.name, dry_run=dry_run, provider_label=provider.label
@@ -591,324 +1047,33 @@ def _sync_one_connection(
         # Nothing has been written yet (mappings above was only a read), so marking
         # every mapping of this connection error and committing right here is safe --
         # the function never reaches its own commit/rollback once it raises.
-        if not dry_run:
-            for mapping in mappings:
-                mapping.last_status = SYNC_ERROR
-                mapping.last_error = message
-            session.commit()
+        _fail_connection(session, mappings, message, dry_run)
         raise MissingCredentials(message)
 
-    plans = {plan.mapping.remote_id: plan for plan in (
-        _account_start(session, mapping, today, provider) for mapping in mappings
-    )}
-
-    window_start = min(
-        (p.start for p in plans.values()),
-        default=today - timedelta(days=_max_lookback_days(provider)),
+    plans = _build_plans(session, mappings, today, provider)
+    account_set = _fetch_remote(
+        session, connection, provider, secret, mappings, plans, today, fetch, dry_run
     )
-    window_end = today + timedelta(days=1)
-
-    try:
-        account_set = fetch(
-            secret,
-            start=window_start,
-            end=window_end,
-            account_ids=[m.remote_id for m in mappings],
-        )
-    except AuthFailed as error:
-        message = (
-            f"Access for connection {connection.name!r} was revoked; run "
-            f"'budget sync connect' again. ({error})"
-        )
-        if not dry_run:
-            for mapping in mappings:
-                mapping.last_status = SYNC_ERROR
-                mapping.last_error = message
-            session.commit()
-        raise SyncError(message) from error
-    except SimpleFINError as error:
-        if not dry_run:
-            for mapping in mappings:
-                mapping.last_status = SYNC_ERROR
-                mapping.last_error = str(error)
-            session.commit()
-        raise
 
     result.errors = [f"{e.code}: {e.msg}" for e in account_set.errors]
-
     remote_by_id = {a.id: a for a in account_set.accounts}
     result.unmapped = [a.name for a in account_set.accounts if a.id not in plans]
 
-    insert_buffer: List[_PendingInsert] = []
-    claimed_csv_ids: set = set()
-    accounts_with_rows: set = set()
-    sync_updates: List[tuple] = []  # (SyncAccount, latest_date_fetched_or_None)
-    inverted_messages: List[str] = []
-    inverted_accounts: List[tuple] = []  # (SyncAccount, message), for the raise below
-    # mapping.id -> (status, error), applied to every mapping right before this
-    # connection's own commit/rollback -- never before, so a dry run's rollback (or
-    # the sign-inversion raise's own narrower commit, see below) discards or skips it
-    # the same way it already does synced_through/last_synced_at.
-    status_updates: Dict[int, tuple] = {}
+    classification = _classify_accounts(session, plans, remote_by_id, account_set, provider)
+    result.accounts = classification.account_results
 
-    for remote_id, plan in plans.items():
-        mapping = plan.mapping
-        local_account = session.get(Account, mapping.account_id)
-        account_result = AccountSyncResult(
-            account_name=local_account.name,
-            remote_name=mapping.remote_name,
-            start=plan.start,
-        )
-        account_result.warnings.extend(plan.warnings)
-        account_result.gap_warning = plan.gap_warning
-
-        remote_account = remote_by_id.get(remote_id)
-        if remote_account is None:
-            # No conn_id to match on without the remote account itself; account_id is
-            # all errlist has to go on here.
-            matches = _matching_errors(account_set.errors, remote_id, None)
-            reason = (
-                _join_error_messages(matches)
-                if matches
-                else f"{mapping.remote_name!r} was not returned by {provider.label}."
-            )
-            status_updates[mapping.id] = (SYNC_ERROR, reason)
-            result.accounts.append(account_result)
-            continue
-
-        if _is_url_currency(remote_account.currency):
-            message = (
-                f"{remote_account.name!r} uses a custom currency "
-                f"({remote_account.currency}), which this app cannot record; skipped."
-            )
-            account_result.warnings.append(message)
-            status_updates[mapping.id] = (SYNC_ERROR, message)
-            result.accounts.append(account_result)
-            continue
-
-        local_currency = session.get(Currency, local_account.currency_id)
-        if local_currency.value != remote_account.currency:
-            message = (
-                f"{remote_account.name!r} is {remote_account.currency} but local "
-                f"account {local_account.name!r} is {local_currency.value}; skipped."
-            )
-            account_result.warnings.append(message)
-            status_updates[mapping.id] = (SYNC_ERROR, message)
-            result.accounts.append(account_result)
-            continue
-
-        posted_all = [t for t in remote_account.transactions if not t.pending]
-        # Pending rows are kept regardless of date -- their ``posted`` is the epoch (1970)
-        # -- so the loop below can count them as skipped rather than silently dropping
-        # them here.
-        #
-        # Filtered on ``posted``, not ``transacted``/``txn_date`` -- the server's own
-        # start-date filter works on posted dates, and so must ours: a charge that
-        # stays pending for a while posts well after its purchase date, and by the time
-        # it posts, ``plan.start`` (anchored on synced_through) may have moved past its
-        # purchase date already. Filtering on the purchase date would then drop it on
-        # every sync from here on, having never been inserted while pending. The row
-        # that gets inserted still carries ``txn_date = transacted or posted`` (see
-        # below) -- only which rows make it into the window changes here.
-        txns_in_window = [
-            t
-            for t in remote_account.transactions
-            if t.pending or t.posted >= plan.start
-        ]
-
-        account_inserts: List[_PendingInsert] = []
-        for txn in txns_in_window:
-            if txn.pending:
-                account_result.skipped_pending += 1
-                continue
-            account_result.fetched += 1
-            txn_date = txn.transacted or txn.posted
-            import_hash = importer._row_hash("simplefin", remote_account.id, txn.id)
-            already = session.scalar(
-                select(Transaction.id).where(Transaction.import_hash == import_hash)
-            )
-            if already is not None:
-                account_result.already_synced += 1
-                continue
-
-            scale = 10 ** local_currency.decimal_places
-            value_minor = int((txn.amount * scale).to_integral_value())
-
-            match_id = _find_csv_match(
-                session, local_account.id, value_minor, txn_date, claimed_csv_ids
-            )
-            if match_id is not None:
-                claimed_csv_ids.add(match_id)
-                account_result.matched_existing += 1
-                continue
-
-            account_inserts.append(
-                _PendingInsert(
-                    local_account=local_account,
-                    currency=local_currency,
-                    remote_txn=txn,
-                    txn_date=txn_date,
-                    value_minor=value_minor,
-                    import_hash=import_hash,
-                )
-            )
-            account_result.inserted += 1
-            if plan.cutoff is not None and txn_date <= plan.cutoff:
-                account_result.inserted_before_cutoff += 1
-
-        # The account was returned, but a provider can still flag its connection (or
-        # the account itself) as broken alongside stale data -- e.g. SimpleFIN keeps
-        # returning a brokerage account after its link needs re-auth, with a con.auth
-        # errlist entry riding along. Presence in the response is not success.
-        account_errors = _matching_errors(
-            account_set.errors, remote_id, remote_account.conn_id
-        )
-        if account_errors:
-            status_updates[mapping.id] = (SYNC_ERROR, _join_error_messages(account_errors))
-        else:
-            status_updates[mapping.id] = (SYNC_OK, None)
-
-        # Unconfirmed coverage: SimpleFIN can return less history than asked for. If
-        # the raw response never reaches back to the anchor, say so -- "could not
-        # confirm", not "gap", since a genuinely low-volume account can trigger this
-        # honestly with nothing actually missing.
-        if plan.anchor is not None:
-            if not posted_all:
-                account_result.warnings.append(
-                    f"Could not confirm the data reaches back to "
-                    f"{plan.anchor.isoformat()}; no transactions were returned for "
-                    "this account, so there may be a gap."
-                )
-                account_result.gap_warning = True
-            else:
-                earliest = min(t.transacted or t.posted for t in posted_all)
-                if earliest > plan.anchor:
-                    account_result.warnings.append(
-                        f"Could not confirm the data reaches back to "
-                        f"{plan.anchor.isoformat()}; the earliest transaction "
-                        f"received was {earliest.isoformat()}, so there may be a gap "
-                        "between them."
-                    )
-                    account_result.gap_warning = True
-
-        # Sign check: unmatched rows inside the CSV-overlap window that would mostly
-        # match if the amount were negated mean the provider's sign convention is
-        # backwards, not that 15+ purchases all genuinely vanished (Amex's polarity
-        # was wrong once already).
-        if plan.cutoff is not None:
-            overlap_unmatched = [i for i in account_inserts if i.txn_date <= plan.cutoff]
-            if len(overlap_unmatched) >= 3:
-                flipped = sum(
-                    1
-                    for item in overlap_unmatched
-                    if _find_csv_match(
-                        session,
-                        local_account.id,
-                        -item.value_minor,
-                        item.txn_date,
-                        claimed_csv_ids,
-                    )
-                    is not None
-                )
-                if flipped * 2 >= len(overlap_unmatched):
-                    message = (
-                        f"{remote_account.name!r}: {flipped} of "
-                        f"{len(overlap_unmatched)} unmatched transactions would match "
-                        "the existing CSV rows with the amount sign flipped. The "
-                        "provider's sign convention looks inverted."
-                    )
-                    account_result.warnings.append(message)
-                    inverted_messages.append(message)
-                    inverted_accounts.append((mapping, message))
-                    status_updates[mapping.id] = (SYNC_ERROR, message)
-
-        insert_buffer.extend(account_inserts)
-        if account_inserts:
-            accounts_with_rows.add(local_account.id)
-
-        latest_fetched = max(
-            (t.transacted or t.posted for t in txns_in_window if not t.pending),
-            default=None,
-        )
-        sync_updates.append((mapping, latest_fetched))
-
-        result.accounts.append(account_result)
-
-    if inverted_messages and not dry_run:
-        # Nothing has been written yet (everything above, including status_updates,
-        # only stages Python-side state -- see its comment), except for the inverted
-        # accounts' own status, set and committed right here: a refusal, not a
-        # connection failure, so only the accounts it actually flagged get marked, and
-        # nothing else (no synced_through, no transactions, no other account's status).
-        for mapping, message in inverted_accounts:
-            mapping.last_status = SYNC_ERROR
-            mapping.last_error = message
-        session.commit()
-        raise SyncError(
-            f"Connection {connection.name!r} looks sign-inverted: "
-            + " ".join(inverted_messages)
+    if classification.inverted_messages and not dry_run:
+        # Nothing else has been written yet -- everything in `classification` only
+        # stages Python-side state until applied below.
+        _refuse_for_sign_inversion(
+            session, connection, classification.inverted, classification.inverted_messages
         )
 
-    import_record: Optional[Import] = None
-    if insert_buffer:
-        import_record = Import(
-            source_file=f"sync:{connection.name} {today.isoformat()}",
-            sync_connection_id=connection.id,
-            row_count=len(insert_buffer),
-        )
-        if len(accounts_with_rows) == 1:
-            import_record.account_id = next(iter(accounts_with_rows))
-        session.add(import_record)
-        session.flush()
+    import_record = _write_inserts(
+        session, connection, today, classification.insert_buffer, classification.accounts_with_rows
+    )
 
-        for item in insert_buffer:
-            description = item.remote_txn.description
-            vendor = (
-                importer._get_or_create_vendor(session, description)
-                if description
-                else None
-            )
-            session.add(
-                Transaction(
-                    account_id=item.local_account.id,
-                    category_id=None,
-                    currency_id=item.currency.id,
-                    import_id=import_record.id,
-                    vendor_id=vendor.id if vendor else None,
-                    posted_date=item.txn_date,
-                    description=description,
-                    raw_description=description,
-                    value_minor=item.value_minor,
-                    category_source="unset",
-                    import_hash=item.import_hash,
-                )
-            )
-
-        # Same post-insert sequence as importer.import_csv, and in the same order.
-        from .vendors import apply_rules
-
-        apply_rules(session)
-
-        from .categories import apply_category_rules
-
-        apply_category_rules(session)
-
-        from .transfers import detect_transfers
-
-        detect_transfers(session)
-
-    for mapping, latest_fetched in sync_updates:
-        if latest_fetched is not None:
-            if mapping.synced_through is None or latest_fetched > mapping.synced_through:
-                mapping.synced_through = latest_fetched
-        mapping.last_synced_at = datetime.utcnow()
-
-    # Set unconditionally, same as synced_through/last_synced_at above -- a dry run's
-    # rollback below discards it along with everything else.
-    for mapping in mappings:
-        update = status_updates.get(mapping.id)
-        if update is not None:
-            mapping.last_status, mapping.last_error = update
+    _apply_mapping_outcomes(mappings, classification.outcomes)
     session.flush()
 
     # Grabbed before the possible rollback below, which expires every ORM attribute.
