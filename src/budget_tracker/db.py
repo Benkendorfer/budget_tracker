@@ -66,6 +66,12 @@ _ADDED_COLUMNS = {
         # one defined before now was USD, so that is the correct value to backfill.
         "currency": "VARCHAR NOT NULL DEFAULT 'USD'",
     },
+    # NULL on every pre-existing row, which is correct: nothing imported before sync
+    # existed could have come from one. The referenced table (sync_connection) may not
+    # exist yet on an old database -- this runs before create_all() -- but SQLite does
+    # not validate a REFERENCES target at ALTER TABLE time, only at DML time, so adding
+    # the column first and creating the table after is safe (see test_sync.py).
+    "import": {"sync_connection_id": "INTEGER REFERENCES sync_connection(id)"},
 }
 
 

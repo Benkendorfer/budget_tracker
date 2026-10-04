@@ -183,9 +183,64 @@ class Import(Base):
     account_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("account.id"), default=None
     )
+    # NULL for a CSV import; set to the connection that wrote it for a sync import.
+    # This is the one place sync vs. CSV origin is recorded -- see :mod:`.sync`.
+    sync_connection_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("sync_connection.id"), default=None
+    )
     source_file: Mapped[str] = mapped_column(String)
     row_count: Mapped[int] = mapped_column(default=0)
     imported_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class SyncConnection(Base):
+    """One claimed SimpleFIN (or compatible) access URL.
+
+    The access URL itself lives in the OS keychain (:mod:`.credentials`), keyed by
+    ``name`` -- never in this table or anywhere else in the database.
+    """
+
+    __tablename__ = "sync_connection"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String, unique=True)
+    provider: Mapped[str] = mapped_column(String, default="simplefin")
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class SyncAccount(Base):
+    """Which local :class:`Account` a remote account's transactions land in.
+
+    ``synced_through`` is the high-water mark a *successful, non-dry* sync leaves
+    behind -- the next sync re-fetches a few days before it (see
+    :data:`.sync.OVERLAP_DAYS`) rather than picking up exactly where it left off, since
+    a provider can still be settling a transaction's final posted date days later.
+
+    One local account holds at most one remote account's data (the second unique
+    constraint), so two remote accounts can never both write into it and double its
+    totals.
+    """
+
+    __tablename__ = "sync_account"
+    __table_args__ = (
+        UniqueConstraint(
+            "connection_id", "remote_id", name="uq_sync_account_connection_remote"
+        ),
+        UniqueConstraint("account_id", name="uq_sync_account_account"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    connection_id: Mapped[int] = mapped_column(
+        ForeignKey("sync_connection.id", ondelete="CASCADE")
+    )
+    remote_id: Mapped[str] = mapped_column(String)
+    remote_name: Mapped[str] = mapped_column(String)
+    account_id: Mapped[int] = mapped_column(ForeignKey("account.id"))
+    synced_through: Mapped[Optional[date]] = mapped_column(default=None)
+    last_synced_at: Mapped[Optional[datetime]] = mapped_column(default=None)
+
+    connection: Mapped[SyncConnection] = relationship()
+    account: Mapped[Account] = relationship()
 
 
 class Transaction(Base):

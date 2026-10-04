@@ -3,8 +3,9 @@
 The parser wires each subcommand to its handler; the handlers themselves live in the
 command-family modules alongside this one (``import_cmds.py``, ``list_cmd.py``,
 ``vendors.py``, ``categories.py``, ``accounts.py``, ``transfers.py``, ``formats.py``,
-``rates.py``, ``tags.py``). This module only assembles argparse structure — no handler
-logic — so it stays readable as the single place every subcommand is registered.
+``rates.py``, ``tags.py``, ``sync.py``). This module only assembles argparse structure
+— no handler logic — so it stays readable as the single place every subcommand is
+registered.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from datetime import date, datetime
 from typing import List, Optional
 
 from .. import queries
+from .. import sync as sync_module
 from .. import tags as tags_module
 from .. import transfers as transfers_module
 from .accounts import _cmd_account
@@ -23,6 +25,7 @@ from .formats import _cmd_format
 from .import_cmds import _cmd_import, _cmd_imports, _cmd_unimport
 from .list_cmd import _cmd_list
 from .rates import _cmd_rates
+from .sync import _cmd_sync
 from .tags import _cmd_tags
 from .transfers import _cmd_transfers
 from .trips import _cmd_trips
@@ -461,6 +464,59 @@ def build_parser() -> argparse.ArgumentParser:
     rule_subparsers.add_parser("list", help="Show every rule (default).")
     rule_subparsers.add_parser(
         "apply", help="Re-run all rules, e.g. after importing outside the app."
+    )
+
+    sync_parser = subparsers.add_parser(
+        "sync",
+        help=(
+            "Pull new transactions from a SimpleFIN connection (default: every "
+            "connection on file); see 'budget sync connect' to set one up."
+        ),
+    )
+    sync_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would change without writing anything.",
+    )
+    sync_parser.add_argument(
+        "--connection",
+        help="Sync only this connection (default: every connection on file).",
+    )
+    sync_parser.set_defaults(func=_cmd_sync, sync_command="run")
+    sync_subparsers = sync_parser.add_subparsers(dest="sync_command")
+
+    sync_connect = sync_subparsers.add_parser(
+        "connect",
+        help=(
+            "Claim a SimpleFIN setup token and map its accounts (the token is read "
+            "from a hidden prompt, never a flag)."
+        ),
+    )
+    sync_connect.add_argument(
+        "--name",
+        help=f"Name for this connection (default: {sync_module.DEFAULT_CONNECTION!r}).",
+    )
+
+    sync_map = sync_subparsers.add_parser(
+        "map",
+        help="Map (or re-map) a connection's remote accounts to local accounts.",
+    )
+    sync_map.add_argument(
+        "--connection",
+        help=f"Which connection to map (default: {sync_module.DEFAULT_CONNECTION!r}).",
+    )
+
+    sync_subparsers.add_parser(
+        "status", help="List every connection's mappings and last sync time."
+    )
+
+    sync_disconnect = sync_subparsers.add_parser(
+        "disconnect",
+        help="Remove a connection and its keychain entry (keeps its transactions).",
+    )
+    sync_disconnect.add_argument(
+        "--name",
+        help=f"Which connection to remove (default: {sync_module.DEFAULT_CONNECTION!r}).",
     )
 
     return parser

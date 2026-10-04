@@ -113,6 +113,7 @@ vendor not listed. Type commands into the bar at the bottom:
 | `transfers same-account` | Also pair legs within the same account (see below); off by default |
 | `rates` | List cached exchange rates: pair, source, date span, count (see below) |
 | `rates fetch` | Cache ECB reference rates for every foreign currency on file, over its whole date range; runs in the background so the app stays responsive (an import does this on its own already — see below) |
+| `sync` | Pull new transactions from every SimpleFIN connection in the background; `sync preview` shows what would change without writing. Connecting is done from the terminal (`budget sync connect`) (see below) |
 | `rules` | Open the rules panel — both kinds of rule (`rule` on its own does the same); `escape` returns |
 | `all` | Clear all filters |
 | `refresh` | Reload from the database |
@@ -250,6 +251,15 @@ budget rates set USD CHF 0.805 --on 2025-12-02
 budget transfers --days 5
 budget transfers --same-account   # also pair legs within one account (see below)
 budget transfers --reset
+
+# SimpleFIN sync: connect once (setup token is prompted, hidden -- never a flag),
+# then pull new transactions (see "Syncing from SimpleFIN" below).
+budget sync connect
+budget sync --dry-run           # see what the next sync would do, without writing
+budget sync                     # sync every connection
+budget sync status
+budget sync map                 # re-map a connection's accounts
+budget sync disconnect
 ```
 
 `budget --help`, or `budget <subcommand> --help`, documents every flag.
@@ -1025,6 +1035,74 @@ Dropping statements into `data/to_import/` lets you import them without typing p
 `import all` in the app imports every recognized file in one go and reports the ones that
 need setup rather than stopping.
 
+### Syncing from SimpleFIN
+
+[SimpleFIN](https://www.simplefin.org/) is a **read-only** aggregator: it links to your
+bank on your behalf and hands this app transactions, never credentials to move money.
+`budget sync` pulls whatever is new since the last sync (or the last CSV import) into the
+same pipeline a CSV import uses, so renames, rules, categories, and transfer detection all
+apply the same way regardless of where a transaction came from.
+
+**Setup**, once per bank account:
+
+1. Subscribe at SimpleFIN Bridge and connect your bank there (SimpleFIN's own site, not
+   this app).
+2. Run `budget sync connect`. It prompts for the setup token at a **hidden** input —
+   never type it as a command-line argument, where it would sit in your shell history
+   and be visible to anyone on the machine with `ps`. Paste it and press enter.
+3. A setup token works **once**; claiming it hands back a long-lived access credential,
+   which the app then walks you through: for each remote account it shows the name,
+   currency, and balance, and offers your existing accounts in that same currency to map
+   it to, plus the option to create a new one or skip it for now.
+4. Run `budget sync --dry-run` first, to see what the first sync would do before it
+   writes anything.
+
+The access credential lives **only** in the macOS Keychain — service `budget-tracker`,
+entry `sync:<name>` — never in this repository or in `data/budget.db`. Nothing about
+your bank or its credentials is ever committed.
+
+**Overlap with CSV history.** A first sync usually happens well after the last CSV
+import, and SimpleFIN cannot know which of the transactions in that gap the CSV already
+recorded. Every sync therefore re-fetches starting 10 days before its own high-water mark
+— the last sync's cutoff, or the latest CSV-imported transaction on a first run — and
+matches each remote row against an existing CSV-imported one by account, amount, and
+date within ±3 days before ever inserting it as new. A match is skipped, not duplicated.
+
+**Warnings**, printed per account and never a refusal on their own:
+
+- A **definite gap**: the account's history reaches further back than SimpleFIN's
+  90-day window can still see, so some days are permanently unreachable and need a CSV
+  import if you want them.
+- A **thin overlap**: the 90-day window did reach the high-water mark, but with less
+  than the usual 10 days of re-checked overlap before it.
+- **Could not confirm coverage**: SimpleFIN returned less history than asked for, so the
+  sync cannot tell whether everything back to the high-water mark truly came back.
+
+The one thing sync *does* refuse outright is a provider whose sign convention looks
+inverted — several unmatched transactions that would mostly match the existing CSV rows
+with the amount flipped. That is a sign of a polarity bug (an Amex connection surfaced
+exactly this once), not fifteen purchases that vanished, so a real run stops before
+writing anything rather than importing everything backwards; a dry run still shows the
+warning so you can see it coming.
+
+SimpleFIN refreshes roughly daily and only ever holds up to 90 days of history, so sync
+is a complement to CSV imports, not a replacement for your bank's own statements.
+
+**Day to day:**
+
+```bash
+budget sync status       # every connection's mappings, synced-through date, last run
+budget sync map          # map more accounts, or re-map one (shows the current mapping)
+budget sync              # pull new transactions from every connection
+budget sync disconnect   # remove a connection and its keychain entry (keeps transactions)
+```
+
+Undo a sync the same way you would a CSV import — `budget imports` shows it (its source
+file reads `sync:<name> <date>`) and `budget unimport <id>` removes it.
+
+Other servers that speak the SimpleFIN protocol (Synci, for UK and European banks) work
+exactly the same way under a different `--name`, e.g. `budget sync connect --name synci`.
+
 ### Where the data lives
 
 The SQLite database is created on first run at `data/budget.db`, and the tables are
@@ -1268,3 +1346,9 @@ erDiagram
 ## Data protection / security
 
 All user data is stored in the `data/` directory, which is `.gitignored`. Within that directory, all user data is stored locally.
+
+**SimpleFIN sync** is the one exception to "everything lives in `data/`": the access
+credential a sync connection claims is never written to the database or anywhere in this
+repository. It lives only in the OS keychain (the `keyring` package; the macOS Keychain
+on this machine), under service `budget-tracker` and an entry named `sync:<connection
+name>` — removed from the keychain the moment you `budget sync disconnect`.
