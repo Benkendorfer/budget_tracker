@@ -18,3 +18,5 @@ __pycache__/
 .pytest_cache/
 build/
 dist/
+
+budget
