@@ -488,13 +488,30 @@ def build_parser() -> argparse.ArgumentParser:
     sync_connect = sync_subparsers.add_parser(
         "connect",
         help=(
-            "Claim a SimpleFIN setup token and map its accounts (the token is read "
-            "from a hidden prompt, never a flag)."
+            "Claim a SimpleFIN or Synci setup token and map its accounts (the token "
+            "is read from a hidden prompt, never a flag)."
+        ),
+    )
+    sync_connect.add_argument(
+        "--provider",
+        choices=sorted(sync_module.PROVIDERS),
+        default="simplefin",
+        help=(
+            "Which SimpleFIN-protocol server the token is from: simplefin (SimpleFIN "
+            "Bridge, US/Canada) or synci (UK/EU banks). Default: simplefin."
         ),
     )
     sync_connect.add_argument(
         "--name",
-        help=f"Name for this connection (default: {sync_module.DEFAULT_CONNECTION!r}).",
+        help="Name for this connection (default: the provider's name).",
+    )
+    sync_connect.add_argument(
+        "--clipboard",
+        action="store_true",
+        help=(
+            "Read the setup token from the clipboard instead of the hidden prompt "
+            "(copy it first). For tokens too long, or too awkward, to paste."
+        ),
     )
 
     sync_map = sync_subparsers.add_parser(

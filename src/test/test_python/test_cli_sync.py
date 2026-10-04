@@ -401,7 +401,11 @@ def test_dry_run_banner_at_start_and_end_and_writes_nothing(tmp_path, monkeypatc
     assert cli.main(["sync", "--dry-run"]) == 0
     out = capsys.readouterr().out
     assert out.count("DRY RUN") >= 2
-    assert out.strip().startswith("DRY RUN")
+    # The progress line (printed before the network call) comes first; the DRY RUN
+    # banner is the first thing after it, not buried further down.
+    lines = out.strip().splitlines()
+    assert lines[0] == "Contacting SimpleFIN (this can take a minute)..."
+    assert lines[1] == "DRY RUN — nothing was written."
     assert out.strip().endswith("DRY RUN — nothing was written.")
     assert "inserted 1" in out
     assert "matched 1 existing CSV row(s)" in out
@@ -611,6 +615,51 @@ def test_no_secret_is_ever_printed(tmp_path, monkeypatch, capsys):
     assert SECRET_ACCESS_URL not in everything
     assert "sekrit-pw-998" not in everything
     assert "alice:sekrit-pw-998" not in everything
+
+
+# -------------------------------------------------------------------- progress line
+
+
+def test_progress_line_appears_before_every_network_call(tmp_path, monkeypatch, capsys):
+    """SimpleFIN can be slow right after a bank is re-linked (close to the old 60s
+    timeout); a progress line before each network call keeps that from looking like
+    a hang, for every command that makes one -- without ever naming the access URL.
+    """
+    session_factory = _db(tmp_path, monkeypatch)
+    _import_amex(session_factory, tmp_path)
+
+    _fake_credentials(monkeypatch)
+    _fake_claim(monkeypatch)
+    _fake_fetch(monkeypatch, AccountSet(accounts=(_racct(),)))
+    monkeypatch.setattr("getpass.getpass", lambda prompt="": SECRET_TOKEN)
+    _answers(monkeypatch, "1")
+
+    progress = "Contacting SimpleFIN (this can take a minute)..."
+
+    assert cli.main(["sync", "connect"]) == 0
+    connect_out = capsys.readouterr().out
+    assert progress in connect_out
+    assert SECRET_ACCESS_URL not in connect_out
+
+    _fake_fetch(monkeypatch, AccountSet(accounts=(_racct(),)))
+    _answers(monkeypatch)  # already mapped; no questions expected
+    assert cli.main(["sync", "map"]) == 0
+    map_out = capsys.readouterr().out
+    assert progress in map_out
+    assert SECRET_ACCESS_URL not in map_out
+
+    new_txn = _rtxn("rt1", CSV_POSTED + timedelta(days=1), "-12.34", "NEW SHOP")
+    _fake_fetch(monkeypatch, AccountSet(accounts=(_racct(txns=[new_txn]),)))
+    assert cli.main(["sync"]) == 0
+    run_out = capsys.readouterr().out
+    assert progress in run_out
+    assert SECRET_ACCESS_URL not in run_out
+
+    _fake_fetch(monkeypatch, AccountSet(accounts=(_racct(),)))
+    assert cli.main(["sync", "--dry-run"]) == 0
+    dry_run_out = capsys.readouterr().out
+    assert progress in dry_run_out
+    assert SECRET_ACCESS_URL not in dry_run_out
 
 
 # ------------------------------------------------------------------------------- unmap

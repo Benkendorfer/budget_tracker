@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import subprocess
 from typing import Dict, List, Optional
 
 from sqlalchemy import select
@@ -74,6 +75,17 @@ def _rate_fetch_summary(outcome: rates_module.ImportRatesOutcome) -> str:
     return f"Fetched {outcome.written} rate(s) for {queries.HOME_CURRENCY} -> {quotes}."
 
 
+def _contacting(labels) -> str:
+    """The progress line printed before a network call, naming who is being called."""
+    names = sorted(set(labels)) or ["SimpleFIN"]
+    return f"Contacting {' and '.join(names)} (this can take a minute)..."
+
+
+def _label_of(session, name: str) -> str:
+    connection = session.scalar(select(SyncConnection).where(SyncConnection.name == name))
+    return sync_module.provider_of(connection).label if connection else "SimpleFIN"
+
+
 def _sync_run(args: argparse.Namespace) -> int:
     engine = get_engine()
     init_db(engine)
@@ -83,6 +95,13 @@ def _sync_run(args: argparse.Namespace) -> int:
             print("Nothing is connected yet; run 'budget sync connect' first.")
             return 1
 
+        connections = session.scalars(select(SyncConnection)).all()
+        if args.connection:
+            connections = [c for c in connections if c.name == args.connection]
+        print(
+            _contacting(sync_module.provider_of(c).label for c in connections),
+            flush=True,
+        )
         try:
             results = sync_module.run_sync(
                 session, args.connection, dry_run=args.dry_run
@@ -149,7 +168,7 @@ def _print_sync_results(results: List["sync_module.SyncResult"], *, dry_run: boo
                         (result.connection_name, account.account_name, warning)
                     )
         if result.errors:
-            print("  Errors reported by SimpleFIN:")
+            print(f"  Errors reported by {result.provider_label}:")
             for message in result.errors:
                 print(f"    - {message}")
         if result.unmapped:
@@ -172,20 +191,32 @@ def _print_sync_results(results: List["sync_module.SyncResult"], *, dry_run: boo
 
 
 def _sync_connect(args: argparse.Namespace) -> int:
-    name = (args.name or sync_module.DEFAULT_CONNECTION).strip()
-    token = getpass.getpass(
-        "Paste your SimpleFIN setup token (hidden input; it works once): "
-    ).strip()
+    provider = args.provider
+    label = sync_module.PROVIDERS[provider].label
+    # Named after its provider by default, so a second provider needs no --name.
+    name = (args.name or provider).strip()
+    if args.clipboard:
+        token = _token_from_clipboard()
+        if token is None:
+            return 1
+    else:
+        token = getpass.getpass(
+            f"Paste your {label} setup token (hidden input; it works once): "
+        ).strip()
     if not token:
         print("No setup token entered.")
         return 1
+    # The length, never the token: enough to tell a paste that was cut short (a hidden
+    # prompt on macOS stops at about 1,024 characters) from one that arrived whole.
+    print(f"Read a {len(token)}-character setup token.")
 
     engine = get_engine()
     init_db(engine)
     session_factory = get_sessionmaker(engine)
     with session_factory() as session:
+        print(_contacting([label]), flush=True)
         try:
-            account_set = sync_module.connect(session, token, name)
+            account_set = sync_module.connect(session, token, name, provider=provider)
         except sync_module.AlreadyConnected as error:
             print(error)
             return 1
@@ -212,10 +243,29 @@ def _sync_connect(args: argparse.Namespace) -> int:
             _walk_account_mapping(session, name, account_set.accounts)
         else:
             print("No remote accounts were returned to map.")
-        _print_remote_errors(account_set.errors)
+        _print_remote_errors(account_set.errors, label)
 
     print("\nRun 'budget sync --dry-run' to see what the first sync would do.")
     return 0
+
+
+def _token_from_clipboard() -> Optional[str]:
+    """The setup token, read from the macOS clipboard with ``pbpaste``.
+
+    For when pasting at the hidden prompt fails: nothing echoes, so a paste that did
+    not land is invisible, and the terminal's line limit truncates a long token. The
+    clipboard sidesteps both and still keeps the token off the command line. Any
+    whitespace a copy picked up -- line breaks from a wrapped token -- is removed, the
+    same as decode_setup_token would.
+    """
+    try:
+        pasted = subprocess.run(
+            ["pbpaste"], capture_output=True, text=True, check=True
+        ).stdout
+    except (OSError, subprocess.CalledProcessError) as error:
+        print(f"Could not read the clipboard ({error}); paste at the prompt instead.")
+        return None
+    return "".join(pasted.split())
 
 
 def _sync_map(args: argparse.Namespace) -> int:
@@ -225,6 +275,8 @@ def _sync_map(args: argparse.Namespace) -> int:
     init_db(engine)
     session_factory = get_sessionmaker(engine)
     with session_factory() as session:
+        label = _label_of(session, name)
+        print(_contacting([label]), flush=True)
         try:
             account_set = sync_module.remote_accounts(session, name)
         except _SYNC_ERRORS as error:
@@ -233,7 +285,7 @@ def _sync_map(args: argparse.Namespace) -> int:
 
         if not account_set.accounts:
             print("No remote accounts were returned to map.")
-            _print_remote_errors(account_set.errors)
+            _print_remote_errors(account_set.errors, label)
             return 0
 
         current = _current_mapping(session, name)
@@ -250,7 +302,7 @@ def _sync_map(args: argparse.Namespace) -> int:
             _walk_account_mapping(session, name, to_walk, current)
         else:
             print("\nEvery remote account is already mapped. Use --all to change one.")
-        _print_remote_errors(account_set.errors)
+        _print_remote_errors(account_set.errors, label)
     return 0
 
 
@@ -297,10 +349,10 @@ def _current_mapping(session, name: str) -> Dict[str, str]:
     }
 
 
-def _print_remote_errors(errors) -> None:
+def _print_remote_errors(errors, label: str = "SimpleFIN") -> None:
     if not errors:
         return
-    print("\nSimpleFIN reported some errors while fetching balances:")
+    print(f"\n{label} reported some errors while fetching balances:")
     for error in errors:
         print(f"  - {error.code}: {error.msg}")
 

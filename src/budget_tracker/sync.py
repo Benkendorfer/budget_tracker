@@ -40,9 +40,33 @@ MATCH_WINDOW_DAYS = 3
 
 DEFAULT_CONNECTION = "simplefin"
 
-# SimpleFIN's own limit (see simplefin.MAX_WINDOW_DAYS), minus one: the earliest day a
-# sync can ever ask for, measured back from "today".
-_MAX_LOOKBACK_DAYS = 89
+
+
+@dataclass(frozen=True)
+class Provider:
+    """A server that speaks the SimpleFIN protocol. They differ only in name and in how
+    much history they keep, which is what the gap warnings measure against."""
+
+    label: str
+    history_days: int
+
+
+# Keyed by SyncConnection.provider. Synci serves UK/EU banks through open banking; its
+# Basic plan keeps 60 days (Pro keeps two years -- 60 errs toward warning, not missing).
+PROVIDERS = {
+    "simplefin": Provider("SimpleFIN", 90),
+    "synci": Provider("Synci", 60),
+}
+
+
+def provider_of(connection: SyncConnection) -> Provider:
+    return PROVIDERS.get(connection.provider, PROVIDERS["simplefin"])
+
+
+def _max_lookback_days(provider: Provider) -> int:
+    """The provider's history, minus one: the earliest day a sync can ever ask for,
+    measured back from "today"."""
+    return provider.history_days - 1
 
 
 class SyncError(Exception):
@@ -83,6 +107,7 @@ class AccountSyncResult:
 class SyncResult:
     connection_name: str
     dry_run: bool
+    provider_label: str = "SimpleFIN"
     import_id: Optional[int] = None  # None if nothing inserted, or a dry run
     accounts: List[AccountSyncResult] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)  # remote errlist messages
@@ -126,6 +151,7 @@ def connect(
     setup_token: str,
     name: str = DEFAULT_CONNECTION,
     *,
+    provider: str = "simplefin",
     claim: Optional[Callable[..., str]] = None,
     store_secret: Optional[Callable[[str, str], None]] = None,
     load_secret: Optional[Callable[[str], Optional[str]]] = None,
@@ -150,6 +176,10 @@ def connect(
         from .simplefin import fetch_accounts as fetch
 
     name = name.strip()
+    if provider not in PROVIDERS:
+        raise SyncError(
+            f"Unknown provider {provider!r}; expected one of {', '.join(PROVIDERS)}."
+        )
     existing = session.scalar(select(SyncConnection).where(SyncConnection.name == name))
     if existing is not None or load_secret(name) is not None:
         raise AlreadyConnected(
@@ -160,7 +190,7 @@ def connect(
     access_url = claim(setup_token)
     store_secret(name, access_url)
 
-    connection = SyncConnection(name=name)
+    connection = SyncConnection(name=name, provider=provider)
     session.add(connection)
     session.commit()
 
@@ -343,7 +373,9 @@ class _AccountPlan:
     gap_warning: bool
 
 
-def _account_start(session: Session, mapping: SyncAccount, today: date) -> _AccountPlan:
+def _account_start(
+    session: Session, mapping: SyncAccount, today: date, provider: Provider
+) -> _AccountPlan:
     """Where to start fetching ``mapping`` from, and any coverage warnings that come
     with it.
 
@@ -353,7 +385,7 @@ def _account_start(session: Session, mapping: SyncAccount, today: date) -> _Acco
     new account, no CSV history) there is nothing to warn about: a fresh 89-day fetch
     is exactly what was asked for, not a shortfall.
     """
-    floor_start = today - timedelta(days=_MAX_LOOKBACK_DAYS)
+    floor_start = today - timedelta(days=_max_lookback_days(provider))
     cutoff = _csv_cutoff(session, mapping.account_id)
     anchor = mapping.synced_through if mapping.synced_through is not None else cutoff
 
@@ -365,7 +397,7 @@ def _account_start(session: Session, mapping: SyncAccount, today: date) -> _Acco
     warnings: List[str] = []
     gap_warning = False
 
-    # How many days short of the anchor the 90-day window itself falls -- more than
+    # How many days short of the anchor the history window itself falls -- more than
     # one means some days between the anchor and the window's edge are permanently
     # unreachable, not just un-re-checked.
     days_short = (floor_start - anchor).days
@@ -374,8 +406,8 @@ def _account_start(session: Session, mapping: SyncAccount, today: date) -> _Acco
         gap_end = floor_start - timedelta(days=1)
         warnings.append(
             f"Transactions from {gap_start.isoformat()} through {gap_end.isoformat()} "
-            "are older than SimpleFIN's 90-day window and cannot be synced; import "
-            "them from a CSV if you need them."
+            f"are older than {provider.label}'s {provider.history_days}-day history "
+            "and cannot be synced; import them from a CSV if you need them."
         )
         gap_warning = True
     elif desired_start < floor_start:
@@ -486,7 +518,10 @@ def _sync_one_connection(
     load_secret: Callable[[str], Optional[str]],
     fetch: Callable[..., AccountSet],
 ) -> SyncResult:
-    result = SyncResult(connection_name=connection.name, dry_run=dry_run)
+    provider = provider_of(connection)
+    result = SyncResult(
+        connection_name=connection.name, dry_run=dry_run, provider_label=provider.label
+    )
 
     secret = load_secret(connection.name)
     if secret is None:
@@ -499,10 +534,13 @@ def _sync_one_connection(
         session.scalars(select(SyncAccount).where(SyncAccount.connection_id == connection.id))
     )
     plans = {plan.mapping.remote_id: plan for plan in (
-        _account_start(session, mapping, today) for mapping in mappings
+        _account_start(session, mapping, today, provider) for mapping in mappings
     )}
 
-    window_start = min((p.start for p in plans.values()), default=today - timedelta(days=_MAX_LOOKBACK_DAYS))
+    window_start = min(
+        (p.start for p in plans.values()),
+        default=today - timedelta(days=_max_lookback_days(provider)),
+    )
     window_end = today + timedelta(days=1)
 
     try:
@@ -566,10 +604,19 @@ def _sync_one_connection(
         # Pending rows are kept regardless of date -- their ``posted`` is the epoch (1970)
         # -- so the loop below can count them as skipped rather than silently dropping
         # them here.
+        #
+        # Filtered on ``posted``, not ``transacted``/``txn_date`` -- the server's own
+        # start-date filter works on posted dates, and so must ours: a charge that
+        # stays pending for a while posts well after its purchase date, and by the time
+        # it posts, ``plan.start`` (anchored on synced_through) may have moved past its
+        # purchase date already. Filtering on the purchase date would then drop it on
+        # every sync from here on, having never been inserted while pending. The row
+        # that gets inserted still carries ``txn_date = transacted or posted`` (see
+        # below) -- only which rows make it into the window changes here.
         txns_in_window = [
             t
             for t in remote_account.transactions
-            if t.pending or (t.transacted or t.posted) >= plan.start
+            if t.pending or t.posted >= plan.start
         ]
 
         account_inserts: List[_PendingInsert] = []

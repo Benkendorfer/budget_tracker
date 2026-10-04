@@ -95,6 +95,13 @@ REQUEST_WINDOW_DAYS = 45
 # app instead.
 USER_AGENT = "budget-tracker/0.1"
 
+# fetch_accounts's default read timeout. SimpleFIN Bridge has been observed taking
+# close to 60s to answer right after a bank is re-linked (it is itself waiting on the
+# aggregator underneath); a 60s timeout looked indistinguishable from a hang. claim()
+# stays at 30s -- it posts an empty body and gets a short access URL back, not a
+# transaction history, so it has never been seen to be slow.
+FETCH_ACCOUNTS_TIMEOUT = 120
+
 
 def redact(url: str) -> str:
     """Strip ``user:pass@`` userinfo from ``url``, for safe use in error messages.
@@ -376,7 +383,7 @@ def fetch_accounts(
     end: Optional[date] = None,
     account_ids: Sequence[str] = (),
     balances_only: bool = False,
-    timeout: float = 60,
+    timeout: float = FETCH_ACCOUNTS_TIMEOUT,
 ) -> AccountSet:
     """GET ``<access url>/accounts``, auth via Basic from the URL's own userinfo.
 
