@@ -323,3 +323,21 @@ def test_transactions_report_whether_they_are_transfers(tmp_path):
     with session_factory() as session:
         flags = {t.description: t.is_transfer for t in queries.get_transactions(session)}
     assert flags == {"Xfer To": True, "Xfer From": True, "Coffee": False}
+
+
+def test_equal_amounts_in_different_currencies_do_not_pair(tmp_path):
+    """2,000 USD arriving and 2,000 CHF leaving are different money. On the real data
+    this once paired a Wise USD top-up with a CHF payment to someone else."""
+    session_factory = _session_factory(tmp_path)
+    with session_factory() as session:
+        usd, accounts = _seed(session)
+        chf = Currency(value="CHF", symbol="CHF", decimal_places=2)
+        session.add(chf)
+        session.flush()
+        wise_chf = Account(name="Wise CHF", currency_id=chf.id)
+        session.add(wise_chf)
+        session.flush()
+        into = _txn(session, usd, accounts["Checking"], 1, 200000, "TOP UP")
+        out = _txn(session, chf, wise_chf, 1, -200000, "SENT")
+        assert transfers.detect_transfers(session) == 0
+        assert into.transfer_group_id is None and out.transfer_group_id is None

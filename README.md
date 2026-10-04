@@ -901,6 +901,44 @@ accidental pairing more likely, and a false pairing silently removes two real tr
 from your totals — worse than leaving a real transfer undetected. It is reversible the
 same way, with `transfers reset`.
 
+#### Marking a transfer by hand
+
+Detection needs the two amounts to match exactly, so a transfer that loses a fee on the
+way -- 1,000.00 out of checking, 995.00 into Wise -- is never paired. Mark it yourself:
+select both legs (`x` on each) and run
+
+```text
+sel transfer        sel untransfer
+```
+
+`sel transfer` needs exactly two rows, one out and one in, neither already a transfer.
+The fee is real money, so it is not excluded with the transfer: it is split off the
+short leg as its own `Transfer fee` row, categorized `Fees`, in the same account, and the
+two legs then cancel exactly. The account's balance is unchanged and the fee still counts
+as spending. A pop-up names both legs and the difference before you move on. Legs in
+different currencies are paired without a split, since no fee can be worked out without a
+rate.
+
+Both legs are tagged `manual-transfer`, so the `Tags` sidebar lists every pair you made by
+hand. `transfers reset` and the category rules leave them alone; `sel untransfer` on
+either leg undoes the pair and folds the fee back into its leg.
+
+#### Excluding rows by hand
+
+Some money is neither income nor spending, and no pairing describes it: an in-kind ACATS
+move of securities between brokers is valued differently by each side, and may come from
+an account that is not tracked here at all. Select the rows and run
+
+```text
+sel exclude         sel include
+```
+
+Excluded rows are greyed out like a transfer, tagged `excluded`, and left out of every
+figure the app draws — the totals line, statistics, chart, pie, and trips — because they
+go through the same rule transfers do. Their category is left as it was. `sel exclude`
+skips rows that are already a transfer, `transfers reset` never touches an exclusion, and
+`sel include` is the only way back.
+
 ### Importing data
 
 Every bank lays its CSV out differently, so the first time you import an unfamiliar
@@ -1103,8 +1141,24 @@ budget sync disconnect   # remove a connection and its keychain entry (keeps tra
 Undo a sync the same way you would a CSV import — `budget imports` shows it (its source
 file reads `sync:<name> <date>`) and `budget unimport <id>` removes it.
 
-Other servers that speak the SimpleFIN protocol (Synci, for UK and European banks) work
-exactly the same way under a different `--name`, e.g. `budget sync connect --name synci`.
+#### Synci, for UK and European banks
+
+SimpleFIN Bridge only reaches US and Canadian banks. [Synci](https://synci.io) speaks the
+same protocol for UK and European ones (through open banking), so it is a second
+connection rather than anything new to learn:
+
+```bash
+budget sync connect --provider synci   # paste a Synci setup token; the connection is named "synci"
+budget sync map --connection synci
+budget sync                            # syncs every connection, SimpleFIN and Synci alike
+```
+
+Everything above applies unchanged, with two differences. Messages name Synci instead of
+SimpleFIN. And Synci's Basic plan keeps only **60 days** of history rather than 90, so the
+gap warnings measure against 60: a first sync anchored further back than that says so,
+and the missing stretch has to come from a CSV. Open-banking access also has to be
+re-approved with your bank every few months; a sync that suddenly reports an `auth`
+error usually just means it is time to reconnect on Synci's site.
 
 ### Where the data lives
 

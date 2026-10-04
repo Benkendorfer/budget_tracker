@@ -733,7 +733,7 @@ def delete_import(session: Session, import_id: int) -> DeleteResult:
 
     # Imported here, as elsewhere in this module, to keep the module-level dependency
     # one-way (transfers -> models only).
-    from .transfers import TRANSFER_SOURCE
+    from .transfers import MANUAL_TRANSFER_SOURCE, TRANSFER_SOURCE
 
     transfers_broken = 0
     if group_ids:
@@ -745,7 +745,9 @@ def delete_import(session: Session, import_id: int) -> DeleteResult:
         )
         for leg in survivors:
             leg.transfer_group_id = None
-            if leg.category_source == TRANSFER_SOURCE:
+            # A manual transfer's surviving leg is no more a transfer than a detected
+            # one's, so it loses the "Transfer" category the same way.
+            if leg.category_source in (TRANSFER_SOURCE, MANUAL_TRANSFER_SOURCE):
                 leg.category_id = None
                 leg.category_source = "unset"
             transfers_broken += 1

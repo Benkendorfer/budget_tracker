@@ -28,7 +28,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from .models import Category, CategoryRule, Transaction, Vendor, VendorName
-from .transfers import TRANSFER_SOURCE
+from .transfers import MANUAL_TRANSFER_SOURCE, TRANSFER_SOURCE
 from .vendors import matches as _matches_raw
 
 MANUAL = "manual"
@@ -36,10 +36,11 @@ RULE = "rule"
 UNSET = "unset"
 
 # Sources a rule will not overwrite. ``manual`` is the user's explicit choice; the
-# ``transfer`` stamp keeps the invariant that a detected transfer reads as one. Without
-# the latter, whether a rule won depended on whether the leg was paired before or after
-# the rule existed, since detection only ever stamps newly paired legs.
-PROTECTED_SOURCES = (MANUAL, TRANSFER_SOURCE)
+# ``transfer``/``manual-transfer`` stamps keep the invariant that a paired leg always
+# reads as a transfer, whether detection or the user found the pair. Without them,
+# whether a rule won depended on whether the leg was paired before or after the rule
+# existed, since detection only ever stamps newly paired legs.
+PROTECTED_SOURCES = (MANUAL, TRANSFER_SOURCE, MANUAL_TRANSFER_SOURCE)
 
 # Separator for a printable category path, e.g. "Food > Dining".
 PATH_SEPARATOR = ">"
@@ -463,6 +464,10 @@ def clear_category_for(session: Session, txn_ids: Sequence[int]) -> int:
         txn.category_source = UNSET
         cleared += 1
     session.flush()
+    # "Clearing one hands it back to the rules" (README) has to happen now, not at the
+    # next import: otherwise a cleared row sits uncategorized even though a rule matches
+    # it. Same module, so no new dependency.
+    apply_category_rules(session)
     return cleared
 
 

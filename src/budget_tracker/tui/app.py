@@ -92,6 +92,14 @@ _CHART_BUCKETS = ("day", "week", "month")
 _SHARE_BUCKETS = ("week", "month", "year")
 
 
+
+def _set_vendor_then_categorize(session: Session, txn_ids, value: str) -> int:
+    """``sel vendor = <name>``: moving rows to another vendor can bring them under a
+    category rule (or out from under one), so the rules are re-run afterwards."""
+    changed = vendors.set_vendor(session, txn_ids, value)
+    categories.apply_category_rules(session)
+    return changed
+
 class BudgetApp(App):
     CSS = """
     #sidebar { width: 36; }
@@ -1816,6 +1824,12 @@ class BudgetApp(App):
                 "sel tag = <name> / sel untag = <name> — add or remove a tag\n"
                 "sel trip = <name> — put everything selected on a trip, replacing any\n"
                 "  other trip; sel untrip takes them off it\n"
+                "sel transfer — mark the 2 selected rows (one out, one in) as a\n"
+                "  transfer; any fee is split off and still counts as spending.\n"
+                "  sel untransfer undoes it\n"
+                "sel exclude — leave the selected rows out of every income and\n"
+                "  spending figure (greyed out, tagged #excluded), e.g. an ACATS move;\n"
+                "  sel include counts them again\n"
                 "  the selection survives an edit, so you can set a category and then\n"
                 "  a tag on the same rows without reselecting\n"
                 "  ctrl+n / ctrl+t prefill 'sel vendor = ' / 'sel category = ' once\n"
@@ -1877,7 +1891,7 @@ class BudgetApp(App):
                 "rates fetch — cache ECB reference rates for every foreign currency\n"
                 "  on file, over its whole date range; runs in the background so the\n"
                 "  app stays responsive (an import does this on its own already)\n"
-                "sync — pull new transactions from every connected SimpleFIN account,\n"
+                "sync — pull new transactions from every sync connection (SimpleFIN, Synci),\n"
                 "  in the background; connect one first with 'budget sync connect' in\n"
                 "  a terminal (it asks for a one-time token on a hidden prompt, so\n"
                 "  that step stays CLI-only)\n"
@@ -2034,6 +2048,10 @@ class BudgetApp(App):
             return
         with self.session_factory() as session:
             ok = vendors.set_override(session, raw, display)
+            if ok:
+                # A category rule may be written against the new display name.
+                categories.apply_category_rules(session)
+                session.commit()
         if not ok:
             self.notify(f"No vendor named {raw!r}.", severity="error")
             return
@@ -2294,6 +2312,9 @@ class BudgetApp(App):
         with self.session_factory() as session:
             vendors.add_rule(session, pattern, display)
             changed = vendors.apply_rules(session)
+            # Renames change display names, and a category rule may match those -- so
+            # the category rules run after, as they do at the end of every import.
+            categories.apply_category_rules(session)
             session.commit()
         self.reload()
         self.notify(f"{pattern!r} → {display!r} ({changed} vendors updated)")
@@ -2360,7 +2381,8 @@ class BudgetApp(App):
 
     SEL_USAGE = (
         "Usage: sel all | sel none | sel category = <name> | sel vendor = <name> | "
-        "sel tag = <name> | sel untag = <name> | sel trip = <name> | sel untrip"
+        "sel tag = <name> | sel untag = <name> | sel trip = <name> | sel untrip | "
+        "sel transfer | sel untransfer | sel exclude | sel include"
     )
 
     def _do_sel(self, arg: str) -> None:
@@ -2386,6 +2408,24 @@ class BudgetApp(App):
         if subject == "untrip" and not separator:
             self._sel_write(tags_module.clear_trip, "taken off their trip")
             return
+        if subject == "transfer" and not separator:
+            self._sel_transfer()
+            return
+        if subject == "exclude" and not separator:
+            self._sel_write(
+                transfers.exclude,
+                "excluded from income and spending (rows already a transfer are left "
+                "as they are)",
+            )
+            return
+        if subject == "include" and not separator:
+            self._sel_write(transfers.include, "counted again")
+            return
+        if subject == "untransfer" and not separator:
+            self._sel_write(
+                transfers.unmark_manual_transfer, "taken out of their manual transfer"
+            )
+            return
         if subject in self.SEL_WRITE_SUBJECTS:
             if not separator:
                 self.notify(self.SEL_USAGE, severity="warning")
@@ -2395,6 +2435,58 @@ class BudgetApp(App):
         self.notify(
             f"Unknown 'sel' command: {arg!r}\n{self.SEL_USAGE}",
             severity="warning",
+            markup=False,
+        )
+
+    def _sel_transfer(self) -> None:
+        """``sel transfer``: mark the two selected legs as one transfer, by hand.
+
+        For pairs detection cannot see -- a Wise fee makes the legs differ. The fee is
+        split off as its own row and stays in the spending figures (the money really is
+        gone), and the pop-up says exactly how much that was, so nothing disappears
+        from the totals unannounced.
+        """
+        ids = sorted(self._selected_ids)
+        if len(ids) != 2:
+            self.notify(
+                f"sel transfer needs both legs selected: exactly 2 rows, one out and "
+                f"one in ({len(ids)} selected).",
+                severity="warning",
+            )
+            return
+        with self.session_factory() as session:
+            try:
+                result = transfers.mark_manual_transfer(session, ids)
+            except transfers.ManualTransferError as error:
+                self.notify(str(error), severity="error", markup=False)
+                return
+            session.commit()
+        self.reload()
+
+        legs = (
+            f"{result.outflow_account} {_fmt_amount(result.outflow_minor)} ⇄ "
+            f"{result.inflow_account} {_fmt_amount(result.inflow_minor)}"
+        )
+        if result.difference_minor is None:
+            detail = (
+                "Different currencies, so no fee could be worked out without a rate; "
+                "nothing was split off."
+            )
+        elif result.difference_minor == 0:
+            detail = "The legs match exactly; no fee."
+        else:
+            kind = "fee" if result.difference_minor < 0 else "difference"
+            detail = (
+                f"Difference {_fmt_amount(result.difference_minor)} {result.currency}, "
+                f"kept as a separate 'Transfer {kind}' row in {result.fee_account} "
+                f"(category {transfers.FEE_CATEGORY}), so it still counts."
+            )
+        self.notify(
+            f"{legs}\n{detail}\nTagged #{transfers.MANUAL_TRANSFER_TAG}; "
+            "sel untransfer undoes it.",
+            title="Manual transfer",
+            severity="warning" if result.difference_minor else "information",
+            timeout=15,
             markup=False,
         )
 
@@ -2427,7 +2519,7 @@ class BudgetApp(App):
                 self._sel_write(categories.clear_category_for, "cleared of their category")
         elif subject == "vendor":
             self._sel_write(
-                lambda session, ids: vendors.set_vendor(session, ids, value),
+                lambda session, ids: _set_vendor_then_categorize(session, ids, value),
                 f"pointed at vendor {value!r}",
             )
         elif subject == "tag":
