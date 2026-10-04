@@ -64,7 +64,8 @@ def test_category_rule_add_list_remove(tmp_path, monkeypatch, capsys):
     assert _categories_of(session_factory) == ["Coffee"] * 3
 
     assert cli.main(["category-rule", "list"]) == 0
-    assert "COFFEE*  ->  Coffee" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "COFFEE*" in out and "Coffee" in out
 
     assert cli.main(["category-rule", "remove", "COFFEE*"]) == 0
     assert "Removed 'COFFEE*'" in capsys.readouterr().out

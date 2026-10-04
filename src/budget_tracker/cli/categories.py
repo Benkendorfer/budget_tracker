@@ -150,9 +150,16 @@ def _cmd_category_rule(args: argparse.Namespace) -> int:
             if not rules:
                 print("No category rules defined.")
                 return 0
-            width = max(len(r.pattern) for r in rules)
+
+            from rich.console import Console
+            from rich.table import Table
+
+            table = Table(box=None, pad_edge=False)
+            table.add_column("Pattern")
+            table.add_column("Category")
             for rule in rules:
-                print(f"  {rule.pattern:<{width}}  ->  {rule.category.value}")
+                table.add_row(rule.pattern, rule.category.value)
+            Console().print(table)
             return 0
 
         if command == "add":

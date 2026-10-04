@@ -175,13 +175,26 @@ def _cmd_imports(args: argparse.Namespace) -> int:
     if not rows:
         print("No imports yet.")
         return 0
-    width = max(len(row.source_file) for row in rows)
+
+    from rich.console import Console
+    from rich.table import Table
+
+    table = Table(box=None, pad_edge=False)
+    table.add_column("Id")
+    table.add_column("Source file")
+    table.add_column("Txns", justify="right")
+    table.add_column("Account")
+    table.add_column("Imported at")
     for row in rows:
         account = row.account or "multiple/none"
-        print(
-            f"  [{row.id:>4}] {row.source_file:<{width}}  "
-            f"{row.transaction_count:>6} txns  {account}  {row.imported_at}"
+        table.add_row(
+            f"[{row.id:>4}]",
+            row.source_file,
+            f"{row.transaction_count} txns",
+            account,
+            row.imported_at,
         )
+    Console().print(table)
     return 0
 
 

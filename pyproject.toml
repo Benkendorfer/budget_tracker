@@ -7,7 +7,7 @@ name = "budget-tracker"
 version = "0.1.0"
 description = "Personal budget tracker with SQL storage and a CLI."
 requires-python = ">=3.9"
-dependencies = ["SQLAlchemy>=2.0", "textual>=0.60", "keyring>=24"]
+dependencies = ["SQLAlchemy>=2.0", "textual>=0.60", "keyring>=24", "alembic>=1.13,<2"]
 
 [project.optional-dependencies]
 dev = ["pytest>=7"]
@@ -18,6 +18,11 @@ budget = "budget_tracker.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["budget_tracker*"]
+
+[tool.setuptools.package-data]
+# The Mako template `alembic revision --autogenerate` needs; not Python, so it is not
+# picked up automatically the way the package's .py files are.
+"budget_tracker.migrations" = ["script.py.mako"]
 
 [tool.pytest.ini_options]
 testpaths = ["src/test/test_python"]

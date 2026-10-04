@@ -68,15 +68,24 @@ def _cmd_format(args: argparse.Namespace) -> int:
             "walked through the first one."
         )
         return 0
-    width = max(len(s.name) for s in specs)
+
+    from rich.console import Console
+    from rich.table import Table
+
+    table = Table(box=None, pad_edge=False)
+    table.add_column("Name")
+    table.add_column("Amount style")
+    table.add_column("Account")
+    table.add_column("Invert")
     for spec in specs:
         account = spec.account_column or "requires --account"
         # invert only means anything for a single signed column; a debit/credit pair
         # already says which side is an outflow, so it is left off there.
-        polarity = (
-            f"  invert: {'on' if spec.invert_amount else 'off'}"
+        invert = (
+            ("on" if spec.invert_amount else "off")
             if spec.amount_style == formats.SIGNED
             else ""
         )
-        print(f"  {spec.name:<{width}}  {spec.amount_style:<13}  account: {account}{polarity}")
+        table.add_row(spec.name, spec.amount_style, account, invert)
+    Console().print(table)
     return 0

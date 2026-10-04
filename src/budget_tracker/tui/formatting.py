@@ -7,6 +7,7 @@ module without depending on ``BudgetApp``.
 
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Optional
 
 from rich.text import Text
@@ -74,7 +75,14 @@ OTHER_COLOR = "#999999"
 
 
 def _fmt_amount(minor: int, decimal_places: int = 2) -> str:
-    return f"{minor / (10 ** decimal_places):,.{decimal_places}f}"
+    """The one place minor units become a decimal string, for TUI and CLI alike.
+
+    Goes through ``Decimal`` rather than a float division: ``minor / 10 ** dp`` loses
+    precision for large amounts (a six-figure JPY balance, for instance), where a float
+    cannot represent the result exactly and the rounding shows up in the rendered text.
+    """
+    value = Decimal(minor).scaleb(-decimal_places)
+    return f"{value:,.{decimal_places}f}"
 
 
 def _fmt_amount_for(minor: int, currency: Optional[queries.CurrencyRow]) -> str:
@@ -95,7 +103,16 @@ def _fmt_amount_for(minor: int, currency: Optional[queries.CurrencyRow]) -> str:
 
 
 def _truncate(text: str, width: int) -> str:
-    return text if len(text) <= width else text[: width - 1] + "…"
+    """Truncate to ``width`` terminal cells, not code points.
+
+    A wide character (CJK, an emoji) occupies two cells, so slicing by code point can
+    let a row overflow its column even though the string "looks" short enough. Rich
+    already has to solve this to lay out a table at all, so this defers to its own
+    cell-width accounting rather than re-deriving it.
+    """
+    truncated = Text(text)
+    truncated.truncate(width, overflow="ellipsis")
+    return truncated.plain
 
 
 def _amount_cell(

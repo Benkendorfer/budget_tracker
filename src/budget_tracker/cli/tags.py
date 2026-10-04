@@ -16,6 +16,7 @@ import argparse
 from .. import queries
 from .. import tags as tags_module
 from ..db import get_engine, get_sessionmaker, init_db
+from ..tui.formatting import _fmt_amount
 
 
 def _cmd_tags(args: argparse.Namespace) -> int:
@@ -59,10 +60,16 @@ def _cmd_tags(args: argparse.Namespace) -> int:
     if not rows:
         print("No tags yet.")
         return 0
-    width = max(len(row.name) for row in rows)
+
+    from rich.console import Console
+    from rich.table import Table
+
+    table = Table(box=None, pad_edge=False)
+    table.add_column("Name")
+    table.add_column("Kind")
+    table.add_column("Txns", justify="right")
+    table.add_column("Total", justify="right")
     for row in rows:
-        print(
-            f"  {row.name:<{width}}  {row.kind:<4}  {row.count:>6} txns  "
-            f"{row.total_minor / 100:>12,.2f}"
-        )
+        table.add_row(row.name, row.kind, f"{row.count} txns", _fmt_amount(row.total_minor))
+    Console().print(table)
     return 0

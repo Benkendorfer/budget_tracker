@@ -92,11 +92,23 @@ def _cmd_rates(args: argparse.Namespace) -> int:
     if not rows:
         print("No exchange rates cached yet. Run 'budget rates fetch' or 'budget rates set'.")
         return 0
+
+    from rich.console import Console
+    from rich.table import Table
+
+    table = Table(box=None, pad_edge=False)
+    table.add_column("Pair")
+    table.add_column("Source")
+    table.add_column("Span")
+    table.add_column("Count")
     for row in rows:
         span = (
             row.first_day if row.first_day == row.last_day
             else f"{row.first_day}..{row.last_day}"
         )
         plural = "" if row.count == 1 else "s"
-        print(f"  {row.base} -> {row.quote}   {row.source:<8} {span:<23} {row.count} rate{plural}")
+        table.add_row(
+            f"{row.base} -> {row.quote}", row.source, span, f"{row.count} rate{plural}"
+        )
+    Console().print(table)
     return 0

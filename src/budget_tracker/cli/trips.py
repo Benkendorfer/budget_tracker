@@ -17,6 +17,7 @@ from .. import queries
 from .. import tags as tags_module
 from .. import trips as trips_module
 from ..db import get_engine, get_sessionmaker, init_db
+from ..tui.formatting import _fmt_amount
 
 
 def _format_date(day: Optional[date]) -> str:
@@ -58,11 +59,18 @@ def _print_trips(rows) -> None:
     if not rows:
         print("No trips yet.")
         return
-    name_width = max([len(r.name) for r in rows] + [len("TOTAL")])
-    print(
-        f"  {'Start':<11} {'End':<11} {'Trip':<{name_width}}  "
-        f"{'Txns':>11}  {'Cost':>12}  {'Cost/day':>9}"
-    )
+
+    from rich.console import Console
+    from rich.table import Table
+
+    table = Table(box=None, pad_edge=False)
+    table.add_column("Start")
+    table.add_column("End")
+    table.add_column("Trip")
+    table.add_column("Txns", justify="right")
+    table.add_column("Cost", justify="right")
+    table.add_column("Cost/day", justify="right")
+    table.add_column("Breakdown")
     for row in rows:
         # A trailing "*" marks a date *derived* from the trip's transactions rather than
         # set by hand -- the flag belongs on the app's guess, which may well be wrong,
@@ -72,13 +80,17 @@ def _print_trips(rows) -> None:
         # marker is appended only where there is a date to qualify.
         start = _format_date(row.start) + ("*" if row.start and not row.start_is_manual else "")
         end = _format_date(row.end) + ("*" if row.end and not row.end_is_manual else "")
-        print(
-            f"  {start:<11} {end:<11} {row.name:<{name_width}}  "
-            f"{row.count:>6} txns  {row.total_minor / 100:>12,.2f}  "
-            f"{_per_day(row.total_minor, row.days):>9}  "
-            f"{_format_breakdown(row.buckets)}"
+        table.add_row(
+            start,
+            end,
+            row.name,
+            f"{row.count} txns",
+            _fmt_amount(row.total_minor),
+            _per_day(row.total_minor, row.days),
+            _format_breakdown(row.buckets),
         )
-    _print_total(rows, name_width)
+    _add_total_row(table, rows)
+    Console().print(table)
 
 
 def _per_day(minor: int, days: Optional[int]) -> str:
@@ -87,10 +99,10 @@ def _per_day(minor: int, days: Optional[int]) -> str:
     Blank rather than ``0.00``: a trip with no dates has no denominator at all, and a
     zero would read as a trip that cost nothing a day.
     """
-    return f"{round(minor / days) / 100:,.2f}" if days else ""
+    return _fmt_amount(round(minor / days)) if days else ""
 
 
-def _print_total(rows, name_width: int) -> None:
+def _add_total_row(table, rows) -> None:
     """A closing row summing every trip -- all travel, in one line.
 
     Cost/day divides by the days actually *traveled*, summed per trip, not by the span
@@ -105,11 +117,15 @@ def _print_total(rows, name_width: int) -> None:
         sum(row.buckets[index] for row in rows)
         for index in range(len(trips_module.BUCKETS))
     ]
-    print(
-        f"  {'':<11} {'':<11} {'TOTAL':<{name_width}}  "
-        f"{count:>6} txns  {total / 100:>12,.2f}  "
-        f"{_per_day(total, days):>9}  "
-        f"{_format_breakdown(totals)}"
+    table.add_row(
+        "",
+        "",
+        "TOTAL",
+        f"{count} txns",
+        _fmt_amount(total),
+        _per_day(total, days),
+        _format_breakdown(totals),
+        style="bold",
     )
 
 

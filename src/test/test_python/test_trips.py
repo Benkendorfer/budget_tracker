@@ -788,8 +788,11 @@ def test_manual_dates_survive_on_a_database_that_predates_the_columns(tmp_path):
     db_path = tmp_path / "old.db"
     engine = get_engine(db_path)
     init_db(engine)
-    # Drop back to the pre-override shape, then reopen.
+    # Drop back to the pre-override shape, then reopen. A database that old also predates
+    # Alembic, so it has no alembic_version table -- without dropping it, init_db would
+    # rightly treat this one as already current and leave the hand-made old table alone.
     with engine.begin() as connection:
+        connection.execute(sqlalchemy.text("DROP TABLE alembic_version"))
         connection.execute(sqlalchemy.text("DROP TABLE transaction_tag"))
         connection.execute(sqlalchemy.text("DROP TABLE tag"))
         connection.execute(

@@ -29,7 +29,6 @@ than matching the resolution of a chart you are not looking at at the same time.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import List, Optional, Tuple

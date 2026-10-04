@@ -420,12 +420,13 @@ def test_cli_sync_status_shows_ok_and_error(tmp_path, monkeypatch, capsys):
 
     assert cli.main(["sync", "status"]) == 0
     out = capsys.readouterr().out
-    lines = {line.strip().split("remote:")[0].strip(): line for line in out.splitlines() if "remote:" in line}
-    good_line = next(line for name, line in lines.items() if "Good Acct" in name)
-    bad_line = next(line for name, line in lines.items() if "Bad Acct" in name)
+    # A table row per account; a long error may wrap onto following lines within its
+    # cell, so the reason is checked on the whitespace-collapsed output.
+    good_line = next(line for line in out.splitlines() if "Good Acct" in line)
+    bad_line = next(line for line in out.splitlines() if "Bad Acct" in line)
     assert good_line.rstrip().endswith("ok")
-    assert "ERROR" in bad_line
-    assert "not returned" in bad_line.lower()
+    assert "ERROR" in bad_line and "ERROR" not in good_line
+    assert "not returned" in " ".join(out.split()).lower()
 
 
 def _status_after(tmp_path, account_conn_id, error_conn_id):

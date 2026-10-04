@@ -3,6 +3,12 @@
 Uses SQLite by default, stored in the gitignored ``data/`` directory. The
 ``sqlite:///`` URL keeps everything local while leaving room to switch to a
 cloud Postgres URL later without touching the models.
+
+Schema changes are versioned Alembic migrations under :mod:`budget_tracker.migrations`
+(see that package's docstring for how to add one). ``_ADDED_COLUMNS`` and the two
+functions below it are not that mechanism -- they are the one-time path that walks a
+database from before Alembic existed up to the baseline revision; see
+:func:`init_db`.
 """
 
 from __future__ import annotations
@@ -11,10 +17,12 @@ import os
 from pathlib import Path
 from typing import Optional
 
+from alembic import command
 from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
+from .migrations import BASELINE_REVISION, alembic_config
 from .models import Base
 
 # db.py -> budget_tracker -> src -> <repo root>
@@ -52,8 +60,10 @@ def get_engine(db_path: Optional[Path] = None) -> Engine:
     return create_engine(f"sqlite:///{path}", future=True)
 
 
-# Columns added to existing tables after the first release. ``create_all`` only creates
-# missing *tables*, so these are applied by hand; SQLite ADD COLUMN is cheap and safe.
+# Columns added to existing tables before Alembic replaced this file as the way to do
+# it. ``create_all`` only creates missing *tables*, so these were applied by hand;
+# SQLite ADD COLUMN is cheap and safe. Still needed, and still correct, to walk a
+# pre-Alembic database up to the baseline revision -- see init_db.
 _ADDED_COLUMNS = {
     "vendor": {"vendor_name_source": "VARCHAR"},
     # Manual overrides for a trip's dates, which otherwise come from the transactions
@@ -136,11 +146,59 @@ def _ensure_unique_category_names(engine: Engine) -> None:
         )
 
 
+def _upgrade_to_head(engine: Engine) -> None:
+    command.upgrade(alembic_config(engine), "head")
+
+
+def _stamp(engine: Engine, revision: str) -> None:
+    command.stamp(alembic_config(engine), revision)
+
+
 def init_db(engine: Engine) -> None:
-    """Create any missing tables, then patch in any columns/constraints added since."""
+    """Bring the database to the current schema, versioned in ``alembic_version``.
+
+    Three cases, told apart by what is already there:
+
+    - **Brand new** (no tables at all): replaying every migration from nothing is
+      just a slower way of doing what ``create_all`` does directly, so that is the
+      fast path -- this is the common case in the test suite, called on a fresh
+      ``tmp_path`` database hundreds of times. It is then stamped at head, so the
+      *next* ``init_db`` call on it takes the "already versioned" branch below.
+    - **Pre-Alembic** (tables exist, but no ``alembic_version`` table): every real
+      database today, including the user's. The old patches --
+      :func:`_add_missing_columns`, ``create_all`` for any table added since,
+      :func:`_ensure_unique_category_names` -- are exactly how such a database
+      reaches the baseline schema, so they still run verbatim, including
+      :exc:`DuplicateCategoryNamesError` still blocking the database from opening at
+      all until the duplicates are merged by hand. It is then stamped at the
+      *baseline* revision, not head, and upgraded -- so a database that reaches the
+      baseline today still picks up any migration added after it, exactly like a
+      database that was already versioned.
+    - **Versioned**: ``alembic upgrade head``. A no-op today (there is only the one,
+      baseline revision); this is the branch every call takes once a database has
+      been opened under this scheme at all.
+
+    Nothing here recreates or drops a table that was not already empty, and the
+    pre-Alembic branch never runs a migration script against real data -- only the
+    same idempotent column/index patches it always ran.
+    """
+    inspector = inspect(engine)
+    existing_tables = set(inspector.get_table_names())
+
+    if "alembic_version" in existing_tables:
+        _upgrade_to_head(engine)
+        return
+
+    if not existing_tables:
+        Base.metadata.create_all(engine)
+        _stamp(engine, "head")
+        return
+
     _add_missing_columns(engine)
     Base.metadata.create_all(engine)
-    _ensure_unique_category_names(engine)
+    _ensure_unique_category_names(engine)  # may raise DuplicateCategoryNamesError
+    _stamp(engine, BASELINE_REVISION)
+    _upgrade_to_head(engine)
 
 
 def get_sessionmaker(engine: Engine) -> "sessionmaker[Session]":

@@ -49,8 +49,9 @@ source .venv/bin/activate
 pip install -e ".[dev]"
 ```
 
-This installs the dependencies (`SQLAlchemy`, `textual`) and puts a `budget` command on
-your path. The `[dev]` extra adds `pytest`; drop it if you do not intend to run the tests.
+This installs the dependencies (`SQLAlchemy`, `textual`, `keyring`, `alembic`) and puts
+a `budget` command on your path. The `[dev]` extra adds `pytest`; drop it if you do not
+intend to run the tests.
 
 ### The interactive app
 
@@ -1176,6 +1177,20 @@ separate from your real one:
 
 ```bash
 BUDGET_DB=/tmp/scratch.db budget import ~/Downloads/statement.csv
+```
+
+### Schema changes
+
+The database schema is versioned with [Alembic](https://alembic.sqlalchemy.org/), packaged
+under `budget_tracker/migrations/` so it does not depend on an `alembic.ini` or the current
+directory. Opening the app brings any database -- brand new, created before Alembic, or
+already versioned -- up to the current schema and records that in `alembic_version`; an
+existing database is only stamped, never rebuilt.
+
+After changing `models.py`, generate the migration and review it before trusting it:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m budget_tracker.migrations new "add monthly budget table"
 ```
 
 ### Running the tests

@@ -46,9 +46,16 @@ def _cmd_rule(args: argparse.Namespace) -> int:
             if not rules:
                 print("No vendor rules defined.")
                 return 0
-            width = max(len(r.pattern) for r in rules)
+
+            from rich.console import Console
+            from rich.table import Table
+
+            table = Table(box=None, pad_edge=False)
+            table.add_column("Pattern")
+            table.add_column("Vendor")
             for rule in rules:
-                print(f"  {rule.pattern:<{width}}  ->  {rule.vendor_name.value}")
+                table.add_row(rule.pattern, rule.vendor_name.value)
+            Console().print(table)
             return 0
 
         if args.rule_command == "add":

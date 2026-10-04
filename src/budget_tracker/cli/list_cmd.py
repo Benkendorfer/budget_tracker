@@ -8,6 +8,7 @@ from typing import Optional
 from .. import categories as categories_module
 from .. import queries
 from ..db import get_engine, get_sessionmaker, init_db
+from ..tui.formatting import _fmt_amount, _fmt_amount_for
 
 
 def _resolve_category(session, name: str) -> Optional[int]:
@@ -84,6 +85,11 @@ def _cmd_list(args: argparse.Namespace) -> int:
             filters=filters,
         )
         totals = queries.get_totals(session, filters=filters)
+        # Each row's amount is in its own currency -- not necessarily home_currency --
+        # so formatting it right needs that currency's own decimal places and symbol
+        # (see formatting._fmt_amount_for), the same lookup the app's own transactions
+        # table does.
+        currencies = {c.code: c for c in queries.get_currencies(session)}
 
     console = Console()
     table = Table(box=None, pad_edge=False)
@@ -98,17 +104,22 @@ def _cmd_list(args: argparse.Namespace) -> int:
         style = "dim" if txn.is_transfer else ("red" if txn.amount_minor < 0 else "green")
         description = f"⇄ {txn.description}" if txn.is_transfer else txn.description
         row = [txn.posted_date, description, txn.vendor, txn.category]
+        amount = _fmt_amount_for(txn.amount_minor, currencies.get(txn.currency))
         table.add_row(
             *([f"[dim]{c}[/dim]" for c in row] if txn.is_transfer else row),
-            f"[{style}]{txn.amount_minor / 100:,.2f}[/{style}]",
+            f"[{style}]{amount}[/{style}]",
         )
     console.print(table)
+    # The totals below are converted to home_currency, same as the app's status line
+    # (tui/app.py), which also formats them with the plain two-decimal default rather
+    # than looking up home_currency's own CurrencyRow -- kept consistent with that
+    # rather than fixed here on its own.
     console.print(
         f"[bold]{totals.count} txns[/bold]"
         + (f" ({totals.transfer_count} transfers excluded)" if totals.transfer_count else "")
         + "   "
-        f"net {totals.net_minor / 100:,.2f}   "
-        f"out {totals.outflow_minor / 100:,.2f}   "
-        f"in {totals.inflow_minor / 100:,.2f}"
+        f"net {_fmt_amount(totals.net_minor)}   "
+        f"out {_fmt_amount(totals.outflow_minor)}   "
+        f"in {_fmt_amount(totals.inflow_minor)}"
     )
     return 0

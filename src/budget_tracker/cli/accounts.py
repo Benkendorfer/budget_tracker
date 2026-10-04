@@ -43,7 +43,15 @@ def _cmd_account(args: argparse.Namespace) -> int:
     if not rows:
         print("No accounts yet.")
         return 0
-    width = max(len(r.name) for r in rows)
+
+    from rich.console import Console
+    from rich.table import Table
+
+    table = Table(box=None, pad_edge=False)
+    table.add_column("Name")
+    table.add_column("Txns", justify="right")
+    table.add_column("Currency")
     for row in rows:
-        print(f"  {row.name:<{width}}  {row.count:>6} txns  {row.currency}")
+        table.add_row(row.name, f"{row.count} txns", row.currency)
+    Console().print(table)
     return 0

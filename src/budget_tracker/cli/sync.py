@@ -450,11 +450,21 @@ def _sync_status(args: argparse.Namespace) -> int:
         print("No sync connections yet. Run 'budget sync connect' to add one.")
         return 0
 
+    from rich.console import Console
+    from rich.table import Table
+
+    console = Console()
     for status in statuses:
         print(f"{status.name} ({status.provider})")
         if not status.accounts:
             print("  (no accounts mapped yet; run 'budget sync map')")
             continue
+        table = Table(box=None, pad_edge=False)
+        table.add_column("Local")
+        table.add_column("Remote")
+        table.add_column("Synced through")
+        table.add_column("Last synced")
+        table.add_column("Status")
         for account in status.accounts:
             synced = (
                 account.synced_through.isoformat() if account.synced_through else "never"
@@ -464,15 +474,16 @@ def _sync_status(args: argparse.Namespace) -> int:
                 if account.last_synced_at
                 else "never"
             )
-            line = (
-                f"  {account.local_name:<24} remote: {account.remote_name:<24} "
-                f"synced through: {synced:<10} last synced: {last_synced}"
-            )
             if account.last_status == SYNC_ERROR:
-                line += f"  ERROR: {account.last_error}"
+                outcome = f"ERROR: {account.last_error}"
             elif account.last_status == SYNC_OK:
-                line += "  ok"
-            print(line)
+                outcome = "ok"
+            else:
+                outcome = ""
+            table.add_row(
+                account.local_name, account.remote_name, synced, last_synced, outcome
+            )
+        console.print(table)
     return 0
 
 
