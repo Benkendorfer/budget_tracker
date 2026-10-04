@@ -104,6 +104,28 @@ def test_claim_posts_the_decoded_url_with_an_empty_body_and_returns_the_access_u
     assert calls[0].full_url == claim_url
     assert calls[0].get_method() == "POST"
     assert calls[0].data == b""
+    # Without its own agent, urllib's default is refused by the Cloudflare firewall in
+    # front of SimpleFIN Bridge with a 403 that reads exactly like a used token.
+    assert calls[0].get_header("User-agent") == simplefin.USER_AGENT
+
+
+def test_claim_403_quotes_the_servers_reply(monkeypatch):
+    import io
+
+    claim_url = "https://bridge.example/claim/abc123"
+    token = base64.b64encode(claim_url.encode("ascii")).decode("ascii")
+
+    def blocked(req, timeout):
+        raise urllib.error.HTTPError(
+            req.full_url, 403, "Forbidden", None, io.BytesIO(b"error code: 1010\n")
+        )
+
+    _install(monkeypatch, blocked)
+
+    with pytest.raises(simplefin.ClaimFailed) as excinfo:
+        simplefin.claim(token)
+    assert "error code: 1010" in str(excinfo.value)
+    assert "abc123" not in str(excinfo.value)
 
 
 def test_claim_403_raises_claim_failed_without_leaking_the_claim_url_creds(monkeypatch):
@@ -161,6 +183,7 @@ def test_fetch_accounts_sends_basic_auth_and_version_but_never_pending(monkeypat
     request = calls[0]
     expected_token = base64.b64encode(b"alice:topsecret").decode("ascii")
     assert request.get_header("Authorization") == f"Basic {expected_token}"
+    assert request.get_header("User-agent") == simplefin.USER_AGENT
     query = _query(request)
     assert query["version"] == ["2"]
     assert "pending" not in query
@@ -343,17 +366,20 @@ def test_fetch_accounts_transport_failure_is_wrapped_and_redacted(monkeypatch):
 # ------------------------------------------------------------- window splitting / merging
 
 
-def test_fetch_accounts_does_not_split_a_window_of_exactly_90_days(monkeypatch):
+def test_fetch_accounts_does_not_split_a_window_of_exactly_the_request_limit(monkeypatch):
     calls = _install(monkeypatch, lambda req, timeout: _json_response({"accounts": []}))
-
-    simplefin.fetch_accounts(ACCESS_URL, start=date(2026, 1, 1), end=date(2026, 4, 1))
-
-    assert len(calls) == 1  # Jan 1 .. Apr 1 is exactly 90 days
-
-
-def test_fetch_accounts_splits_a_window_over_90_days_into_consecutive_requests(monkeypatch):
     start = date(2026, 1, 1)
-    end = start + timedelta(days=91)
+
+    simplefin.fetch_accounts(
+        ACCESS_URL, start=start, end=start + timedelta(days=simplefin.REQUEST_WINDOW_DAYS)
+    )
+
+    assert len(calls) == 1
+
+
+def test_fetch_accounts_splits_a_window_over_the_limit_into_consecutive_requests(monkeypatch):
+    start = date(2026, 1, 1)
+    end = start + timedelta(days=simplefin.REQUEST_WINDOW_DAYS + 1)
 
     def respond(req, timeout):
         query = _query(req)
@@ -389,7 +415,7 @@ def test_fetch_accounts_splits_a_window_over_90_days_into_consecutive_requests(m
 
 def test_fetch_accounts_merges_transactions_across_windows_deduping_by_id(monkeypatch):
     start = date(2026, 1, 1)
-    end = start + timedelta(days=95)
+    end = start + timedelta(days=simplefin.REQUEST_WINDOW_DAYS + 5)
     windows = []
 
     def respond(req, timeout):
@@ -440,7 +466,7 @@ def test_fetch_accounts_merges_transactions_across_windows_deduping_by_id(monkey
 
 def test_fetch_accounts_merges_errors_from_every_window(monkeypatch):
     start = date(2026, 1, 1)
-    end = start + timedelta(days=95)
+    end = start + timedelta(days=simplefin.REQUEST_WINDOW_DAYS + 5)
     seen = []
 
     def respond(req, timeout):

@@ -79,9 +79,21 @@ class AuthFailed(SimpleFINError):
     """The access URL's credentials were rejected (401/403) -- access was revoked."""
 
 
-# SimpleFIN limits a single /accounts request to this many days; longer ranges must be
-# split into consecutive requests and merged client-side (see fetch_accounts).
+# How far back SimpleFIN will serve history at all (see sync.py's lookback).
 MAX_WINDOW_DAYS = 90
+
+# The longest range one /accounts request asks for. SimpleFIN Bridge answers a longer
+# one in full but adds "Requested date range exceeds recommended range of 45 days. In
+# the future, this may be capped." to errlist, so longer ranges are split into
+# consecutive requests and merged client-side (see fetch_accounts). A routine sync
+# spans 10-20 days and stays one request; only a first sync becomes two.
+REQUEST_WINDOW_DAYS = 45
+
+# SimpleFIN Bridge sits behind Cloudflare, which refuses urllib's default
+# "Python-urllib/3.x" agent with a bare 403 (Cloudflare error 1010) -- indistinguishable,
+# by status alone, from a setup token that was already claimed. Every request names the
+# app instead.
+USER_AGENT = "budget-tracker/0.1"
 
 
 def redact(url: str) -> str:
@@ -122,6 +134,20 @@ def decode_setup_token(token: str) -> str:
     return decoded
 
 
+def _short_reply(error: urllib.error.HTTPError) -> str:
+    """``': <first line of the body>'`` for an error message, or nothing.
+
+    Kept short and to one line: it is there to tell a firewall's refusal from the
+    server's, not to relay a whole HTML error page.
+    """
+    try:
+        text = error.read().decode("utf-8", "replace").strip()
+    except Exception:  # noqa: BLE001 - a body we cannot read is just left out
+        return ""
+    first = text.splitlines()[0][:80] if text else ""
+    return f": {first}" if first else ""
+
+
 def claim(setup_token: str, *, timeout: float = 30) -> str:
     """POST the decoded claim URL with an empty body; returns the access URL.
 
@@ -133,18 +159,21 @@ def claim(setup_token: str, *, timeout: float = 30) -> str:
     # userinfo, and a transport failure leaves it unclaimed -- still usable by anyone who
     # reads the message. Name the host and nothing else.
     where = urllib.parse.urlsplit(claim_url).hostname
-    request = urllib.request.Request(claim_url, data=b"", method="POST")
+    request = urllib.request.Request(
+        claim_url, data=b"", method="POST", headers={"User-Agent": USER_AGENT}
+    )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             status = getattr(response, "status", 200)
             body = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
-        if exc.code == 403:
-            raise ClaimFailed(
-                f"setup token already claimed or unknown ({where})"
-            ) from exc
+        # Quote the server's own reply: a 403 from the firewall in front of the server
+        # ("error code: 1010") and one from the server itself ("was it already
+        # claimed?") look identical by status, and only one of them is about the token.
+        reply = _short_reply(exc)
         raise ClaimFailed(
-            f"claim failed with HTTP {exc.code} ({where})"
+            f"setup token was rejected by {where} (HTTP {exc.code}{reply}). It may "
+            "already have been used; if so, create a new one."
         ) from exc
     except (urllib.error.URLError, OSError) as exc:
         raise SimpleFINError(f"could not reach {where}: {exc}") from exc
@@ -182,19 +211,19 @@ def _basic_auth_header(parsed: urllib.parse.SplitResult) -> str:
 def _split_window(
     start: Optional[date], end: Optional[date]
 ) -> List[Tuple[Optional[date], Optional[date]]]:
-    """Break a start/end range into consecutive chunks no longer than MAX_WINDOW_DAYS.
+    """Break a start/end range into consecutive chunks no longer than REQUEST_WINDOW_DAYS.
 
     Either end being ``None`` means "let the server use its default", which can't be
     split against a range it doesn't know -- passed through as the single window.
     """
     if start is None or end is None:
         return [(start, end)]
-    if (end - start).days <= MAX_WINDOW_DAYS:
+    if (end - start).days <= REQUEST_WINDOW_DAYS:
         return [(start, end)]
     windows: List[Tuple[date, date]] = []
     cursor = start
     while cursor < end:
-        chunk_end = min(cursor + timedelta(days=MAX_WINDOW_DAYS), end)
+        chunk_end = min(cursor + timedelta(days=REQUEST_WINDOW_DAYS), end)
         windows.append((cursor, chunk_end))
         cursor = chunk_end
     return windows
@@ -316,7 +345,9 @@ def _fetch_accounts_once(
     if balances_only:
         query.append(("balances-only", "1"))
     url = f"{base}/accounts?{urllib.parse.urlencode(query)}"
-    request = urllib.request.Request(url, headers={"Authorization": auth_header})
+    request = urllib.request.Request(
+        url, headers={"Authorization": auth_header, "User-Agent": USER_AGENT}
+    )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             raw = response.read()
@@ -350,7 +381,7 @@ def fetch_accounts(
     """GET ``<access url>/accounts``, auth via Basic from the URL's own userinfo.
 
     ``start``/``end`` are protocol semantics: start inclusive, end exclusive. A range
-    over :data:`MAX_WINDOW_DAYS` is split into consecutive requests and merged (see
+    over :data:`REQUEST_WINDOW_DAYS` is split into consecutive requests and merged (see
     :func:`_merge_account_sets`) so callers never have to think about the server's
     90-day limit. Always sends ``version=2``; never ``pending=1`` -- pending rows are
     not wanted here.
