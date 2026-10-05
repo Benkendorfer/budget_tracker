@@ -6,7 +6,7 @@ that never left your control.
 
 Two transactions are paired when they have the same amount with opposite signs, sit in
 different accounts, and post within ``window_days`` of each other. Paired legs share a
-``transfer_group_id``, are categorised as ``Transfer``, and are left out of the
+``transfer_group_id``, are categorized as ``Transfer``, and are left out of the
 inflow/outflow totals. Same-account pairing is off by default and opt-in via
 ``allow_same_account``, for the case where several sub-accounts of one provider are
 tracked here as a single account.
@@ -315,7 +315,7 @@ def mark_manual_transfer(
     transaction of its own -- category ``Fees``, *not* part of the transfer group -- so
     the two transfer legs cancel exactly (an account's balance still foots) while the fee
     itself keeps counting as an expense. A leg that sent less than was received (a
-    positive difference) splits the excess off the inflow leg the same way, labelled
+    positive difference) splits the excess off the inflow leg the same way, labeled
     "Transfer difference" instead of "Transfer fee", but is otherwise identical.
     Different currencies are paired with no split at all -- there is no single number to
     call "the fee" without a conversion this function has no business doing -- and
@@ -428,7 +428,7 @@ def unmark_manual_transfer(session: Session, txn_ids: Sequence[int]) -> int:
     always has exactly two members, so there is nothing a partial undo could mean.
 
     Each leg is un-grouped, its category cleared back to ``unset`` (handing it back to
-    rules or a manual re-categorisation, same as :func:`clear_transfers`), and the
+    rules or a manual re-categorization, same as :func:`clear_transfers`), and the
     manual-transfer tag removed. A fee or difference row split off by the original call
     is folded back into its leg's amount and deleted, found by its ``":fee"``-suffixed
     import hash.

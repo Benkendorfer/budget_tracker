@@ -11,12 +11,13 @@
     - [Searching transactions](#searching-transactions)
     - [Renaming and grouping vendors](#renaming-and-grouping-vendors)
     - [Vendor rename rules](#vendor-rename-rules)
-    - [Categorising transactions](#categorising-transactions)
+    - [Categorizing transactions](#categorizing-transactions)
     - [Nesting categories](#nesting-categories)
     - [Statistics](#statistics)
     - [Charts](#charts)
     - [Pie chart](#pie-chart)
     - [Transfers between your own accounts](#transfers-between-your-own-accounts)
+    - [Monthly budget](#monthly-budget)
     - [Currencies and exchange rates](#currencies-and-exchange-rates)
     - [Importing data](#importing-data)
     - [Where the data lives](#where-the-data-lives)
@@ -108,6 +109,8 @@ vendor not listed. Type commands into the bar at the bottom:
 | `chart <window> [day\|week\|month] [net\|spending\|income]` | Skip the picker, and set the bar width and what the bars measure: `chart 1y month spending` |
 | `pie` | Pick a time window, then see each category's share of spending over time (see below) |
 | `pie <window>` | Skip the picker: `pie 6m`, `pie 1 year`, `pie 2025-01-01..2025-06-30` |
+| `budget [YYYY-MM]` | This month (or another) against its budget: spent, left, and pace (see "Monthly budget") |
+| `budget plan [YYYY-MM] [N]` | Plan a month's budget beside each category's average over the last N months (default 6); `enter` edits a row |
 | `trips` | See each trip's dates, cost, and travel-bucket breakdown as a color bar (see below) |
 | `trip bucket <categories> = <bucket>` | Map one or more categories to a travel bucket; a blank bucket unmaps it (see below) |
 | `trip buckets` | Show the bucket map, grouped by bucket |
@@ -213,11 +216,11 @@ budget list --trip "Japan 2026"
 # Give a raw vendor string a readable display name.
 budget rename "COFFEE SHOP A" "Coffee"
 
-# Categorise a vendor by hand, or undo it.
+# Categorize a vendor by hand, or undo it.
 budget categorize "COFFEE SHOP A" "Dining"
 budget categorize "COFFEE SHOP A" --clear
 
-# Categorise by pattern instead, now and on every future import.
+# Categorize by pattern instead, now and on every future import.
 budget category-rule add "*COFFEE*" "Dining"
 budget category-rule list
 
@@ -335,12 +338,12 @@ column says which kind each rule is:
  category   *CAVA*                      Dining                   34
  category   RENT PAYMENT*               Housing                  12
 
- 4 rules   17 vendors named   46 txns categorised   escape to return to transactions
+ 4 rules   17 vendors named   46 txns categorized   escape to return to transactions
 ```
 
 `Count` means raw vendors for a vendor rule and transactions for a category rule — in
 both cases, what that rule currently owns. A row a category rule matched but could not
-take, because you had categorised it by hand, is not counted.
+take, because you had categorized it by hand, is not counted.
 
 Press `escape` to go back to the transactions. Adding a rule while the panel is open
 updates it in place. Removing a rule is CLI-only for now.
@@ -365,7 +368,7 @@ name:
 Rules are stored, not baked in: they are re-evaluated rather than rewriting transactions,
 and `raw_description` always preserves the bank's original text.
 
-### Categorising transactions
+### Categorizing transactions
 
 Imports keep whatever category the bank supplied, which is often wrong and often blank.
 There are two ways to fix that, and they behave differently:
@@ -385,24 +388,24 @@ filter.
 The two coexist by the same rules vendor renames do, and each transaction records which
 set its category:
 
-- **A manual category always wins.** Rules skip transactions you categorised by hand, and
+- **A manual category always wins.** Rules skip transactions you categorized by hand, and
   so does the next import. Clearing one hands it back to the rules.
-- **Rules own the transactions they categorise.** Re-pointing a rule updates them, and
+- **Rules own the transactions they categorize.** Re-pointing a rule updates them, and
   removing a rule clears them again. A rule overwrites the bank's own category, but never
   touches a detected transfer, so both legs of one keep reading as a transfer.
 - **Rules re-apply at the end of every import**, so new transactions arrive already
-  categorised. `budget category-rule apply` is only needed if the database is changed
+  categorized. `budget category-rule apply` is only needed if the database is changed
   outside the app.
 
 A rule pattern is a case-insensitive glob matched against **the raw merchant string or
 the display name**, so `*CAVA*` keeps working after you rename the vendor, and a rule
 written against a name you chose catches every raw vendor grouped under it. When several
 rules match, the oldest one wins. A manual `categorize` accepts either name too: give it a
-display name and the whole override group is categorised.
+display name and the whole override group is categorized.
 
 The important difference between the two is what happens next month. **A manual category
 applies to the transactions that exist right now.** Rows imported later come in
-uncategorised — the vendor is not remembered, only its transactions were changed — so use
+uncategorized — the vendor is not remembered, only its transactions were changed — so use
 a rule for anything recurring, and keep manual categories for one-offs and for the rows
 where a rule gets it wrong.
 
@@ -655,7 +658,7 @@ again. The footer shows `→ Drill down` while a stats row is highlighted and `�
 stats` once you have drilled in; neither status line has room left to say so, having both
 already measured out to their 92-column budget with a real year of five-figure totals.
 
-The `Uncategorised` row drills in like any other, which is the quickest way to find what
+The `Uncategorized` row drills in like any other, which is the quickest way to find what
 still needs a rule. `ctrl+l`, or `all`, clears the window again along with the rest of the
 filters — a drill-down is not sticky.
 
@@ -677,7 +680,7 @@ the figures, and the status line reports how many (`⇄ 43`) so the money is nev
 without explanation.
 
 Averages are per *average* month (30.44 days) rather than per calendar month, so a window
-starting mid-month is not penalised by partial months at either end.
+starting mid-month is not penalized by partial months at either end.
 
 ### Charts
 
@@ -693,7 +696,7 @@ transactions.
 
 Three choices, cycled with `m` or named on the command line (`chart 1y income`):
 
-**`net`** — the default. Outflow and inflow added together, drawn either side of a centre
+**`net`** — the default. Outflow and inflow added together, drawn either side of a center
 axis: a bucket that cost more than it took in grows **left**, one that took in more grows
 **right**. A month whose spending was matched by a refund sits *on* the line rather than
 reading as a heavy month.
@@ -720,7 +723,7 @@ whatever is most worth seeing beside it. Only `net` has a sign to encode, so the
 use the full width of the column in the conventional direction. That also means `net` draws
 in whole cells while the other two get eighth-cell precision (`▏▎▍`) — a bar growing
 *leftwards* is anchored at its right-hand end, and Unicode has no left-facing counterpart
-to those eighth blocks, so quantising both sides of the axis keeps the two directions of
+to those eighth blocks, so quantizing both sides of the axis keeps the two directions of
 `net` honestly comparable with each other.
 
 The measure sticks when you change period — it is a question about the money, not about
@@ -797,6 +800,58 @@ Press `b` to cycle the bucket: week, month (the default), or year — deliberate
 daily option here, since a year charted by day is 365 rows; the chart panel keeps its
 own day/week/month cycle for exactly that reason.
 
+### Monthly budget
+
+Two views, both in the app and on the command line. **`budget plan`** is where a budget is
+set; **`budget`** tracks a month against it.
+
+The plan view puts your **income target** at the top, then every category you have spent in
+lately, each with its average monthly spend over the last N months (6 unless you say
+otherwise; `n` cycles 3/6/12), last month's actual, and its budget. Put the cursor on a row
+and press `enter` to type an amount (blank clears it); the income row sets the target. The
+footer compares the total budgeted with the income target, and what is left is
+**unallocated** -- in effect, planned savings.
+
+```bash
+budget limits plan 2026-11 --months 12        # the same table on the command line
+budget limits set Food 800 --month 2026-11    # set (or change) one category
+budget limits clear Food --month 2026-11
+budget limits income 9000 --month 2026-11     # the income target; --clear removes it
+```
+
+The tracking view shows, for each budgeted category, its budget, what has been spent, what
+is left, and how much of it is used. Over-budget rows are highlighted; in the current month,
+a category further through its budget than the month is through its days is flagged as
+**ahead of pace**. The status line sums it up -- days elapsed, how many categories are over,
+what is left, and what was spent in categories without a budget, so nothing is missing from
+the picture. `budget limits [YYYY-MM]` prints the same on the command line.
+
+How the figures work:
+
+- **One plan per month, copied forward.** A month you have not planned uses the most recent
+  plan before it (the status line says "plan from Sep 2026"). Editing such a month first
+  copies that plan into it, so changes -- including removing a category's budget -- apply
+  from that month on and leave earlier months alone. Clearing *every* amount in a month
+  leaves it unplanned, so it falls back to the previous plan.
+- **Subcategories roll up.** A budget on Food covers Dining and Groceries too; Dining can
+  have its own budget as well. Totals count only the top-most budgeted category, so a parent
+  and its child are never counted twice.
+- **A parent without a budget of its own shows the sum of its subcategories'**, in yellow.
+  It is computed, never stored, so it follows them as they change; typing an amount on that
+  row makes it a real budget. A parent budgeted *below* that sum is shown in red with both
+  figures (`1,000.00 < 1,300.00`), since it cannot actually hold its subcategories.
+- **Folding.** In the plan, `z` (or `space`) folds a category's subcategories under it and
+  `f` folds or opens them all -- the same keys as the statistics panel.
+- **The same figures as the statistics panel.** Spending is net of refunds, transfers and
+  excluded rows are left out, and other currencies are converted to dollars -- a budget
+  and `stats` for the same month always agree. Income is what top-level categories brought
+  in on balance (paychecks, interest, dividends); a refund reduces its own category's
+  spending rather than counting as income.
+- **Averages divide by all N months**, so a month without spending in a category counts as
+  zero. A one-off month (a bonus, a move) pulls the average with it; last month's actual is
+  shown beside it for that reason.
+- **Each month starts fresh**: unspent budget does not carry over.
+
 ### Currencies and exchange rates
 
 Every transaction records the currency it happened in, and every account is denominated
@@ -843,7 +898,7 @@ safely written before the fetch is even attempted. The CLI does the same on `bud
 import`, just synchronously (a one-shot command has nothing to stay responsive for).
 
 **A missing rate is never guessed.** It is not treated as 1.0 and not averaged from
-neighbours; the amount is reported as unconverted instead, the same way transfers excluded
+neighbors; the amount is reported as unconverted instead, the same way transfers excluded
 from a total are counted rather than silently dropped. Every status line that shows money —
 transactions, statistics, the chart, the pie — says so when it happens: `(N unconverted,
 rates fetch)` on the transactions line, and a terser `⚠ N` where the line has no room to
@@ -860,7 +915,7 @@ income double-counts money that never left your control.
 `budget transfers` (or `transfers` in the app) pairs them up. Two transactions match when
 they have **the same amount with opposite signs**, sit in **different accounts**, and post
 **within a few days** of each other — `--days` controls the window, five by default.
-Paired rows are categorised as `Transfer`, share a `transfer_group_id`, and drop out of
+Paired rows are categorized as `Transfer`, share a `transfer_group_id`, and drop out of
 the inflow and outflow figures. They are still listed, and the totals line says how many
 were excluded:
 
@@ -868,8 +923,8 @@ were excluded:
 1939 txns (110 transfers excluded)   net -995.04   out -165,541.56   in 164,546.52
 ```
 
-Detected transfers are **greyed out and flagged with `⇄`** in both the app and
-`budget list`, and their amounts lose the red/green colouring:
+Detected transfers are **grayed out and flagged with `⇄`** in both the app and
+`budget list`, and their amounts lose the red/green coloring:
 
 ```text
 2026-07-20  POS-: MTA*NYCT PAYGO       MTA                  Auto & Transport     -3.00
@@ -934,7 +989,7 @@ an account that is not tracked here at all. Select the rows and run
 sel exclude         sel include
 ```
 
-Excluded rows are greyed out like a transfer, tagged `excluded`, and left out of every
+Excluded rows are grayed out like a transfer, tagged `excluded`, and left out of every
 figure the app draws — the totals line, statistics, chart, pie, and trips — because they
 go through the same rule transfers do. Their category is left as it was. `sel exclude`
 skips rows that are already a transfer, `transfers reset` never touches an exclusion, and

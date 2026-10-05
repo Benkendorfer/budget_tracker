@@ -608,8 +608,14 @@ def test_init_db_creates_the_tag_tables_on_a_database_that_predates_them(tmp_pat
     # A minimal legacy-shaped database: everything except tag/transaction_tag, built
     # directly rather than through Base.metadata so the two new tables are genuinely
     # absent going in.
+    # Only baseline tables: a database this old cannot have anything a later
+    # migration added (budget_amount), and init_db's own upgrade would collide with it.
+    from budget_tracker.db import _BASELINE_TABLES
+
     legacy_tables = [
-        t for t in Base.metadata.sorted_tables if t.name not in ("tag", "transaction_tag")
+        t
+        for t in Base.metadata.sorted_tables
+        if t.name in _BASELINE_TABLES and t.name not in ("tag", "transaction_tag")
     ]
     with engine.begin() as connection:
         for table in legacy_tables:

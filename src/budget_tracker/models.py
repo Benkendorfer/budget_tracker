@@ -123,7 +123,7 @@ class VendorRule(Base):
 
 
 class CategoryRule(Base):
-    """A glob pattern that categorises the transactions of matching vendors.
+    """A glob pattern that categorizes the transactions of matching vendors.
 
     ``pattern`` is matched case-insensitively (shell-style ``*`` and ``?``) against
     ``vendor.name`` *or* the vendor's display name, so a rule can be written against
@@ -349,6 +349,38 @@ class TransactionTag(Base):
     tag_id: Mapped[int] = mapped_column(
         ForeignKey("tag.id", ondelete="CASCADE"), primary_key=True
     )
+
+
+class BudgetAmount(Base):
+    """One stored amount of a monthly budget plan -- see :mod:`.budget`.
+
+    ``month`` is always the first of a calendar month. A row with ``kind="expense"``
+    always carries a ``category_id``; the income target is ``kind="income"`` with
+    ``category_id`` NULL, which is why that column is nullable while the unique
+    constraint still includes it (SQLite treats NULLs in a unique index as distinct,
+    so this only ever constrains one income-target row per month because
+    :mod:`.budget` enforces that in code, not here).
+
+    Deleting a category cascades its budget rows, the same as :class:`CategoryRule`
+    does not (that one has no ``ondelete`` and is cleaned up elsewhere) -- a budget on
+    a deleted category has nothing left to mean.
+    """
+
+    __tablename__ = "budget_amount"
+    __table_args__ = (
+        UniqueConstraint("month", "kind", "category_id", name="uq_budget_amount_month_kind_category"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    month: Mapped[date] = mapped_column()
+    category_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("category.id", ondelete="CASCADE"), default=None
+    )
+    kind: Mapped[str] = mapped_column(String)  # "expense" | "income"
+    amount_minor: Mapped[int] = mapped_column()  # positive, home-currency minor units
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+    category: Mapped[Optional[Category]] = relationship()
 
 
 class TripBucket(Base):

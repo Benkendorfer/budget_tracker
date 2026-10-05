@@ -285,7 +285,7 @@ def test_a_sel_verb_without_a_value_is_a_usage_error_not_a_write(tmp_path, monke
 
 def test_an_unknown_sel_subcommand_warns_without_crashing(tmp_path, monkeypatch):
     async def body(app, pilot):
-        app._run_command("sel colour = blue")
+        app._run_command("sel color = blue")
         await pilot.pause()
         return list(app._notifications)[-1]
 

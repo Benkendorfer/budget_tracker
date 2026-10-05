@@ -23,6 +23,7 @@ filters are ``self._active_filters()`` here for exactly that reason.
 
 from __future__ import annotations
 
+from datetime import date
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set, Tuple, Union
 
@@ -50,13 +51,16 @@ from textual.widgets import (
 # split does not get to change), and ImportCommands reads them back off this live
 # module object at call time precisely so that patch takes effect -- see
 # commands/imports.py's `_app_module()`.
+from .. import budget as budget_module
 from .. import charts, models, queries, stats, tags as tags_module
 from ..db import DuplicateCategoryNamesError, get_engine, get_sessionmaker, init_db
 from ..importer import ImportCandidate, InboxFolder, import_csv  # noqa: F401
+from . import budget as budget_panel
 from . import periods as periods_panel
 from . import transactions
 from . import trips as trips_panel
 from .commands.actions import ActionCommands
+from .commands.budget import BudgetCommands
 from .commands.categories import CategoryCommands
 from .commands.chart import ChartCommands
 from .commands.drilldown import DrillDownCommands
@@ -86,6 +90,7 @@ class BudgetApp(
     RatesCommands,
     SyncCommands,
     TripCommands,
+    BudgetCommands,
     PeriodPickerCommands,
     StatsCommands,
     ChartCommands,
@@ -107,6 +112,7 @@ class BudgetApp(
     #trips_view { height: 1fr; }
     #trip_table { border: round $accent; height: 1fr; }
     #trips_legend { height: auto; padding: 0 1; color: $text-muted; }
+    #budget_track, #budget_plan { border: round $accent; height: 1fr; }
     #prompt { height: auto; padding: 1 1 0 1; color: $accent; }
     #status { height: 1; padding: 0 1; color: $text-muted; background: $panel; }
     #command { border: tall $accent; }
@@ -120,6 +126,7 @@ class BudgetApp(
 
     PANELS = (
         "txns", "rules", "imports", "setup", "periods", "stats", "chart", "pie", "trips",
+        "budget_track", "budget_plan",
     )
 
     # The sidebar's five collapsible sections, in the order they are stacked. Exactly
@@ -181,6 +188,8 @@ class BudgetApp(
         # plain (non-priority) binding reaches this once it has bubbled past whatever
         # is focused — see check_action() below for the "only on #stats_table" gate.
         Binding("space", "toggle_stats_fold", "Fold", show=True),
+        # z folds too, vim's own fold key; same action and gate as space.
+        Binding("z", "toggle_stats_fold", "Fold", show=False),
         # Same reasoning as space: a plain letter binding, not priority, so a command
         # like "filter foo" still gets its 'f' typed into #command rather than toggling
         # every fold in the stats table out from under the user.
@@ -189,9 +198,21 @@ class BudgetApp(
         # typed into a command is still just a letter.
         Binding("b", "cycle_bucket", "Bucket", show=True),
         Binding("m", "cycle_measure", "Measure", show=True),
+        # Same shape again: a plain letter, gated to the budget plan panel by
+        # check_action, so 'n' typed into a command is still just a letter.
+        Binding("n", "cycle_budget_months", "Months", show=True),
         # Same shape again: a plain letter, gated to the transactions table by
         # check_action, so 'x' typed into a command is still just a letter.
         Binding("x", "toggle_selected", "Select", show=True),
+        # Vim-style movement, in the same shape as the letters above: plain bindings, so
+        # the command bar still types them, and gated by check_action to a focused table
+        # or sidebar list. h/l do whatever the arrows do in that spot (drill in and back
+        # out of statistics, say), so the two never mean different things. Not shown in
+        # the footer: it is full already, and anyone reaching for hjkl knows them.
+        Binding("j", "vim_down", "Down", show=False),
+        Binding("k", "vim_up", "Up", show=False),
+        Binding("h", "vim_left", "Left", show=False),
+        Binding("l", "vim_right", "Right", show=False),
         ("ctrl+c", "quit", "Quit"),
     ]
 
@@ -323,6 +344,33 @@ class BudgetApp(
         # _foldable_ids rather than a shared one).
         self._trips_expanded: Set[int] = set()
         self._trips_foldable_ids: Set[int] = set()
+        # The tracking panel's month and last-built view, plus which stored month it
+        # actually came from (None if nothing was ever budgeted; a different month if
+        # this one copied forward -- see tui/budget.track_status()).
+        self._budget_month: Optional[date] = None
+        self._budget_track_view: Optional[budget_module.TrackView] = None
+        self._budget_track_source_month: Optional[date] = None
+        # Parallel to the rendered rows of #budget_track -- not yet used to map a
+        # cursor back to anything (the tracking panel has no per-row action), kept for
+        # symmetry with the plan panel and any future drill-down.
+        self._budget_track_rows: List[budget_panel.TrackPanelRow] = []
+        # Same shape for the plan panel, plus its own averaging window (see
+        # commands/budget.py's action_cycle_budget_months) and the rows enter actually
+        # edits -- see budget_panel.PlanPanelRow and _edit_budget_row().
+        self._budget_plan_month: Optional[date] = None
+        # commands/budget.py's DEFAULT_PLAN_MONTHS -- not imported for one constant;
+        # _do_budget_plan() always passes an explicit N anyway, so this is only ever
+        # seen before the panel has been opened once.
+        self._budget_plan_months: int = 6
+        self._budget_plan_view: Optional[budget_module.PlanView] = None
+        self._budget_plan_source_month: Optional[date] = None
+        self._budget_plan_rows: List[budget_panel.PlanPanelRow] = []
+        # Plan rows folded with z, by category id -- kept across months and refreshes,
+        # like the statistics panel's own folds.
+        self._budget_plan_collapsed: Set[int] = set()
+        # Awaiting a typed amount for the plan row enter opened -- see
+        # commands/budget.py's _edit_budget_row/_answer_budget_edit.
+        self._pending_budget_edit: Optional[budget_panel.BudgetEditTarget] = None
         self._range_pending = False  # awaiting a typed date range for the picker
         # Which panel the period picker is choosing for: "stats", "chart", or "pie". All
         # three open the same picker, and it has to know where the answer goes.
@@ -392,12 +440,14 @@ class BudgetApp(
                     # past the whole table to find and then back again.
                     yield Static("", id="trips_legend")
                     yield trips_panel.TripTable(id="trip_table")
+                yield DataTable(id="budget_track")
+                yield DataTable(id="budget_plan")
                 yield Static("", id="status")
         yield Input(
             placeholder=(
                 "command: import | unimport | filter | categorize | category | sel | "
-                "section | format | stats | chart | pie | trips | rates | sync | sort | "
-                "rules | all | refresh | help | quit"
+                "section | format | stats | chart | pie | trips | budget | rates | "
+                "sync | sort | rules | all | refresh | help | quit"
             ),
             id="command",
         )
@@ -420,6 +470,8 @@ class BudgetApp(
             # action_toggle_stats_fold()/action_toggle_all_stats_folds().
             if self._panel == "trips":
                 return self.focused is not None and self.focused.id == "trip_table"
+            if self._panel == "budget_plan":
+                return self.focused is not None and self.focused.id == "budget_plan"
             return (
                 self._panel == "stats"
                 and self.focused is not None
@@ -435,6 +487,14 @@ class BudgetApp(
                 self._panel == "chart"
                 and self.focused is not None
                 and self.focused.id == "chart"
+            )
+        if action in ("vim_down", "vim_up", "vim_left", "vim_right"):
+            return isinstance(self.focused, (DataTable, ListView))
+        if action == "cycle_budget_months":
+            return (
+                self._panel == "budget_plan"
+                and self.focused is not None
+                and self.focused.id == "budget_plan"
             )
         if action == "toggle_selected":
             return (
@@ -556,6 +616,20 @@ class BudgetApp(
         # width is adaptive (see trips_panel.bar_width), so it is only known once the
         # panel's actual width is.
 
+        budget_track = self.query_one("#budget_track", DataTable)
+        budget_track.cursor_type = "row"
+        budget_track.zebra_stripes = True
+        # Columns are added in budget_panel.fill_track, not here: the Used column's
+        # width is adaptive, same reason as the trips table's Breakdown column above.
+        budget_track.display = False
+
+        budget_plan = self.query_one("#budget_plan", DataTable)
+        budget_plan.cursor_type = "row"
+        budget_plan.zebra_stripes = True
+        # Columns are added in budget_panel.fill_plan, not here: the Avg/mo header
+        # names the current averaging window, which changes with 'n'.
+        budget_plan.display = False
+
         self.query_one("#stats", Vertical).display = False
         chart.display = False
         pie = self.query_one("#pie", Static)
@@ -582,7 +656,7 @@ class BudgetApp(
         at a time is what made adding a sixth touch every signature. Named
         ``_active_filters`` rather than the obvious ``_filters`` because Textual's own
         ``App`` already owns that attribute -- a list of line filters -- and shadowing it
-        replaces the method with a list the moment the app initialises. A caller that
+        replaces the method with a list the moment the app initializes. A caller that
         needs a different range says so with ``.replace(date_range=...)`` -- the
         statistics and chart panels do, because their window is the range, not whatever
         a drill-down happened to leave on ``self.date_filter``.
@@ -655,6 +729,15 @@ class BudgetApp(
         if self._panel == "trips":
             self._build_trips()
             self._fill_trips()
+        # Same idea for both budget panels: neither is scoped by the app's other
+        # filters (budget.track()/plan_rows() take none), so this only needs to
+        # notice the database changed while one of them is actually on screen.
+        if self._panel == "budget_track":
+            self._build_budget_track()
+            self._fill_budget_track()
+        if self._panel == "budget_plan":
+            self._build_budget_plan()
+            self._fill_budget_plan()
         # The rules panel's data comes from get_rules/get_category_rules, which match
         # every rule against every vendor -- not cheap, and not needed at all when the
         # panel is hidden, so (like stats/chart/pie/trips above) it is only rebuilt
@@ -904,6 +987,12 @@ class BudgetApp(
         if self._panel == "trips":
             status.update(trips_panel.trips_status(self._trip_data))
             return
+        if self._panel == "budget_track" and self._budget_track_view is not None:
+            status.update(self._budget_track_status())
+            return
+        if self._panel == "budget_plan" and self._budget_plan_view is not None:
+            status.update(self._budget_plan_status())
+            return
         if self._panel == "periods":
             status.update(
                 "choose a period   enter selects   "
@@ -963,7 +1052,7 @@ class BudgetApp(
             # rather than reusing the word "date".
             scope.append("bucket")
         if self.date_filter is not None:
-            # Spelled out rather than labelled "date": the drill-down from a statistics
+            # Spelled out rather than labeled "date": the drill-down from a statistics
             # row is the only thing that sets it, and the user needs to see which window
             # they landed in to reconcile the numbers they just clicked.
             scope.append(_range_label(self.date_filter))
@@ -1063,6 +1152,9 @@ class BudgetApp(
         if self._pending_category_merge is not None:
             self._answer_category_merge(text)
             return
+        if self._pending_budget_edit is not None:
+            self._answer_budget_edit(text)
+            return
         self._run_command(text.strip())
 
     def _do_refresh(self, arg: str) -> None:
@@ -1110,6 +1202,7 @@ class BudgetApp(
             "pie": self._do_pie,
             "trips": lambda arg: self._show_trips(),
             "trip": self._do_trip,
+            "budget": self._do_budget,
             "rates": self._do_rates,
             "sync": self._do_sync,
             "sort": self._do_sort,
@@ -1168,7 +1261,7 @@ class BudgetApp(
             "  transfer; any fee is split off and still counts as spending.\n"
             "  sel untransfer undoes it\n"
             "sel exclude — leave the selected rows out of every income and\n"
-            "  spending figure (greyed out, tagged #excluded), e.g. an ACATS move;\n"
+            "  spending figure (grayed out, tagged #excluded), e.g. an ACATS move;\n"
             "  sel include counts them again\n"
             "  the selection survives an edit, so you can set a category and then\n"
             "  a tag on the same rows without reselecting\n"
@@ -1191,14 +1284,14 @@ class BudgetApp(
             f"  stats {periods_panel.RANGE_EXAMPLE})\n"
             "  enter, or the right arrow, on a category row lists that window's\n"
             "  transactions; the left arrow goes back to the breakdown\n"
-            "  space, on a category row with children, folds/unfolds its subtree\n"
+            "  space or z, on a category row with children, folds/unfolds its subtree\n"
             "  f folds/unfolds every group at once\n"
             "chart — pick a period, then see money per day/week/month as bars\n"
             "chart <period> [day|week|month] [net|spending|income] — skip the\n"
             "  picker, set the bar width and what the bars measure (e.g.\n"
             "  chart 1y month spending); the bucket defaults to the period's\n"
             "  length. b cycles the bucket, m the measure. graph = chart\n"
-            "  net draws either side of a centre line: money out to the left,\n"
+            "  net draws either side of a center line: money out to the left,\n"
             "  money in to the right, so an even month sits on the line\n"
             "  click a category in the sidebar to chart just that category\n"
             "  enter, or the right arrow, on a bar lists that bucket's\n"
@@ -1227,6 +1320,24 @@ class BudgetApp(
             "  months ahead drags the start back). Leave either side of the '..'\n"
             "  empty to set just the other; a blank right-hand side derives both\n"
             "  again. Derived dates show dimmed with a '*'\n"
+            "budget [YYYY-MM] — track this month's spending against its plan: an\n"
+            "  income row (target vs actual), then each budgeted category's\n"
+            "  Budget/Spent/Left and a Used bar + %; over-budget rows show in the\n"
+            "  error color, ahead-of-pace ones in the warning color; a Budget cell\n"
+            "  in the warning color is the sum of its subcategories' budgets\n"
+            "budget plan [YYYY-MM] [months] — the editable plan for that month:\n"
+            "  income target at top, then each category's average monthly spend\n"
+            "  (over the window, default 6 months), last month's actual, and its\n"
+            "  budget, down to a total vs the income target → unallocated\n"
+            "  enter on a row asks for the amount in the command bar below,\n"
+            "  prefilled with the current one; blank clears it\n"
+            "  n cycles the averaging window 3/6/12 months; z (or space) folds a\n"
+            "  category's subcategories, f folds/unfolds them all\n"
+            "  a category with no budget of its own shows the sum of its\n"
+            "  subcategories' in the warning color; one budgeted below that sum\n"
+            "  shows red, with both totals\n"
+            "  an unplanned month reuses the most recent month that was ('plan\n"
+            "  from ...' in the status line)\n"
             "rates — list cached exchange rates (pair, source, span, count)\n"
             "rates fetch — cache ECB reference rates for every foreign currency\n"
             "  on file, over its whole date range; runs in the background so the\n"

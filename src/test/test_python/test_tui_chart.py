@@ -41,7 +41,7 @@ def test_the_chart_defaults_to_net_drawn_either_side_of_the_axis(tmp_path, monke
 
 
 def test_the_net_axis_lines_up_on_every_row(tmp_path, monkeypatch):
-    """A diverging chart whose centre wanders is not readable as a chart."""
+    """A diverging chart whose center wanders is not readable as a chart."""
     _setup_chart(tmp_path, monkeypatch)
 
     async def run():
@@ -90,7 +90,7 @@ def test_a_bucket_that_came_out_even_sits_on_the_axis(tmp_path, monkeypatch):
     # Charted as spending, February is now the biggest month of the three.
     assert spending[1][2] == "205.00"
     assert spending[1][1] == "█" * 27
-    # Charted as net, it is a sliver: the refund cancelled almost all of it.
+    # Charted as net, it is a sliver: the refund canceled almost all of it.
     assert net[1][2] == "-5.00"
     assert net[1][1].count("█") == 1
 

@@ -14,16 +14,25 @@ import pytest
 from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.migration import MigrationContext
+from alembic.script import ScriptDirectory
 from sqlalchemy import Column, Integer, Table, inspect, text
 
 from budget_tracker.db import DuplicateCategoryNamesError, get_engine, get_sessionmaker, init_db
 from budget_tracker.migrations import BASELINE_REVISION, MIGRATIONS_DIR, alembic_config
-from budget_tracker.models import Base, Category
+from budget_tracker.models import Base, BudgetAmount, Category
 
 
 def _version(engine):
     with engine.begin() as connection:
         return connection.execute(text("SELECT version_num FROM alembic_version")).scalar()
+
+
+def _head() -> str:
+    """The current head revision, read from the versions/ directory rather than
+    hardcoded -- tests below assert "ends up at head" rather than naming a specific
+    revision, so they keep working as more migrations are added after this one.
+    """
+    return ScriptDirectory.from_config(alembic_config()).get_current_head()
 
 
 def _legacy_database(engine):
@@ -88,7 +97,7 @@ def test_fresh_database_is_created_at_head(tmp_path):
     engine = get_engine(tmp_path / "fresh.db")
     init_db(engine)
 
-    assert _version(engine) == BASELINE_REVISION  # the only revision today
+    assert _version(engine) == _head()
 
     Session = get_sessionmaker(engine)
     with Session() as session:
@@ -104,7 +113,7 @@ def test_fresh_database_init_db_is_idempotent(tmp_path):
     init_db(engine)
     init_db(engine)  # already versioned; must take the upgrade-head branch and no-op
 
-    assert _version(engine) == BASELINE_REVISION
+    assert _version(engine) == _head()
 
 
 def test_unversioned_database_migrates_data_intact_and_gets_stamped(tmp_path):
@@ -113,7 +122,7 @@ def test_unversioned_database_migrates_data_intact_and_gets_stamped(tmp_path):
 
     init_db(engine)  # must not raise
 
-    assert _version(engine) == BASELINE_REVISION
+    assert _version(engine) == _head()
 
     columns = {c["name"] for c in inspect(engine).get_columns("vendor")}
     assert "vendor_name_source" in columns
@@ -150,7 +159,7 @@ def test_unversioned_database_second_init_db_is_a_no_op(tmp_path):
     version_after_first = _version(engine)
     init_db(engine)  # now versioned; must take the upgrade-head branch, not re-migrate
 
-    assert _version(engine) == version_after_first == BASELINE_REVISION
+    assert _version(engine) == version_after_first == _head()
 
 
 def test_unversioned_database_with_duplicate_category_names_is_still_refused(tmp_path):
@@ -174,12 +183,32 @@ def test_unversioned_database_with_duplicate_category_names_is_still_refused(tmp
 
 def test_already_versioned_database_upgrades_to_head_as_a_no_op(tmp_path):
     engine = get_engine(tmp_path / "versioned.db")
-    Base.metadata.create_all(engine)
-    command.stamp(alembic_config(engine), BASELINE_REVISION)
+    # Migrated the real way (not create_all + stamp) so this is genuinely already at
+    # head, not a database shaped like head but mislabeled -- the distinction matters
+    # once head is past the baseline, since create_all() against *current* models
+    # would include tables a later migration also creates.
+    command.upgrade(alembic_config(engine), "head")
 
     init_db(engine)  # must not raise, and must not touch anything since already at head
 
-    assert _version(engine) == BASELINE_REVISION
+    assert _version(engine) == _head()
+
+
+def test_database_stamped_at_baseline_upgrades_to_pick_up_a_later_migration(tmp_path):
+    """A real database that went through the Alembic-introducing commit is stamped
+    at ``BASELINE_REVISION`` and takes the "already versioned" branch of ``init_db``
+    from here on -- it must never again run ``create_all()``, so a table added by a
+    migration after baseline (``budget_amount``) can only come from actually running
+    that migration. This is the scenario migration 0002 has to get right.
+    """
+    engine = get_engine(tmp_path / "at_baseline.db")
+    command.upgrade(alembic_config(engine), BASELINE_REVISION)
+    assert "budget_amount" not in inspect(engine).get_table_names()
+
+    init_db(engine)
+
+    assert _version(engine) == _head()
+    assert "budget_amount" in inspect(engine).get_table_names()
 
 
 def test_head_schema_matches_models_exactly(tmp_path):
@@ -257,7 +286,23 @@ def test_autogenerate_detects_a_table_added_after_the_baseline(tmp_path):
         generated = list(out_dir.glob("*.py"))
         assert len(generated) == 1
         text_ = generated[0].read_text()
-        assert "down_revision" in text_ and BASELINE_REVISION in text_
+        assert "down_revision" in text_ and _head() in text_
         assert "create_table('throwaway_regression_table'" in text_
     finally:
         Base.metadata.remove(throwaway)
+
+
+def test_baseline_tables_match_the_baseline_revision():
+    """db._BASELINE_TABLES must name exactly what 0001_baseline creates: the pre-Alembic
+    branch creates only these before stamping the baseline, so a table missing here would
+    never be created for an old database, and an extra one would collide with its own
+    later migration."""
+    import re
+    from pathlib import Path
+
+    from budget_tracker import db
+    from budget_tracker.migrations import versions
+
+    baseline = Path(versions.__file__).parent / "0001_baseline_full_schema.py"
+    created = set(re.findall(r"create_table\(\s*['\"]([a-z_]+)['\"]", baseline.read_text()))
+    assert created == db._BASELINE_TABLES

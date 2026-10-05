@@ -65,7 +65,7 @@ def test_transfer_rows_are_marked_in_the_table(tmp_path, monkeypatch):
     rows = asyncio.run(run())
     transfer_row = rows["⇄ MOVE IN"]
     assert "⇄" in str(transfer_row[2])  # flagged
-    assert "dim" in str(transfer_row[5].style)  # and greyed, not red/green
+    assert "dim" in str(transfer_row[5].style)  # and grayed, not red/green
     ordinary = next(v for k, v in rows.items() if "COFFEE" in k)
     assert "⇄" not in str(ordinary[2])
     assert "dim" not in str(ordinary[5].style)

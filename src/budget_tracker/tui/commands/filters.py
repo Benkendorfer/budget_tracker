@@ -53,7 +53,7 @@ class FilterCommands:
         if rest.strip() and field.strip().lower() in queries.TEXT_FIELDS:
             text_filter = queries.TextFilter(rest.strip(), field.strip().lower())
         else:
-            # No recognised prefix, so the whole argument is the search text. This also
+            # No recognized prefix, so the whole argument is the search text. This also
             # means a colon inside ordinary text is treated literally.
             text_filter = queries.TextFilter(arg, "all")
         self.text_filter = text_filter

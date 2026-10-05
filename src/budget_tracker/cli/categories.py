@@ -36,7 +36,7 @@ def _cmd_categorize(args: argparse.Namespace) -> int:
         changed = categories.set_category(session, args.vendor, args.category)
         session.commit()
         print(
-            f"Categorised {changed} transaction(s) of {args.vendor!r} "
+            f"Categorized {changed} transaction(s) of {args.vendor!r} "
             f"as {args.category!r}."
         )
         return 0

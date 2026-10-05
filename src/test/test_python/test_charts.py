@@ -504,7 +504,7 @@ def _share_cat(name, share, total, depth=0, cid=None):
 
 
 def test_the_bar_fills_its_whole_track_exactly():
-    """A bar labelled 100% that does not fill its own track is the kind of small
+    """A bar labeled 100% that does not fill its own track is the kind of small
     wrongness nobody reports and everybody notices — and rounding each share
     independently leaves it short or long depending on the data."""
     for shares in ([0.5, 0.3, 0.2], [1/3, 1/3, 1/3], [0.07, 0.31, 0.62], [0.999, 0.001]):
@@ -544,7 +544,7 @@ def test_the_same_data_always_produces_the_same_bar():
 
 def test_slivers_are_folded_into_other_rather_than_dropped():
     """The bar has to still account for the whole window: a slice too thin to tell from
-    its neighbours is not the same thing as a slice that is not there."""
+    its neighbors is not the same thing as a slice that is not there."""
     bar = charts.build_share_bar(
         [_share_cat("Rent", 0.90, -90000)] + [_share_cat(f"Tiny{i}", 0.01, -1000) for i in range(10)],
         width=100,
@@ -630,7 +630,7 @@ def test_segments_run_biggest_first_with_other_last():
     not descend reads as broken even when every number on it is right."""
     bar = charts.build_share_bar([
         _share_cat("Travel", 0.22, -2200),
-        _share_cat("Uncategorised", 0.12, -1200),
+        _share_cat("Uncategorized", 0.12, -1200),
         _share_cat("Health", 0.19, -1900),
         _share_cat("Rent", 0.16, -1600),
         _share_cat("Sliver", 0.005, -50),
@@ -638,7 +638,7 @@ def test_segments_run_biggest_first_with_other_last():
     ], width=100)
 
     names = [seg.name for seg in bar.segments]
-    assert names == ["Food", "Travel", "Health", "Rent", "Uncategorised", "Other"]
+    assert names == ["Food", "Travel", "Health", "Rent", "Uncategorized", "Other"]
     drawn = [seg.cells for seg in bar.segments[:-1]]
     assert drawn == sorted(drawn, reverse=True)
     assert bar.segments[-1].is_other is True  # the tail always trails, whatever its size
@@ -736,7 +736,7 @@ def test_every_non_empty_bar_is_full_width_regardless_of_the_buckets_own_size():
 def test_a_category_large_in_one_bucket_but_small_overall_is_folded_in_both():
     """Sliver is 1% over the whole window and folds into the top bar's Other -- even
     though it is the only thing January spent on, January must fold it into Other too,
-    not draw it as its own segment, or the same colour would mean two different things
+    not draw it as its own segment, or the same color would mean two different things
     on two different rows."""
     top_categories = [
         _share_cat("Rent", 0.99, -99000, cid=1),

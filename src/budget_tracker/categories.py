@@ -1,4 +1,4 @@
-"""Categorising transactions.
+"""Categorizing transactions.
 
 A transaction's category is recorded together with who chose it, in
 ``transaction.category_source``:
@@ -14,7 +14,7 @@ A transaction's category is recorded together with who chose it, in
 ``rule``
     :func:`apply_category_rules`, which matches every vendor against the glob patterns
     in :class:`CategoryRule`. Rules own these rows, so editing or deleting a rule
-    re-categorises or clears them on the next apply.
+    re-categorizes or clears them on the next apply.
 
 Nothing here commits; callers own the transaction, as in :mod:`.vendors`.
 """
@@ -400,8 +400,8 @@ def merge_category(session: Session, source: str, target: str) -> MergeResult:
 def _vendor_ids(session: Session, vendor: str) -> List[int]:
     """Raw vendor ids meant by ``vendor``, a raw name or a display name.
 
-    A display name covers every raw vendor pointed at it, so categorising an override
-    group categorises the whole group — the same resolution
+    A display name covers every raw vendor pointed at it, so categorizing an override
+    group categorizes the whole group — the same resolution
     :func:`queries.resolve_vendor_filter` does for filtering.
     """
     vendor = vendor.strip()
@@ -429,7 +429,7 @@ def _transactions_of(session: Session, vendor_ids: List[int]) -> List[Transactio
 
 
 def set_category_for(session: Session, txn_ids: Sequence[int], value: str) -> int:
-    """Categorise the given transactions by hand. Returns rows written.
+    """Categorize the given transactions by hand. Returns rows written.
 
     Per-row form of :func:`set_category`, for the multi-select UI, which picks
     transactions rather than a vendor. An empty ``txn_ids`` is a no-op returning 0 --
@@ -472,10 +472,10 @@ def clear_category_for(session: Session, txn_ids: Sequence[int]) -> int:
 
 
 def set_category(session: Session, vendor: str, value: str) -> int:
-    """Categorise every transaction of ``vendor`` by hand. Returns rows written.
+    """Categorize every transaction of ``vendor`` by hand. Returns rows written.
 
     ``vendor`` is either a raw merchant string or a display name, in which case the
-    whole override group is categorised. Returns 0 when no such vendor exists; the
+    whole override group is categorized. Returns 0 when no such vendor exists; the
     caller reports that.
 
     The rows are stamped ``manual``, which protects them from rules, later imports and
@@ -542,7 +542,7 @@ def list_rules(session: Session) -> List[CategoryRule]:
 def apply_category_rules(session: Session) -> int:
     """Re-derive every rule-owned category. Returns the number of transactions changed.
 
-    Rows categorised by hand, and the legs of a detected transfer, are skipped; anything
+    Rows categorized by hand, and the legs of a detected transfer, are skipped; anything
     else a rule matches is overwritten, including the bank's own category. A row
     previously set by a rule that no longer matches is cleared, so deleting a rule
     undoes it.
@@ -569,7 +569,7 @@ def apply_category_rules(session: Session) -> int:
         if target is not None:
             source = RULE
         elif txn.category_source == RULE:
-            source = UNSET  # its rule is gone; revert to uncategorised
+            source = UNSET  # its rule is gone; revert to uncategorized
         else:
             continue
         if (txn.category_id, txn.category_source) != (target, source):

@@ -549,7 +549,7 @@ def test_clear_filters_also_clears_the_text_filter(tmp_path, monkeypatch):
 # relative to today rather than written into a fixture.
 
 
-def test_categorize_command_categorises_a_vendor(tmp_path, monkeypatch):
+def test_categorize_command_categorizes_a_vendor(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
 
     async def run():
@@ -594,7 +594,7 @@ def test_categorize_with_a_blank_category_clears_it(tmp_path, monkeypatch):
 
     before, after, messages = asyncio.run(run())
     assert before == "Coffee"
-    assert after == ""  # back to uncategorised, not left on the old category
+    assert after == ""  # back to uncategorized, not left on the old category
     assert any("cleared the category on 2 transactions" in m for m in messages)
 
 
@@ -843,7 +843,7 @@ def test_category_command_confirmed_relocates_the_existing_category(tmp_path, mo
     assert any(label.startswith("  Dining (") for label in sidebar)
 
 
-def test_category_command_relocation_cancelled_leaves_it_in_place(tmp_path, monkeypatch):
+def test_category_command_relocation_canceled_leaves_it_in_place(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
 
     async def run():
@@ -861,7 +861,7 @@ def test_category_command_relocation_cancelled_leaves_it_in_place(tmp_path, monk
             ).display
 
     messages, depths, pending, prompt_visible = asyncio.run(run())
-    assert any("Category move cancelled" in m for m in messages)
+    assert any("Category move canceled" in m for m in messages)
     assert pending is None
     assert prompt_visible is False
     assert depths["Dining"] == 0  # untouched: still top-level
@@ -882,7 +882,7 @@ def test_category_command_relocation_escape_cancels(tmp_path, monkeypatch):
             return messages, depths, app._pending_category
 
     messages, depths, pending = asyncio.run(run())
-    assert any("Category move cancelled" in m for m in messages)
+    assert any("Category move canceled" in m for m in messages)
     assert pending is None
     assert depths["Dining"] == 0
 
@@ -1014,7 +1014,7 @@ def test_category_merge_confirmed_moves_everything_and_deletes_the_source(
         assert queries.resolve_category(session, "Snacks") is not None
 
 
-def test_category_merge_cancelled_moves_nothing(tmp_path, monkeypatch):
+def test_category_merge_canceled_moves_nothing(tmp_path, monkeypatch):
     session_factory = _setup(tmp_path, monkeypatch)
     with session_factory() as session:
         categories.ensure_path(session, "Snacks")
@@ -1033,7 +1033,7 @@ def test_category_merge_cancelled_moves_nothing(tmp_path, monkeypatch):
 
     messages, pending = asyncio.run(run())
     assert pending is None
-    assert any("Merge cancelled" in m for m in messages)
+    assert any("Merge canceled" in m for m in messages)
     with session_factory() as session:
         assert categories.resolve_path(session, "Dining") is not None
 

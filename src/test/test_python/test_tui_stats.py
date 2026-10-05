@@ -308,12 +308,12 @@ def test_sidebar_is_not_rebuilt_when_only_the_filters_changed(tmp_path, monkeypa
     assert any("Housing Costs" in label for label in sidebar), sidebar
 
 
-UNCATEGORISED_ROW = (12, "MYSTERY CHARGE", "", "25.00", "")
+UNCATEGORIZED_ROW = (12, "MYSTERY CHARGE", "", "25.00", "")
 
 
-def _setup_with_uncategorised(tmp_path, monkeypatch):
+def _setup_with_uncategorized(tmp_path, monkeypatch):
     session_factory = _setup_recent(tmp_path, monkeypatch)
-    days, description, category, debit, credit = UNCATEGORISED_ROW
+    days, description, category, debit, credit = UNCATEGORIZED_ROW
     day = (datetime.date.today() - datetime.timedelta(days=days)).isoformat()
     extra = tmp_path / "extra.csv"
     extra.write_text(
@@ -362,8 +362,8 @@ def test_enter_on_a_stats_row_drills_into_that_category(tmp_path, monkeypatch):
     assert "[filtered: category," in status and str(window.start) in status
 
 
-def test_enter_on_the_uncategorised_row_drills_in_too(tmp_path, monkeypatch):
-    _setup_with_uncategorised(tmp_path, monkeypatch)
+def test_enter_on_the_uncategorized_row_drills_in_too(tmp_path, monkeypatch):
+    _setup_with_uncategorized(tmp_path, monkeypatch)
 
     async def run():
         app = BudgetApp()
@@ -373,7 +373,7 @@ def test_enter_on_the_uncategorised_row_drills_in_too(tmp_path, monkeypatch):
             table = app.query_one("#stats_table", DataTable)
             row = next(
                 i for i in range(table.row_count)
-                if str(table.get_row_at(i)[0]) == stats.UNCATEGORISED
+                if str(table.get_row_at(i)[0]) == stats.UNCATEGORIZED
             )
             shown = [str(c) for c in table.get_row_at(row)]
             table.focus()
@@ -383,7 +383,7 @@ def test_enter_on_the_uncategorised_row_drills_in_too(tmp_path, monkeypatch):
             return shown, app.category_filter, [t.description for t in app._txns]
 
     shown, category_filter, descriptions = asyncio.run(run())
-    assert category_filter == queries.UNCATEGORISED_ID  # the null category, not "none"
+    assert category_filter == queries.UNCATEGORIZED_ID  # the null category, not "none"
     assert shown[1] == "1" and descriptions == ["MYSTERY CHARGE"]
 
 

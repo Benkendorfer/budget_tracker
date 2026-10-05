@@ -135,7 +135,7 @@ def test_new_rule_appears_in_an_open_panel(tmp_path, monkeypatch):
     assert row_count == 1  # and it picked up the rule that was just added
 
 
-def test_categorize_rule_categorises_matching_vendors(tmp_path, monkeypatch):
+def test_categorize_rule_categorizes_matching_vendors(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
 
     async def run():
@@ -213,7 +213,7 @@ def test_rules_panel_lists_both_kinds_of_rule(tmp_path, monkeypatch):
     assert named[1] is True  # `categorize rules` opens the same panel
     assert rows == [
         ["vendor", "COFFEE*", "Coffee", "2"],  # 2 raw vendors named
-        ["category", "*SHOP A", "Treats", "2"],  # 2 transactions categorised
+        ["category", "*SHOP A", "Treats", "2"],  # 2 transactions categorized
     ]
     assert state[1] is True and focused == "rules"
     assert "2 rules" in state[2] and "2 vendors named" in state[2]
@@ -263,5 +263,5 @@ def test_rules_panel_columns_fit_the_main_panel(tmp_path, monkeypatch):
 
 
 # ------------------------------------------------------- statistics drill-down
-# One row with no category at all, so the Uncategorised row of the report has
+# One row with no category at all, so the Uncategorized row of the report has
 # something to drill into.

@@ -148,7 +148,7 @@ def test_manual_category_survives_reimport(tmp_path):
     with session_factory() as session:
         rows = sorted(_rows(session)["COFFEE SHOP A"], key=lambda p: p[1])
         # The two original rows kept their category through both imports. Categories
-        # are per transaction, so the newly imported row is uncategorised until the
+        # are per transaction, so the newly imported row is uncategorized until the
         # user says otherwise (a rule is how you make that automatic).
         assert rows == [("Dining", "manual"), ("Dining", "manual"), (None, "unset")]
 
@@ -186,7 +186,7 @@ def test_clear_category_reverts_only_manual_rows(tmp_path):
 # --------------------------------------------------------------------- per-row form
 
 
-def test_set_category_for_categorises_exactly_the_given_rows(tmp_path):
+def test_set_category_for_categorizes_exactly_the_given_rows(tmp_path):
     """The per-row form must not spill onto other transactions of the same vendor --
     unlike set_category, which is deliberately vendor-wide."""
     session_factory = _setup(tmp_path)
@@ -265,7 +265,7 @@ def test_get_or_create_reuses_an_existing_category(tmp_path):
 # -------------------------------------------------------------------- rules
 
 
-def test_rule_categorises_matching_vendors(tmp_path):
+def test_rule_categorizes_matching_vendors(tmp_path):
     session_factory = _setup(tmp_path)
     with session_factory() as session:
         categories.add_rule(session, "COFFEE SHOP*", "Dining")
@@ -303,7 +303,7 @@ def test_rule_applies_to_rows_from_later_imports(tmp_path):
         assert import_csv(session, later).inserted == 2
 
     with session_factory() as session:
-        # Categorised by the importer, with no manual step.
+        # Categorized by the importer, with no manual step.
         assert _categories(session, "COFFEE SHOP A") == [("Dining", "rule")]
         assert len(_rows(session)["COFFEE SHOP A"]) == 3
 
@@ -417,7 +417,7 @@ def _rule_first_database(tmp_path):
     return session_factory
 
 
-def test_detected_transfer_legs_are_categorised_transfer(tmp_path):
+def test_detected_transfer_legs_are_categorized_transfer(tmp_path):
     session_factory = _setup(tmp_path)
     _import_text(session_factory, tmp_path, "out.csv", XFER_OUT_CSV)
     _import_text(session_factory, tmp_path, "in.csv2", XFER_IN_CSV)
@@ -765,8 +765,8 @@ def test_filtering_by_a_parent_returns_descendant_transactions(tmp_path):
         leaf_rows = queries.get_transactions(session, category_id=restaurants_id)
         assert {r.description for r in leaf_rows} == {"COFFEE SHOP A"}
 
-        # The uncategorised sentinel is unaffected by the subtree change.
-        assert queries.get_transactions(session, category_id=queries.UNCATEGORISED_ID) == []
+        # The uncategorized sentinel is unaffected by the subtree change.
+        assert queries.get_transactions(session, category_id=queries.UNCATEGORIZED_ID) == []
 
 
 def test_get_categories_rolls_up_parent_counts_and_totals(tmp_path):

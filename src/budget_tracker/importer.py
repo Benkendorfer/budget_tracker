@@ -136,7 +136,7 @@ def _normalize_amount(raw: str) -> Decimal:
 
     European "1.234,56" grouping is deliberately not attempted: without knowing the
     file's locale, a "." could be a thousands separator or a decimal point, and
-    guessing wrong would corrupt the amount rather than merely reject it. Parenthesised
+    guessing wrong would corrupt the amount rather than merely reject it. Parenthesized
     negatives ("(75.00)") are likewise not handled — no format seen here uses them, and
     adding speculative shapes is how this kind of ambiguity creeps in.
     """
@@ -714,7 +714,7 @@ def delete_import(session: Session, import_id: int) -> DeleteResult:
     transactions).
 
     A transaction whose *partner* leg is being deleted stops being a transfer: its
-    ``transfer_group_id`` is cleared, and if transfer detection is what categorised it
+    ``transfer_group_id`` is cleared, and if transfer detection is what categorized it
     (``category_source == "transfer"``), that category is cleared too, leaving it in the
     same "unset" state :func:`.transfers.clear_transfers` would. A category set by hand
     or by the import itself is left alone.

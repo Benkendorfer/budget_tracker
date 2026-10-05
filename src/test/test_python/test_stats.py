@@ -169,7 +169,7 @@ def test_average_per_month_divides_by_the_window(tmp_path):
     assert report.avg_month_inflow_minor == 0
 
 
-def test_categories_are_ordered_by_spend_and_include_uncategorised(tmp_path):
+def test_categories_are_ordered_by_spend_and_include_uncategorized(tmp_path):
     session_factory = _session_factory(tmp_path)
     with session_factory() as session:
         currency, accounts, categories = _seed(
@@ -190,15 +190,15 @@ def test_categories_are_ordered_by_spend_and_include_uncategorised(tmp_path):
         report = stats.build_report(session, _custom("2025-03-01", "2025-03-31"))
 
     names = [c.name for c in report.categories]
-    assert names == ["Rent", "Dining", stats.UNCATEGORISED]
+    assert names == ["Rent", "Dining", stats.UNCATEGORIZED]
     assert [c.outflow_minor for c in report.categories] == [-100000, -4000, -500]
-    assert [c.count for c in report.categories] == [1, 2, 2]  # salary is uncategorised
+    assert [c.count for c in report.categories] == [1, 2, 2]  # salary is uncategorized
 
     # The rows add back up to the report, and the shares are a probability distribution.
     assert sum(c.outflow_minor for c in report.categories) == report.outflow_minor
     assert sum(c.inflow_minor for c in report.categories) == report.inflow_minor
     assert sum(c.share for c in report.categories) == pytest.approx(1.0)
-    # Net-based, not gross: Uncategorised nets to +249500 (-500 Mystery, +250000 Salary),
+    # Net-based, not gross: Uncategorized nets to +249500 (-500 Mystery, +250000 Salary),
     # so it contributes 0 to the denominator despite -500 of gross outflow. The
     # denominator is net spend only: -100000 (Rent) + -4000 (Dining) = -104000, not the
     # old gross-outflow denominator of -104500.
@@ -580,7 +580,7 @@ def test_category_rows_carry_a_filter_ready_id(tmp_path):
         by_name = {c.name: c.category_id for c in report.categories}
         dining_id = queries.resolve_category(session, "Dining")
         assert by_name["Dining"] == dining_id
-        assert by_name[stats.UNCATEGORISED] == queries.UNCATEGORISED_ID
+        assert by_name[stats.UNCATEGORIZED] == queries.UNCATEGORIZED_ID
 
         # Round-trip: filtering by each id returns exactly that row's transactions.
         for name, category_id in by_name.items():
@@ -591,7 +591,7 @@ def test_category_rows_carry_a_filter_ready_id(tmp_path):
             assert len(rows) == expected
 
 
-def test_uncategorised_filter_is_not_confused_with_no_filter(tmp_path):
+def test_uncategorized_filter_is_not_confused_with_no_filter(tmp_path):
     session_factory = _session_factory(tmp_path)
     with session_factory() as session:
         currency, accounts, cats = _seed(session, category_names=("Dining",))
@@ -602,11 +602,11 @@ def test_uncategorised_filter_is_not_confused_with_no_filter(tmp_path):
 
     with session_factory() as session:
         everything = queries.get_transactions(session)
-        uncategorised = queries.get_transactions(
-            session, category_id=queries.UNCATEGORISED_ID
+        uncategorized = queries.get_transactions(
+            session, category_id=queries.UNCATEGORIZED_ID
         )
     assert len(everything) == 2
-    assert [t.description for t in uncategorised] == ["B"]
+    assert [t.description for t in uncategorized] == ["B"]
 
 
 def test_spending_series_covers_a_partial_final_bucket(tmp_path):
@@ -788,7 +788,7 @@ def test_parent_share_zero_denominator_guard(tmp_path):
     assert rows["Salary"].share == 0.0
 
 
-def test_uncategorised_takes_part_in_the_same_display_order(tmp_path):
+def test_uncategorized_takes_part_in_the_same_display_order(tmp_path):
     session_factory = _session_factory(tmp_path)
     with session_factory() as session:
         currency, accounts, _ = _seed(session)
@@ -796,21 +796,21 @@ def test_uncategorised_takes_part_in_the_same_display_order(tmp_path):
         dining = categories.ensure_path(session, "Food > Dining")
         session.flush()
         _txn(session, currency, account, date(2025, 3, 1), -1000, "Snack", category=dining)
-        _txn(session, currency, account, date(2025, 3, 2), -5000, "Mystery")  # uncategorised
+        _txn(session, currency, account, date(2025, 3, 2), -5000, "Mystery")  # uncategorized
         session.commit()
 
     window = _custom("2025-03-01", "2025-03-31")
     with session_factory() as session:
         report = stats.build_report(session, window)
 
-    # Uncategorised (-5000) outspends Food (-1000), so it heads the depth-0 order.
+    # Uncategorized (-5000) outspends Food (-1000), so it heads the depth-0 order.
     assert [(r.name, r.depth) for r in report.categories] == [
-        (stats.UNCATEGORISED, 0), ("Food", 0), ("Dining", 1),
+        (stats.UNCATEGORIZED, 0), ("Food", 0), ("Dining", 1),
     ]
-    uncategorised = next(r for r in report.categories if r.name == stats.UNCATEGORISED)
-    assert uncategorised.parent_id is None
-    assert uncategorised.category_id == queries.UNCATEGORISED_ID
-    assert uncategorised.own_total_minor == uncategorised.total_minor
+    uncategorized = next(r for r in report.categories if r.name == stats.UNCATEGORIZED)
+    assert uncategorized.parent_id is None
+    assert uncategorized.category_id == queries.UNCATEGORIZED_ID
+    assert uncategorized.own_total_minor == uncategorized.total_minor
 
 
 def test_get_currencies_reports_symbols_and_decimal_places(tmp_path):
@@ -1534,7 +1534,7 @@ def test_get_category_bucket_totals_groups_by_bucket_and_category(tmp_path):
         _txn(session, currency, account, date(2025, 1, 5), -1000, "A", cats["Dining"])
         _txn(session, currency, account, date(2025, 1, 20), -500, "B", cats["Travel"])
         _txn(session, currency, account, date(2025, 2, 3), -2000, "C", cats["Dining"])
-        _txn(session, currency, account, date(2025, 2, 4), -300, "D")  # uncategorised
+        _txn(session, currency, account, date(2025, 2, 4), -300, "D")  # uncategorized
         session.commit()
 
     with session_factory() as session:
@@ -1544,9 +1544,9 @@ def test_get_category_bucket_totals_groups_by_bucket_and_category(tmp_path):
     assert by_key_name[("2025-01", "Dining")].outflow_minor == -1000
     assert by_key_name[("2025-01", "Travel")].outflow_minor == -500
     assert by_key_name[("2025-02", "Dining")].outflow_minor == -2000
-    uncategorised = by_key_name[("2025-02", "")]
-    assert uncategorised.outflow_minor == -300
-    assert uncategorised.category_id is None
+    uncategorized = by_key_name[("2025-02", "")]
+    assert uncategorized.outflow_minor == -300
+    assert uncategorized.category_id is None
     # Chronological by bucket.
     assert [r.bucket_key for r in rows] == sorted(r.bucket_key for r in rows)
 
@@ -1826,7 +1826,7 @@ def test_category_totals_across_buckets_equal_the_top_bars_own_total(tmp_path):
         _txn(session, currencies["CHF"], accounts["Card CHF"], early, -2000, "B", groceries)
         _txn(session, currencies["USD"], accounts["Checking"], late, -500, "C", dining)
         _txn(session, currencies["CHF"], accounts["Card CHF"], late, -3000, "D", travel)
-        _txn(session, currencies["USD"], accounts["Checking"], late, -700, "E")  # uncategorised
+        _txn(session, currencies["USD"], accounts["Checking"], late, -700, "E")  # uncategorized
         session.commit()
 
     window = _custom("2025-01-01", "2025-03-31")
@@ -1840,6 +1840,6 @@ def test_category_totals_across_buckets_equal_the_top_bars_own_total(tmp_path):
             summed[cat.name] += cat.total_minor
     for cat in report.categories:
         assert summed[cat.name] == cat.total_minor, cat.name
-    # Uncategorised is not part of report.categories' name-keying oddity -- check it too.
-    uncategorised = next(c for c in report.categories if c.name == stats.UNCATEGORISED)
-    assert summed[stats.UNCATEGORISED] == uncategorised.total_minor
+    # Uncategorized is not part of report.categories' name-keying oddity -- check it too.
+    uncategorized = next(c for c in report.categories if c.name == stats.UNCATEGORIZED)
+    assert summed[stats.UNCATEGORIZED] == uncategorized.total_minor

@@ -4,7 +4,7 @@ Core logic only: window arithmetic plus reshaping what :mod:`.queries` returns. 
 here knows how any of it is drawn.
 
 Averages are per *average* month (365.25 / 12 days) rather than per calendar month, so a
-window that starts mid-month is not penalised by a partial month at either end.
+window that starts mid-month is not penalized by a partial month at either end.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ from .queries import (
     resolve_filters,
 )
 
-UNCATEGORISED = "Uncategorised"
+UNCATEGORIZED = "Uncategorized"
 
 # The average length of a Gregorian month, used as the avg-per-month divisor.
 DAYS_PER_MONTH = 30.4375
@@ -131,7 +131,7 @@ def parse(text: str, today: Optional[date] = None) -> Window:
 
 @dataclass(frozen=True)
 class CategoryStat:
-    name: str  # UNCATEGORISED for the null category
+    name: str  # UNCATEGORIZED for the null category
     count: int  # inclusive of every descendant
     total_minor: int  # inclusive of every descendant
     outflow_minor: int  # inclusive of every descendant
@@ -145,7 +145,7 @@ class CategoryStat:
     # so does every row when that total is zero. A fraction, not a percentage — formatting
     # stays the UI's job. This is *net* spend, not gross outflow, so a category with heavy
     # churn (money moving out and back in) does not read as bigger than its actual net
-    # cost — see the "Uncategorised at 43% but net -$2,374" bug this fixed.
+    # cost — see the "Uncategorized at 43% but net -$2,374" bug this fixed.
     share: float
     # The identical rule, but measured against the *parent's* own net contribution
     # (``min(0, parent's total_minor)``) rather than the report-wide total. So siblings
@@ -158,8 +158,8 @@ class CategoryStat:
     # treated as impossible.
     parent_share: float
     # Filter-ready, so a UI can drill from a row straight into its transactions:
-    # UNCATEGORISED_ID rather than None for the null category.
-    category_id: int = queries.UNCATEGORISED_ID
+    # UNCATEGORIZED_ID rather than None for the null category.
+    category_id: int = queries.UNCATEGORIZED_ID
     parent_id: Optional[int] = None
     depth: int = 0  # 0 for top level
     # This category's own direct figures (not its descendants'), so a UI can tell
@@ -241,7 +241,7 @@ def _roll_up_categories(
     heading the list, wrapping money the filter never included beyond Dining itself.
     """
     direct: Dict[int, CategoryTotal] = {row.id: row for row in rows if row.id is not None}
-    uncategorised = next((row for row in rows if row.id is None), None)
+    uncategorized = next((row for row in rows if row.id is None), None)
 
     all_categories: Dict[int, Category] = {}
     if direct:
@@ -294,8 +294,8 @@ def _roll_up_categories(
     # gross outflow, which is the whole point of the change.
     depth0_ids = children.get(None, [])
     net_spend_minor = sum(min(0, rolled[cid][1]) for cid in depth0_ids)
-    if uncategorised is not None:
-        net_spend_minor += min(0, uncategorised.total_minor)
+    if uncategorized is not None:
+        net_spend_minor += min(0, uncategorized.total_minor)
 
     def stat_for(
         cid: int, depth: int, parent_id: Optional[int], parent_contribution: int
@@ -337,26 +337,26 @@ def _roll_up_categories(
     for root_id in display_order(depth0_ids):
         flat.extend(walk(root_id, 0, None, net_spend_minor))
 
-    if uncategorised is not None:
-        outflow = uncategorised.outflow_minor
-        contribution = min(0, uncategorised.total_minor)
+    if uncategorized is not None:
+        outflow = uncategorized.outflow_minor
+        contribution = min(0, uncategorized.total_minor)
         share = (contribution / net_spend_minor) if net_spend_minor else 0.0
         stat = CategoryStat(
-            name=UNCATEGORISED,
-            count=uncategorised.count,
-            total_minor=uncategorised.total_minor,
+            name=UNCATEGORIZED,
+            count=uncategorized.count,
+            total_minor=uncategorized.total_minor,
             outflow_minor=outflow,
-            inflow_minor=uncategorised.inflow_minor,
-            avg_month_minor=per_month(uncategorised.total_minor, window),
+            inflow_minor=uncategorized.inflow_minor,
+            avg_month_minor=per_month(uncategorized.total_minor, window),
             share=share,
             parent_share=share,  # depth 0, so parent_share equals share as elsewhere
-            category_id=queries.UNCATEGORISED_ID,
+            category_id=queries.UNCATEGORIZED_ID,
             parent_id=None,
             depth=0,
-            own_count=uncategorised.count,
-            own_total_minor=uncategorised.total_minor,
+            own_count=uncategorized.count,
+            own_total_minor=uncategorized.total_minor,
         )
-        # Uncategorised is a depth-0 row like any other, so it takes part in the same
+        # Uncategorized is a depth-0 row like any other, so it takes part in the same
         # biggest-spend-first order rather than always trailing.
         insert_at = len(flat)
         for i, existing in enumerate(flat):
@@ -394,7 +394,7 @@ def build_report(
 
     root_category_id = (
         resolved.category_id
-        if resolved.category_id not in (None, queries.UNCATEGORISED_ID)
+        if resolved.category_id not in (None, queries.UNCATEGORIZED_ID)
         else None
     )
     categories = _roll_up_categories(session, rows, window, root_category_id)
@@ -483,7 +483,7 @@ def category_share_series(
 
     root_category_id = (
         resolved.category_id
-        if resolved.category_id not in (None, queries.UNCATEGORISED_ID)
+        if resolved.category_id not in (None, queries.UNCATEGORIZED_ID)
         else None
     )
 

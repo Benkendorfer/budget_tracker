@@ -30,7 +30,7 @@ NEW_ROWS_CSV = """Transaction Date,Posted Date,Card No.,Description,Category,Deb
 2025-09-03,2025-09-04,8207,NEW BAKERY,Dining,6.00,
 """
 
-# A Wise transfer log: recognised by its own signature columns (see wise.looks_like_wise),
+# A Wise transfer log: recognized by its own signature columns (see wise.looks_like_wise),
 # not a learned layout, so it never needs the setup walkthrough.
 
 
@@ -69,7 +69,7 @@ def test_import_command_opens_a_file_picker(tmp_path, monkeypatch):
     assert focused == "imports"
     # Files sort by name; the row count and what blocks each file are both shown.
     assert rows[0][:2] == ["known.csv", "3"]
-    assert rows[0][2] == "test_layout"  # a recognised layout, ready to import
+    assert rows[0][2] == "test_layout"  # a recognized layout, ready to import
     assert rows[1][0] == "unknown.csv"
     assert rows[1][2] == "needs setup"
     assert "2 file(s), 1 ready" in state[2] and "enter to import" in state[2]
@@ -405,7 +405,7 @@ def test_unimport_confirmed_deletes_the_transactions(tmp_path, monkeypatch):
         assert queries.get_imports(session) == []
 
 
-def test_unimport_cancelled_by_any_other_answer(tmp_path, monkeypatch):
+def test_unimport_canceled_by_any_other_answer(tmp_path, monkeypatch):
     session_factory = _setup(tmp_path, monkeypatch)
     with session_factory() as session:
         import_id = queries.get_imports(session)[0].id
@@ -424,7 +424,7 @@ def test_unimport_cancelled_by_any_other_answer(tmp_path, monkeypatch):
 
     before, after, messages, prompt_visible = asyncio.run(run())
     assert before == after == 3  # nothing was touched
-    assert any("Unimport cancelled" in m for m in messages)
+    assert any("Unimport canceled" in m for m in messages)
     assert prompt_visible is False
 
 
@@ -445,7 +445,7 @@ def test_unimport_escape_cancels(tmp_path, monkeypatch):
 
     count, messages, pending = asyncio.run(run())
     assert count == 3  # nothing deleted
-    assert any("Unimport cancelled" in m for m in messages)
+    assert any("Unimport canceled" in m for m in messages)
     assert pending is None
 
 

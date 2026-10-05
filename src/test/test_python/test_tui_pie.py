@@ -218,8 +218,8 @@ def test_selecting_a_category_rescopes_the_open_pie(tmp_path, monkeypatch):
     one category leaves a single, whole-window segment behind.
 
     The unfiltered window also carries a zero-share ``Other`` placeholder: February's
-    lone uncategorised charge is real spend *within that bucket*, even though the
-    window-wide Uncategorised row nets positive once March's paycheck is added in (see
+    lone uncategorized charge is real spend *within that bucket*, even though the
+    window-wide Uncategorized row nets positive once March's paycheck is added in (see
     charts.build_stacked_share's ``needs_other`` guard) -- so the legend has to make
     room for a bucket that would otherwise have nowhere to put it.
     """

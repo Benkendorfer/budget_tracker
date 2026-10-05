@@ -50,7 +50,7 @@ def _row(**overrides):
 
 def test_the_layout_is_recognized_from_its_signature_columns():
     assert wise.looks_like_wise(HEADER)
-    # A tail Wise has changed before is not part of the judgement.
+    # A tail Wise has changed before is not part of the judgment.
     assert wise.looks_like_wise([c for c in HEADER if c not in ("Batch", "Note")])
 
 

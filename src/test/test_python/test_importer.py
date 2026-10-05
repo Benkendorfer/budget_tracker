@@ -100,7 +100,7 @@ def test_european_grouping_is_not_silently_accepted():
         _parse_signed_minor("1.234,56", 2)
 
 
-def test_parenthesised_negative_is_not_supported():
+def test_parenthesized_negative_is_not_supported():
     # No format seen here uses this shape; raising rather than guessing at it.
     with pytest.raises(ValueError):
         _parse_signed_minor("(75.00)", 2)

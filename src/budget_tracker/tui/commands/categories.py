@@ -80,7 +80,7 @@ class CategoryCommands:
         path = self._pending_category
         self._cancel_category()
         if text.strip().lower() != "yes":
-            self.notify("Category move cancelled.")
+            self.notify("Category move canceled.")
             return
         with self.session_factory() as session:
             try:
@@ -147,7 +147,7 @@ class CategoryCommands:
         source, target = self._pending_category_merge
         self._cancel_category_merge()
         if text.strip().lower() != "yes":
-            self.notify("Merge cancelled.")
+            self.notify("Merge canceled.")
             return
         with self.session_factory() as session:
             try:

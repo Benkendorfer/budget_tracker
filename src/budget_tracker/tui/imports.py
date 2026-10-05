@@ -89,7 +89,7 @@ def import_label(import_dir: Path, to_import_dir: Path) -> str:
 
     At the top that is the inbox folder's own name: "." is technically the relative
     path but reads as an error in a status line, and the point of the label is to say
-    where you are in words you would recognise.
+    where you are in words you would recognize.
     """
     try:
         relative = import_dir.relative_to(to_import_dir)

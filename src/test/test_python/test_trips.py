@@ -471,7 +471,7 @@ def test_get_trips_single_currency_cost_counts_and_buckets(tmp_path):
     by_bucket = dict(zip(trips.BUCKETS, row.buckets))
     assert by_bucket[trips.FOOD] == 4000
     assert by_bucket[trips.HOTEL] == 50000
-    assert by_bucket[trips.MISC] == 1500  # uncategorised transaction
+    assert by_bucket[trips.MISC] == 1500  # uncategorized transaction
     assert by_bucket[trips.AIRFARE] == 0
     assert sum(row.buckets) == row.total_minor
 
@@ -494,7 +494,7 @@ def test_get_trips_refund_reduces_cost_and_can_make_a_bucket_negative(tmp_path):
         session.commit()
 
     with session_factory() as session:
-        tags.set_trip(session, ids, "Cancelled Trip")
+        tags.set_trip(session, ids, "Canceled Trip")
         session.commit()
 
     with session_factory() as session:
@@ -793,6 +793,8 @@ def test_manual_dates_survive_on_a_database_that_predates_the_columns(tmp_path):
     # rightly treat this one as already current and leave the hand-made old table alone.
     with engine.begin() as connection:
         connection.execute(sqlalchemy.text("DROP TABLE alembic_version"))
+        # Nor anything a later migration added -- the upgrade would make it again.
+        connection.execute(sqlalchemy.text("DROP TABLE budget_amount"))
         connection.execute(sqlalchemy.text("DROP TABLE transaction_tag"))
         connection.execute(sqlalchemy.text("DROP TABLE tag"))
         connection.execute(

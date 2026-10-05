@@ -1,4 +1,4 @@
-"""Tests for the CLI twins of the app's categorisation commands.
+"""Tests for the CLI twins of the app's categorization commands.
 
 ``cli.main`` is called with an argv list, exactly as the ``budget`` entry point does,
 and the database is pointed at a temporary file through ``BUDGET_DB``.
@@ -27,7 +27,7 @@ def test_categorize_sets_a_category(tmp_path, monkeypatch, capsys):
     session_factory = _setup(tmp_path, monkeypatch)
 
     assert cli.main(["categorize", "COFFEE SHOP A", "Coffee"]) == 0
-    assert "Categorised 2 transaction(s)" in capsys.readouterr().out
+    assert "Categorized 2 transaction(s)" in capsys.readouterr().out
     assert _categories_of(session_factory) == ["Coffee", "Coffee", "Dining"]
 
 

@@ -65,6 +65,9 @@ class EventCommands:
         if event.data_table.id == "trip_table":
             self._drill_into_trip_row(event.cursor_row)
             return
+        if event.data_table.id == "budget_plan":
+            self._edit_budget_row(event.cursor_row)
+            return
         if event.data_table.id == "setup":
             if self._setup is not None and self._setup.question is not None:
                 choices = self._setup.question.choices

@@ -3,9 +3,9 @@
 The parser wires each subcommand to its handler; the handlers themselves live in the
 command-family modules alongside this one (``import_cmds.py``, ``list_cmd.py``,
 ``vendors.py``, ``categories.py``, ``accounts.py``, ``transfers.py``, ``formats.py``,
-``rates.py``, ``tags.py``, ``sync.py``). This module only assembles argparse structure
-— no handler logic — so it stays readable as the single place every subcommand is
-registered.
+``rates.py``, ``tags.py``, ``sync.py``, ``budget_cmd.py``). This module only assembles
+argparse structure — no handler logic — so it stays readable as the single place every
+subcommand is registered.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from .. import sync as sync_module
 from .. import tags as tags_module
 from .. import transfers as transfers_module
 from .accounts import _cmd_account
+from .budget_cmd import _cmd_budget_limits
 from .categories import _cmd_categorize, _cmd_category, _cmd_category_rule
 from .formats import _cmd_format
 from .import_cmds import _cmd_import, _cmd_imports, _cmd_unimport
@@ -166,7 +167,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     categorize_parser = subparsers.add_parser(
         "categorize",
-        help="Categorise every transaction of a vendor by hand (outranks rules).",
+        help="Categorize every transaction of a vendor by hand (outranks rules).",
     )
     categorize_parser.add_argument(
         "vendor", help="Raw vendor name, or an override display name."
@@ -226,7 +227,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     category_rule_parser = subparsers.add_parser(
-        "category-rule", help="Manage pattern-based categorisation rules."
+        "category-rule", help="Manage pattern-based categorization rules."
     )
     category_rule_parser.set_defaults(
         func=_cmd_category_rule, category_rule_command="list"
@@ -245,7 +246,7 @@ def build_parser() -> argparse.ArgumentParser:
     category_rule_add.add_argument("category", help="The category to apply.")
 
     category_rule_remove = category_rule_subparsers.add_parser(
-        "remove", help="Delete a rule and clear the transactions it categorised."
+        "remove", help="Delete a rule and clear the transactions it categorized."
     )
     category_rule_remove.add_argument("pattern", help="The exact pattern to remove.")
 
@@ -346,6 +347,43 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Derive the dates from the trip's transactions again.",
     )
+
+    limits_parser = subparsers.add_parser(
+        "limits",
+        help=(
+            "Track the monthly budget against spending, or plan next month's "
+            "(see 'budget limits plan')."
+        ),
+    )
+    # One catch-all positional, not a subparsers tree -- see budget_cmd.py's module
+    # docstring for why 'plan'/'set'/'clear'/'income' and a bare 'YYYY-MM' can't both
+    # sit in argparse subparsers at the same position.
+    limits_parser.add_argument(
+        "tokens",
+        nargs="*",
+        metavar="...",
+        help=(
+            "[YYYY-MM] for the tracking table (default, current month); or "
+            "'plan [YYYY-MM]', 'set <category> <amount>', 'clear <category>', "
+            "'income <amount>' (or 'income --clear')."
+        ),
+    )
+    limits_parser.add_argument(
+        "--months",
+        type=int,
+        default=6,
+        help="Averaging window for 'plan' (default: %(default)s).",
+    )
+    limits_parser.add_argument(
+        "--month",
+        help="Month 'set'/'clear'/'income' applies to, YYYY-MM (default: current).",
+    )
+    limits_parser.add_argument(
+        "--clear",
+        action="store_true",
+        help="With 'income', clear the income target instead of setting one.",
+    )
+    limits_parser.set_defaults(func=_cmd_budget_limits)
 
     account_parser = subparsers.add_parser(
         "account", help="List, rename, or merge accounts."

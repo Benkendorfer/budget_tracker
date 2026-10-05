@@ -171,7 +171,7 @@ class ImportCommands:
         pending = self._pending_unimport
         self._cancel_unimport()
         if text.strip().lower() != "yes":
-            self.notify("Unimport cancelled.")
+            self.notify("Unimport canceled.")
             return
         with self.session_factory() as session:
             try:

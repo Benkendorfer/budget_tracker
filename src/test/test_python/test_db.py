@@ -12,6 +12,7 @@ import pytest
 from sqlalchemy import text
 
 from budget_tracker.db import (
+    _BASELINE_TABLES,
     DuplicateCategoryNamesError,
     get_engine,
     get_sessionmaker,
@@ -118,8 +119,18 @@ def test_merging_the_duplicates_unblocks_init_db(tmp_path):
 
     # Everything else (account, currency, transactions...) still needs to exist for the
     # ORM to work, so create_all runs directly here rather than through init_db, which
-    # would immediately re-hit the same duplicate check.
-    Base.metadata.create_all(engine)
+    # would immediately re-hit the same duplicate check. Tables a migration adds after
+    # baseline are skipped, same as init_db's own pre-Alembic branch does -- the
+    # second init_db call below still has to create those itself, by actually running
+    # that migration, not find them already there.
+    Base.metadata.create_all(
+        engine,
+        tables=[
+            t
+            for name, t in Base.metadata.tables.items()
+            if name in _BASELINE_TABLES
+        ],
+    )
     from budget_tracker import categories
 
     Session = get_sessionmaker(engine)

@@ -19,6 +19,28 @@ from budget_tracker.tui.commands.pie import _SHARE_BUCKETS
 class ActionCommands:
     """``action_*`` bindings, plus the vendor/cursor helpers ``ctrl+n``/``ctrl+t`` use."""
 
+    # ------------------------------------------------------------- vim keys
+    # Gated by check_action to a focused DataTable or ListView, so self.focused is one.
+    def action_vim_down(self) -> None:
+        self.focused.action_cursor_down()
+
+    def action_vim_up(self) -> None:
+        self.focused.action_cursor_up()
+
+    def action_vim_left(self) -> None:
+        # The same thing the left arrow does here: back out of a drill-down when there is
+        # one to leave, otherwise move the table's cursor.
+        if self.check_action("drill_up", ()):
+            self.action_drill_up()
+        elif isinstance(self.focused, DataTable):
+            self.focused.action_cursor_left()
+
+    def action_vim_right(self) -> None:
+        if self.check_action("drill_down", ()):
+            self.action_drill_down()
+        elif isinstance(self.focused, DataTable):
+            self.focused.action_cursor_right()
+
     def _selected_vendor(self) -> Optional[queries.VendorRow]:
         """The vendor ctrl+n targets: the active filter, else the highlighted row."""
         if self.vendor_filter is not None:
@@ -92,6 +114,10 @@ class ActionCommands:
             table = self.query_one("#trip_table", DataTable)
             self._toggle_trip_fold(table.cursor_row)
             return
+        if self._panel == "budget_plan":
+            table = self.query_one("#budget_plan", DataTable)
+            self._toggle_budget_fold(table.cursor_row)
+            return
         table = self.query_one("#stats_table", DataTable)
         self._toggle_fold(table.cursor_row)
 
@@ -100,6 +126,9 @@ class ActionCommands:
         the trips panel. See check_action()."""
         if self._panel == "trips":
             self._toggle_trip_fold_all()
+            return
+        if self._panel == "budget_plan":
+            self._toggle_budget_fold_all()
             return
         self._toggle_fold_all()
 
@@ -159,24 +188,29 @@ class ActionCommands:
         # drill-down's back-link even when the panel is already "txns".
         self._set_drilled_from(None)
         if self._setup is not None:
-            self.notify(f"Setup for {self._setup.path.name} cancelled.")
+            self.notify(f"Setup for {self._setup.path.name} canceled.")
             self._cancel_setup()
             return
         if self._range_pending:
-            self.notify("Custom range cancelled.")
+            self.notify("Custom range canceled.")
             self._cancel_range()
             return
         if self._pending_unimport is not None:
-            self.notify("Unimport cancelled.")
+            self.notify("Unimport canceled.")
             self._cancel_unimport()
             return
         if self._pending_category is not None:
-            self.notify("Category move cancelled.")
+            self.notify("Category move canceled.")
             self._cancel_category()
             return
         if self._pending_category_merge is not None:
-            self.notify("Merge cancelled.")
+            self.notify("Merge canceled.")
             self._cancel_category_merge()
+            return
+        if self._pending_budget_edit is not None:
+            self.notify("Budget edit canceled.")
+            self._cancel_budget_edit()
+            self._refocus_budget_plan()
             return
         if self._panel != "txns":
             self._set_panel("txns")

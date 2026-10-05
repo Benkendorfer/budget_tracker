@@ -10,7 +10,7 @@ Folding here deliberately does *not* reuse ``BudgetApp._collapsed``/``_foldable_
 two would mean folding category #3 in the statistics panel could silently fold trip #3
 here too, the moment both happen to exist. A trip's fold state also starts *collapsed*
 (space "unfolds" it) rather than expanded, unlike the statistics panel's fully-expanded
-default -- there is no pre-folding behaviour here to stay byte-for-byte with, and one row
+default -- there is no pre-folding behavior here to stay byte-for-byte with, and one row
 per bucket (``len(trips.BUCKETS)`` of them) on first open would bury the one line (dates,
 cost, bar) most of what this panel is for. ``toggle_fold``/``toggle_fold_all`` below are
 therefore a small, deliberate duplicate of ``stats.toggle_fold``/``toggle_fold_all``'s

@@ -63,7 +63,7 @@ def test_excluded_rows_leave_the_totals_and_keep_their_category(tmp_path):
         assert out.transfer_group_id == out.id  # a group of one, like a conversion
         assert session.get(Category, out.category_id).value == "Transfer"  # untouched
         [row] = [r for r in queries.get_transactions(session) if r.id == out.id]
-        assert row.is_transfer  # greyed out like any transfer
+        assert row.is_transfer  # grayed out like any transfer
         assert transfers.EXCLUDED_TAG in row.tags
 
 

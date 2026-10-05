@@ -86,6 +86,18 @@ _ADDED_COLUMNS = {
     "sync_account": {"last_status": "VARCHAR", "last_error": "VARCHAR"},
 }
 
+# The tables BASELINE_REVISION creates -- frozen, like the baseline itself, so this
+# never needs touching again. init_db's pre-Alembic branch brings a database to the
+# baseline and no further: it creates only these, stamps the baseline, then lets the
+# real migrations add everything since. Creating a later table here instead (from the
+# current models) would make that table's own migration fail on "already exists".
+# test_migrations checks this set against the baseline revision's create_table calls.
+_BASELINE_TABLES = frozenset({
+    "account", "category", "category_rule", "csv_format", "currency", "exchange_rate",
+    "import", "sync_account", "sync_connection", "tag", "transaction_tag",
+    "transactions", "trip_bucket", "vendor", "vendor_name", "vendor_rule",
+})
+
 
 def _add_missing_columns(engine: Engine) -> None:
     """Idempotently add known-new columns to tables that predate them."""
@@ -164,19 +176,25 @@ def init_db(engine: Engine) -> None:
       fast path -- this is the common case in the test suite, called on a fresh
       ``tmp_path`` database hundreds of times. It is then stamped at head, so the
       *next* ``init_db`` call on it takes the "already versioned" branch below.
-    - **Pre-Alembic** (tables exist, but no ``alembic_version`` table): every real
-      database today, including the user's. The old patches --
-      :func:`_add_missing_columns`, ``create_all`` for any table added since,
-      :func:`_ensure_unique_category_names` -- are exactly how such a database
-      reaches the baseline schema, so they still run verbatim, including
-      :exc:`DuplicateCategoryNamesError` still blocking the database from opening at
-      all until the duplicates are merged by hand. It is then stamped at the
-      *baseline* revision, not head, and upgraded -- so a database that reaches the
-      baseline today still picks up any migration added after it, exactly like a
-      database that was already versioned.
-    - **Versioned**: ``alembic upgrade head``. A no-op today (there is only the one,
-      baseline revision); this is the branch every call takes once a database has
-      been opened under this scheme at all.
+    - **Pre-Alembic** (tables exist, but no ``alembic_version`` table): a database
+      from before Alembic existed, never yet opened under this scheme. The old
+      patches -- :func:`_add_missing_columns`, ``create_all`` for any *baseline*
+      table added since, :func:`_ensure_unique_category_names` -- are exactly how
+      such a database reaches the baseline schema, so they still run verbatim,
+      including :exc:`DuplicateCategoryNamesError` still blocking the database from
+      opening at all until the duplicates are merged by hand. ``create_all`` here is
+      scoped to :data:`_BASELINE_TABLES` -- a table a later migration adds must come
+      from actually running that migration, below, not from this create_all finding
+      it already current in ``models.py`` and making it early (which would make that
+      migration's own ``op.create_table`` fail against a table that already exists). The database is then stamped at the *baseline*
+      revision, not head, and upgraded -- so it still picks up every migration added
+      after baseline, exactly like a database that was already versioned.
+    - **Versioned**: ``alembic upgrade head``. A no-op once a database is already at
+      head; otherwise it runs whatever migrations (like the one adding
+      ``budget_amount``) have landed since it was last opened. This is the branch
+      every real database takes today, including the user's -- it was walked to the
+      baseline revision once, by the pre-Alembic branch above, when Alembic was
+      introduced.
 
     Nothing here recreates or drops a table that was not already empty, and the
     pre-Alembic branch never runs a migration script against real data -- only the
@@ -195,7 +213,12 @@ def init_db(engine: Engine) -> None:
         return
 
     _add_missing_columns(engine)
-    Base.metadata.create_all(engine)
+    baseline_tables = [
+        table
+        for name, table in Base.metadata.tables.items()
+        if name in _BASELINE_TABLES
+    ]
+    Base.metadata.create_all(engine, tables=baseline_tables)
     _ensure_unique_category_names(engine)  # may raise DuplicateCategoryNamesError
     _stamp(engine, BASELINE_REVISION)
     _upgrade_to_head(engine)

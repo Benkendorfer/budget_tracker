@@ -50,8 +50,8 @@ TEXT_FIELDS = ("all", "description", "vendor", "raw")
 
 # A category filter meaning "the ones with no category at all". Real ids come from SQLite
 # autoincrement and are always positive, so a negative sentinel keeps every signature
-# ``Optional[int]`` rather than growing a parallel "uncategorised?" flag through them.
-UNCATEGORISED_ID = -1
+# ``Optional[int]`` rather than growing a parallel "uncategorized?" flag through them.
+UNCATEGORIZED_ID = -1
 
 # Time buckets a series can be grouped into.
 BUCKETS = ("day", "week", "month", "year")
@@ -246,7 +246,7 @@ class CategoryRuleRow:
     id: int
     pattern: str
     category: str
-    txn_count: int  # transactions this rule currently categorises
+    txn_count: int  # transactions this rule currently categorizes
 
 
 @dataclass
@@ -264,13 +264,13 @@ class Totals:
 
 @dataclass
 class CategoryTotal:
-    id: Optional[int]  # None for uncategorised transactions
-    name: str  # "" when uncategorised — the caller picks the label
+    id: Optional[int]  # None for uncategorized transactions
+    name: str  # "" when uncategorized — the caller picks the label
     count: int
     total_minor: int  # signed sum
     outflow_minor: int  # sum of the negatives, so <= 0
     inflow_minor: int  # sum of the positives, so >= 0
-    parent_id: Optional[int] = None  # None for uncategorised, or a top-level category
+    parent_id: Optional[int] = None  # None for uncategorized, or a top-level category
 
 
 @dataclass
@@ -658,7 +658,7 @@ def _txn_query(filters: Filters):
         )
     if filters.account_id is not None:
         query = query.where(Transaction.account_id == filters.account_id)
-    if filters.category_id == UNCATEGORISED_ID:
+    if filters.category_id == UNCATEGORIZED_ID:
         query = query.where(Transaction.category_id.is_(None))
     elif filters.category_id is not None:
         query = query.where(
@@ -952,7 +952,7 @@ def get_category_totals(
     a UI drills into, and a category holding a transfer would then promise fewer rows
     than it shows.
 
-    Uncategorised transactions are a row of their own (``id`` None, ``name`` ""), reached
+    Uncategorized transactions are a row of their own (``id`` None, ``name`` ""), reached
     by an outer join, so the rows always add back up to the totals.
     """
     resolved = resolve_filters(
@@ -1141,8 +1141,8 @@ class CategoryBucketTotal:
 
     bucket_key: str
     bucket_label: str
-    category_id: Optional[int]  # None for uncategorised, matching CategoryTotal.id
-    category_name: str  # "" when uncategorised
+    category_id: Optional[int]  # None for uncategorized, matching CategoryTotal.id
+    category_name: str  # "" when uncategorized
     parent_id: Optional[int]
     count: int
     total_minor: int  # signed sum

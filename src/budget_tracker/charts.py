@@ -14,7 +14,7 @@ Three measures, because they answer different questions:
 ``income``
     What came in, drawn the same way.
 ``net``
-    The two added together, drawn either side of a centre axis: a bucket that cost more
+    The two added together, drawn either side of a center axis: a bucket that cost more
     than it paid grows **left**, one that paid more than it cost grows **right**. So a
     month whose spending was matched by a refund sits at the axis instead of reading as
     a heavy month.
@@ -22,7 +22,7 @@ Three measures, because they answer different questions:
 The net bars are whole cells where the others are eighths. A bar growing leftwards is
 anchored at its right-hand end, and Unicode has no left-facing counterpart to the
 ``▏▎▍`` eighth blocks — only a half and an eighth — so sub-cell resolution is available
-on one side of the axis and not the other. Quantising both sides of ``net`` to whole
+on one side of the axis and not the other. Quantizing both sides of ``net`` to whole
 cells keeps its two directions honestly comparable with each other, which matters more
 than matching the resolution of a chart you are not looking at at the same time.
 """
@@ -41,7 +41,7 @@ BLOCK = "█"
 # Eighth-width blocks, 1/8 through 8/8, for the single-direction measures.
 BAR_BLOCKS = "▏▎▍▌▋▊▉█"
 
-# The centre line of a ``net`` chart. Bars never overwrite it, so it stays at one screen
+# The center line of a ``net`` chart. Bars never overwrite it, so it stays at one screen
 # column all the way down the table and the eye can read "left of here cost me" at a
 # glance.
 AXIS = "│"
@@ -118,7 +118,7 @@ def bucket_date_range(key: str, bucket: str, window: Window) -> Tuple[date, date
 
 
 def parse_measure(text: str) -> str:
-    """A measure name or alias, normalised. Raises on anything else."""
+    """A measure name or alias, normalized. Raises on anything else."""
     measure = MEASURE_ALIASES.get(text.strip().lower())
     if measure is None:
         raise ValueError(
@@ -247,7 +247,7 @@ def build(
             f"Unknown measure {measure!r}; expected one of {', '.join(MEASURES)}."
         )
     diverging = measure == "net"
-    # The axis costs a column, and the two halves have to be equal or the centre would
+    # The axis costs a column, and the two halves have to be equal or the center would
     # drift; an even width therefore loses one cell rather than an uneven half.
     half_width = (width - len(AXIS)) // 2
 
@@ -291,7 +291,7 @@ def build(
 # ----------------------------------------------------------------------------- pie
 #
 # Category shares as a circle. Geometry only, same split as the bars above: this decides
-# which cell belongs to which slice, and the TUI decides what colour that is.
+# which cell belongs to which slice, and the TUI decides what color that is.
 
 # The pie's bounding box, in character cells. Twice as wide as it is tall, because a
 # monospace terminal cell is itself roughly twice as tall as it is wide — a box this
@@ -310,7 +310,7 @@ PIE_HEIGHT = 20
 SHARE_BAR_WIDTH = 100
 
 # Below this, a category is folded into "Other" rather than drawn. A slice thinner than
-# a couple of cells cannot be told apart from its neighbours or matched to its legend
+# a couple of cells cannot be told apart from its neighbors or matched to its legend
 # entry, so drawing it separately claims a precision the display does not have.
 OTHER_LABEL = "Other"
 MIN_SEGMENT_CELLS = 2
@@ -323,8 +323,8 @@ class ShareSegment:
     name: str
     # None for the folded "Other" segment, which stands for several categories and so
     # cannot be drilled into. Making it None rather than borrowing a sentinel forces a
-    # caller to notice: pointing a drill-down at UNCATEGORISED_ID here would quietly
-    # show uncategorised transactions instead of the ones the segment represents.
+    # caller to notice: pointing a drill-down at UNCATEGORIZED_ID here would quietly
+    # show uncategorized transactions instead of the ones the segment represents.
     category_id: Optional[int]
     share: float  # the true share, before it was rounded to whole cells
     amount_minor: int  # net spend, as a positive magnitude
@@ -340,11 +340,11 @@ class ShareBar:
 
     @property
     def cell_owners(self) -> List[int]:
-        """One index into ``segments`` per cell, so a caller can colour cell by cell.
+        """One index into ``segments`` per cell, so a caller can color cell by cell.
 
-        Exactly ``width`` long whenever there is anything to draw. No colours and no
+        Exactly ``width`` long whenever there is anything to draw. No colors and no
         characters here, on purpose: this module knows proportions, and the UI turns an
-        index into a colour.
+        index into a color.
         """
         owners: List[int] = []
         for index, segment in enumerate(self.segments):
@@ -358,7 +358,7 @@ def _apportion(shares: List[float], width: int) -> List[int]:
     Largest-remainder apportionment: floor every share, then hand the leftover cells to
     whoever was rounded down hardest. Rounding each share independently would leave the
     bar a cell or two short or long depending on the data, so its right-hand end would
-    wander between windows — and a bar labelled "100%" that does not fill its own track
+    wander between windows — and a bar labeled "100%" that does not fill its own track
     is exactly the kind of small wrongness nobody reports but everybody notices.
     """
     exact = [share * width for share in shares]
@@ -478,7 +478,7 @@ class StackedBar:
 class StackedShareChart:
     # The category set every bar -- `top` and each of `bars` -- draws, in the one order
     # they all share. Read once here rather than off any particular bar, so a caller has
-    # exactly one place to build a legend and assign colours from.
+    # exactly one place to build a legend and assign colors from.
     segments: List[ShareSegment]
     top: ShareBar  # the window-wide bar, unchanged from calling build_share_bar directly
     bars: List[StackedBar]
@@ -505,7 +505,7 @@ def build_stacked_share(
     folded into ``Other`` (too small over the whole window) or never carried at all
     (net positive over the whole window, even if a real cost in this one bucket) goes
     into that bucket's ``Other`` too. A bucket is allowed to pick its own segments in
-    no version of this chart: that is what would let the same colour mean two different
+    no version of this chart: that is what would let the same color mean two different
     categories on two different rows, which defeats the entire point of stacking them
     for comparison. Each bucket's own ``Other``, unlike the top bar's, can therefore
     hold money the top bar's own ``Other`` does not -- see the ``needs_other`` guard
